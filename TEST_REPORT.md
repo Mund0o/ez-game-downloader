@@ -83,3 +83,18 @@ Also checked by hand: screenshots of couch mode (Home, Library, Downloads, Detai
 Wishlist (live: Hollow Knight: Silksong found on OnlineFix, FitGirl and AnkerGames), Library, Storage and Settings,
 from a copy of the real library (Steam artwork via Steam's store API); the packaged build (PyInstaller) starts couch
 mode and the Wishlist; the updater unpacks and verifies the real release tarball (relative symlinks kept).
+
+## Version 0.3.0 (2026-10-14): couch mode does everything, controllers, speed
+
+Offline suite: **496 passed, 1 skipped**.
+
+* Couch mode: Store (search with an on-screen keyboard, filters, pages that keep loading), game pages and downloads,
+  Wishlist, Settings, a Manage menu per game, Downloads (pause / resume / cancel), all by controller; the in-app
+  browser driven by the controller (pointer on the left stick, real clicks, typing, menu).
+* Controllers: presses of every controller were dropped before (the notifier's argument replaced the device path) —
+  now tested through a real device node; PlayStation / Xbox / Steam button prompts; triggers; guide button.
+* Couch mode stays on top while a game starts (KWin scripting on KDE Wayland), fills the screen it is on, and sends
+  frames at a steady rate (VRR flicker).
+* Speed: covers decoded and cards drawn once off the GUI thread, site pages parsed in a helper process, zip and 7z
+  extracted with 7-Zip (40× faster for encrypted zips, the app stays responsive), closing the app stops a running
+  extraction (it resumes on the next start).

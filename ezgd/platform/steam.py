@@ -293,8 +293,9 @@ def open_steam_url(url: str) -> None:
     cmd = steam_command()
     if cmd is None:
         raise RuntimeError("Steam was not found.")
-    subprocess.Popen(cmd + [url], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     start_new_session=True)
+    # -silent: if Steam has to start for this, it starts in the background — no Steam window over the game
+    subprocess.Popen(cmd + ["-silent", url], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
 
 
 def overlay_env(steam_root: Path | None, inherited: str = "") -> dict[str, str] | None:

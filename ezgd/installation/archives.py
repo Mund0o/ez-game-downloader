@@ -481,6 +481,7 @@ def extract(archive: Path, dest: Path, *, password: str | None = None, progress:
                          sorted(m.name for m in members if not m.is_dir) if only is not None else None)
         else:
             _extract_single(archive, staging / _single_name(archive), fmt, prog)
+        prog.check()                       # cancelled while the extractor finished: nothing is moved in
         _verify_tree(staging)
         files, total = _move_into(staging, dest, overwrite, only)
         prog.done = prog.total
@@ -500,8 +501,89 @@ def _norm(name: str) -> str:
     return n.strip("/")
 
 
+def seven_zip() -> str | None:
+    """The 7-Zip program: the one shipped with the app first, else one installed on the system."""
+    exe = bundled_7zip()
+    if exe:
+        return exe
+    for name in ("7zz", "7z", "7za"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+class _ToolCannotOpen(ArchiveError):
+    """7-Zip could not handle this archive (old 7-Zip, unusual method): the built-in extractor tries instead."""
+
+
+def _seven_zip_error(out: str, code: int, what: str) -> ArchiveError:
+    low = out.lower()
+    if "wrong password" in low or "enter password" in low or "password is incorrect" in low:
+        return PasswordRequiredError(f"The {what} archive needs a password (or the password is wrong).")
+    if "unexpected end of archive" in low or "missing volume" in low:
+        return CorruptArchiveError(f"The {what} archive is incomplete — a part may be missing or still downloading.")
+    if "crc failed" in low or "data error" in low or "headers error" in low:
+        return CorruptArchiveError(f"The {what} archive is corrupted (checksum error).")
+    if "unsupported method" in low or "cannot open the file as archive" in low or "can not open the file" in low:
+        return _ToolCannotOpen(out.strip()[-300:])
+    if "not enough space" in low or "no space left" in low:
+        return ArchiveError("The disk is full — free some space and install the game again.")
+    return _ToolCannotOpen(f"7-Zip failed (exit code {code}): {out.strip()[-300:]}")
+
+
+def _extract_with_7zip(exe: str, archive: Path, staging: Path, password: str | None, prog: _Progress,
+                       names: list[str] | None, what: str) -> None:
+    """Extract with 7-Zip in its own process: fast (C, every core) and it never holds Python's lock, so the app
+    stays responsive however big the game is. Encrypted zips are ~40× faster than Python's zipfile."""
+    files = names if names is not None and len(names) <= 400 else []    # long lists: extract all, move some
+    cmd = [exe, "x", "-y", "-bso0", "-bsp0", "-snl-", f"-p{password or ''}", f"-o{staging}", str(archive), *files]
+    flags = subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                            creationflags=flags)
+    output: list[bytes] = []
+    reader = threading.Thread(target=lambda: output.append(proc.stdout.read() if proc.stdout else b""),
+                              daemon=True)
+    reader.start()
+    try:
+        while proc.poll() is None:
+            time.sleep(0.4)
+            prog.done = dir_size(staging)
+            prog.report()
+    except ExtractionCancelled:
+        proc.kill()
+        proc.wait()
+        raise
+    reader.join(timeout=5)
+    if proc.returncode not in (0, 1):            # 1 = warnings only (e.g. a file could not get its timestamp)
+        raise _seven_zip_error(b"".join(output).decode("utf-8", "replace"), proc.returncode, what)
+
+
+def _restart_staging(staging: Path) -> None:
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
+
+
 def _extract_zip(archive: Path, staging: Path, password: str | None, prog: _Progress,
                  only: set[str] | None = None) -> None:
+    exe = seven_zip()
+    if exe:
+        names = None
+        if only is not None:
+            with _volumes(archive) as src, zipfile.ZipFile(src) as zf:
+                names = [zi.filename for zi in zf.infolist() if _norm(zi.filename) in only]
+        try:
+            _extract_with_7zip(exe, archive, staging, password, prog, names, "zip")
+            return
+        except _ToolCannotOpen as exc:
+            log.info("7-Zip could not extract %s (%s); using the built-in extractor", archive.name, exc)
+            _restart_staging(staging)
+            prog.done = 0
+    _extract_zip_builtin(archive, staging, password, prog, only)
+
+
+def _extract_zip_builtin(archive: Path, staging: Path, password: str | None, prog: _Progress,
+                         only: set[str] | None = None) -> None:
     try:
         with _volumes(archive) as src, zipfile.ZipFile(src) as zf:
             if password:
@@ -565,6 +647,25 @@ def _extract_tar(archive: Path, staging: Path, prog: _Progress, only: set[str] |
 
 def _extract_7z(archive: Path, staging: Path, password: str | None, prog: _Progress, links: set[str],
                 only: set[str] | None = None) -> None:
+    exe = seven_zip()
+    if exe:
+        names = None
+        if only is not None:
+            import py7zr
+            with _volumes(archive) as src, py7zr.SevenZipFile(src, password=password) as zf:
+                names = [n for n in zf.getnames() if _norm(n) in only]
+        try:
+            _extract_with_7zip(exe, archive, staging, password, prog, names, "7z")
+            return
+        except _ToolCannotOpen as exc:
+            log.info("7-Zip could not extract %s (%s); using the built-in extractor", archive.name, exc)
+            _restart_staging(staging)
+            prog.done = 0
+    _extract_7z_builtin(archive, staging, password, prog, links, only)
+
+
+def _extract_7z_builtin(archive: Path, staging: Path, password: str | None, prog: _Progress, links: set[str],
+                        only: set[str] | None = None) -> None:
     import py7zr
     from py7zr.callbacks import ExtractCallback
 

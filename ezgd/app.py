@@ -255,6 +255,8 @@ def exit_now(rc: int) -> None:
 
 def run() -> None:
     """Console/GUI entry point: run the app, then exit without the crash-prone teardown (in every case)."""
+    import multiprocessing
+    multiprocessing.freeze_support()              # the page-parsing helper process (packaged app: same program)
     try:
         rc = main()
     except SystemExit as exc:                     # argparse --help/--version, explicit exits

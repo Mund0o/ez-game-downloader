@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QAbstractListModel, QEvent, QModelIndex, QRect, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPainterPath, QPen
+from collections import OrderedDict
+
+from PySide6.QtCore import QAbstractListModel, QEvent, QModelIndex, QPointF, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QLinearGradient, QPainter, QPainterPath,
+                           QPen, QPixmap)
 from PySide6.QtWidgets import (QAbstractItemView, QAbstractScrollArea, QApplication, QListView, QStyle,
                                QStyledItemDelegate)
 
@@ -50,11 +53,46 @@ class GameListModel(QAbstractListModel):
 
 
 class GameCardDelegate(QStyledItemDelegate):
+    # finished cards, reused while scrolling — one cache for every grid (Home, All Games, Picks)
+    _cards: "OrderedDict[tuple, QPixmap]" = OrderedDict()
+    CARDS = 150
     def __init__(self, covers, parent=None):
         super().__init__(parent)
         self.covers = covers
         self.installed: set[str] = set()
         self.card_width = CARD_WIDTHS["comfortable"]
+        self._lock: QPixmap | None = None
+
+
+    @staticmethod
+    def _finish(img: QImage, w: int, h: int, dpr: float) -> QImage:
+        """The cover as the card shows it — scaled, rounded top corners, shaded — built in a worker thread."""
+        pw, ph = max(1, round(w * dpr)), max(1, round(h * dpr))
+        out = QImage(pw, ph, QImage.Format_ARGB32_Premultiplied)
+        out.fill(Qt.transparent)
+        q = QPainter(out)
+        q.setRenderHint(QPainter.Antialiasing)
+        q.setRenderHint(QPainter.SmoothPixmapTransform)
+        # rounded top corners, square bottom edge (union — not odd-even — of the two shapes)
+        rounded = QPainterPath()
+        rounded.addRoundedRect(QRectF(0.5 * dpr, 0.5 * dpr, pw - dpr, ph), 11.5 * dpr, 11.5 * dpr)
+        bottom = QPainterPath()
+        bottom.addRect(QRectF(0.5 * dpr, ph / 2, pw - dpr, ph / 2))
+        q.setClipPath(rounded.united(bottom))
+        scaled = img.scaled(QSize(pw, ph), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        q.drawImage(0, 0, scaled, (scaled.width() - pw) // 2, (scaled.height() - ph) // 2, pw, ph)
+        shade = QLinearGradient(0, ph * 0.65, 0, ph)
+        shade.setColorAt(0, QColor(0, 0, 0, 0))
+        shade.setColorAt(1, QColor(0, 0, 0, 120))
+        q.fillRect(QRectF(0, 0, pw, ph), QBrush(shade))
+        q.end()
+        out.setDevicePixelRatio(dpr)
+        return out
+
+    def _lock_pixmap(self) -> QPixmap:
+        if self._lock is None:
+            self._lock = icon("lock", "#0b0d12", 13).pixmap(26, 26)
+        return self._lock
 
     def card_size(self) -> QSize:
         w = self.card_width
@@ -64,60 +102,85 @@ class GameCardDelegate(QStyledItemDelegate):
         return self.card_size()
 
     def paint(self, p: QPainter, option, index) -> None:
+        """A card is drawn once into a pixmap (cover, badges, title, …) and reused while scrolling; only the
+        hover / selection outline is drawn each time."""
         group: GameGroup = index.data(GroupRole)
         if group is None:
             return
         pal = theme.CURRENT
-        p.save()
-        p.setRenderHint(QPainter.Antialiasing)
-        p.setRenderHint(QPainter.SmoothPixmapTransform)
         r = QRectF(option.rect).adjusted(7, 7, -7, -7)
         hover = bool(option.state & QStyle.State_MouseOver)
         selected = bool(option.state & QStyle.State_Selected)
         if hover:
             r.translate(0, -2)
+        dpr = p.device().devicePixelRatioF() if p.device() is not None else 1.0
+        w, h = round(r.width()), round(r.height())
+        cw, ch = w, round(r.width() * 0.5625)
+        url = group.primary.cover_url or next((e.cover_url for e in group.entries if e.cover_url), None)
+        pm = self.covers.variant(url, ("card", url, cw, ch, dpr), lambda img: self._finish(img, cw, ch, dpr))
+        meta = self._meta(group)
+        key = (group.key, group.title, tuple(group.sources), meta, w, h, dpr, pm.cacheKey() if pm else None,
+               group.key in self.installed, pal.accent, pal.bg2, option.font.key())
+        card = self._cards.get(key)
+        if card is None:
+            card = self._render_card(group, meta, w, h, dpr, pm, option.font)
+            self._cards[key] = card
+            while len(self._cards) > self.CARDS:
+                self._cards.popitem(last=False)
+        else:
+            self._cards.move_to_end(key)
+        p.drawPixmap(QPointF(round(r.left() * dpr) / dpr, round(r.top() * dpr) / dpr), card)
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(pal.accent if (hover or selected) else pal.border), 1.4 if hover else 1))
+        p.drawRoundedRect(r, 12, 12)
+        p.restore()
+
+    def _render_card(self, group: GameGroup, meta: str, w: int, h: int, dpr: float, pm: QPixmap | None,
+                     font: QFont) -> QPixmap:
+        pal = theme.CURRENT
+        out = QPixmap(max(1, round(w * dpr)), max(1, round(h * dpr)))
+        out.setDevicePixelRatio(dpr)
+        out.fill(Qt.transparent)
+        p = QPainter(out)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        r = QRectF(0, 0, w, h)
         path = QPainterPath()
         path.addRoundedRect(r, 12, 12)
         p.fillPath(path, QColor(pal.bg2))
-        p.setPen(QPen(QColor(pal.accent if (hover or selected) else pal.border), 1.4 if hover else 1))
-        p.drawPath(path)
-
         cover_h = r.width() * 0.5625
-        cover = QRectF(r.left(), r.top(), r.width(), cover_h)
-        # rounded top corners, square bottom edge (union — not odd-even — of the two shapes)
-        rounded = QPainterPath()
-        rounded.addRoundedRect(cover.adjusted(0.5, 0.5, -0.5, 0), 11.5, 11.5)
-        bottom = QPainterPath()
-        bottom.addRect(cover.adjusted(0.5, cover_h / 2, -0.5, 0))
-        p.save()
-        p.setClipPath(rounded.united(bottom))
-        url = group.primary.cover_url or next((e.cover_url for e in group.entries if e.cover_url), None)
-        pm = self.covers.get(url)
-        if pm is not None and not pm.isNull():
-            scaled = pm.scaled(cover.size().toSize(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-            sx = (scaled.width() - cover.width()) / 2
-            sy = (scaled.height() - cover.height()) / 2
-            p.drawPixmap(cover.toRect(), scaled, QRect(int(sx), int(sy), int(cover.width()), int(cover.height())))
+        cover = QRectF(0, 0, r.width(), cover_h)
+        if pm is not None:
+            p.drawPixmap(QPointF(0, 0), pm)
         else:
+            # rounded top corners, square bottom edge (union — not odd-even — of the two shapes)
+            rounded = QPainterPath()
+            rounded.addRoundedRect(cover.adjusted(0.5, 0.5, -0.5, 0), 11.5, 11.5)
+            bottom = QPainterPath()
+            bottom.addRect(cover.adjusted(0.5, cover_h / 2, -0.5, 0))
+            p.save()
+            p.setClipPath(rounded.united(bottom))
             grad = QLinearGradient(cover.topLeft(), cover.bottomRight())
             grad.setColorAt(0, QColor(pal.accent).darker(260))
             grad.setColorAt(1, QColor(pal.bg3))
             p.fillRect(cover, QBrush(grad))
-            f = QFont(option.font)
+            f = QFont(font)
             f.setPointSize(22)
             f.setBold(True)
             p.setFont(f)
             p.setPen(QColor(255, 255, 255, 70))
-            initials = "".join(w[0] for w in group.title.split()[:2] if w).upper() or "?"
+            initials = "".join(x[0] for x in group.title.split()[:2] if x).upper() or "?"
             p.drawText(cover, Qt.AlignCenter, initials)
-        shade = QLinearGradient(cover.bottomLeft() - (cover.bottomLeft() - cover.topLeft()) * 0.35, cover.bottomLeft())
-        shade.setColorAt(0, QColor(0, 0, 0, 0))
-        shade.setColorAt(1, QColor(0, 0, 0, 120))
-        p.fillRect(cover, QBrush(shade))
-        p.restore()
+            shade = QLinearGradient(QPointF(0, cover_h * 0.65), QPointF(0, cover_h))
+            shade.setColorAt(0, QColor(0, 0, 0, 0))
+            shade.setColorAt(1, QColor(0, 0, 0, 120))
+            p.fillRect(cover, QBrush(shade))
+            p.restore()
 
         # source badges: full site names, plus a lock for sources whose archives are password-protected
-        f = QFont(option.font)
+        f = QFont(font)
         f.setPointSizeF(7.8)
         f.setBold(True)
         p.setFont(f)
@@ -127,8 +190,8 @@ class GameCardDelegate(QStyledItemDelegate):
             color = QColor(theme.SOURCE_COLORS.get(src, pal.accent))
             text = theme.source_name(src)
             locked = bool(theme.source_password(src))
-            w = bfm.horizontalAdvance(text) + 14 + (14 if locked else 0)
-            badge = QRectF(x, cover.top() + 8, w, 19)
+            bw = bfm.horizontalAdvance(text) + 14 + (14 if locked else 0)
+            badge = QRectF(x, cover.top() + 8, bw, 19)
             bg = QColor(color)
             bg.setAlpha(232)
             p.setPen(Qt.NoPen)
@@ -138,8 +201,8 @@ class GameCardDelegate(QStyledItemDelegate):
             p.drawText(badge.adjusted(7, 0, 0, 0), Qt.AlignVCenter | Qt.AlignLeft, text)
             if locked:
                 lock_rect = QRectF(badge.right() - 18, badge.top() + 3, 13, 13)
-                p.drawPixmap(lock_rect.toRect(), icon("lock", "#0b0d12", 13).pixmap(26, 26))
-            x += w + 5
+                p.drawPixmap(lock_rect.toRect(), self._lock_pixmap())
+            x += bw + 5
         if group.key in self.installed:
             badge = QRectF(cover.right() - 30, cover.top() + 8, 22, 22)
             p.setPen(Qt.NoPen)
@@ -156,7 +219,7 @@ class GameCardDelegate(QStyledItemDelegate):
 
         # text
         body = QRectF(r.left() + 12, cover.bottom() + 9, r.width() - 24, r.bottom() - cover.bottom() - 14)
-        tf = QFont(option.font)
+        tf = QFont(font)
         tf.setPointSizeF(10.2)
         tf.setBold(True)
         p.setFont(tf)
@@ -165,15 +228,15 @@ class GameCardDelegate(QStyledItemDelegate):
         title = fm.elidedText(group.title, Qt.ElideRight, int(body.width() * 2 - 20))
         title_rect = QRectF(body.left(), body.top(), body.width(), fm.lineSpacing() * 2 + 2)
         p.drawText(title_rect, Qt.TextWordWrap | Qt.AlignTop | Qt.AlignLeft, title)
-        mf = QFont(option.font)
+        mf = QFont(font)
         mf.setPointSizeF(8.6)
         p.setFont(mf)
         p.setPen(QColor(pal.muted))
-        meta = self._meta(group)
         mfm = QFontMetrics(mf)
         p.drawText(QRectF(body.left(), body.bottom() - mfm.lineSpacing(), body.width(), mfm.lineSpacing()),
                    Qt.AlignLeft | Qt.AlignVCenter, mfm.elidedText(meta, Qt.ElideRight, int(body.width())))
-        p.restore()
+        p.end()
+        return out
 
     @staticmethod
     def _meta(group: GameGroup) -> str:

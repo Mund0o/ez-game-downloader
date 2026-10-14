@@ -33,6 +33,7 @@ from ezgd.catalog.normalize import canonical_genre, tokens
 from ezgd.core.fsutil import parse_size
 from ezgd.sources.base import (LayoutChangedError, ManualActionRequired, Page, ResolvedDownload, SourceAdapter,
                                SourceError, SourceInfo)
+from ezgd.sources import parsing
 
 log = logging.getLogger(__name__)
 
@@ -324,7 +325,7 @@ class AnkerGamesAdapter(SourceAdapter):
             html, stale = await self._get(f"/genre/{slug}", params)
         else:
             html, stale = await self._get("/games", params)
-        games, more = parse_listing(html, self.base)
+        games, more = await parsing.parse(parse_listing, html, self.base)
         return Page(games, page, more, None, stale)
 
     async def _index(self) -> list[tuple[str, str | None]]:
@@ -338,7 +339,7 @@ class AnkerGamesAdapter(SourceAdapter):
                 if out:
                     break                         # fewer sitemaps than expected
                 raise
-            found = parse_sitemap(xml)
+            found = await parsing.parse(parse_sitemap, xml)
             if not found:
                 break
             out += found
@@ -362,7 +363,7 @@ class AnkerGamesAdapter(SourceAdapter):
         if slug is None or slug != game.source_game_id:
             raise SourceError("refusing to fetch a URL that is not an AnkerGames game page")
         html, _ = await self._get(f"/game/{slug}", ttl=1800)
-        return parse_details(html, game)
+        return await parsing.parse(parse_details, html, game)
 
     async def resolve(self, method: DownloadMethod, game: Game) -> ResolvedDownload:
         raise ManualActionRequired(method.note or BROWSER_NOTE, game.url)

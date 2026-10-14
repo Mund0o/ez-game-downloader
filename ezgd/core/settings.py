@@ -73,7 +73,7 @@ class Settings:
     check_game_updates: bool = True              # re-check installed games' pages for newer versions (every 6 h)
     auto_backup_saves: bool = True               # back up saves after playing and before updates/uninstalls
     # app updates (GitHub releases)
-    update_repo: str = ""                        # "owner/name" of the GitHub repository with the app's releases
+    update_repo: str = ""                        # "owner/name" with the app's releases; empty = the official one
     check_app_updates: bool = True               # look for a new version of the app once a day
     # ui
     theme_accent: str = "violet"

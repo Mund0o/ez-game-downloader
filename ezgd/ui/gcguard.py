@@ -14,17 +14,30 @@ whole heap now and then, so memory use stays the same in practice.
 from __future__ import annotations
 
 import gc
+import time
 
 from PySide6.QtCore import QObject, QTimer
 
 YOUNG_MS = 500          # generation 0: cheap, frequent
 FULL_EVERY = 60         # every 60th tick (30 s): all generations
+MAX_DEFER = 120.0       # the bigger collections never wait longer than this
+
+_quiet_until = 0.0
+
+
+def defer(seconds: float = 1.5) -> None:
+    """The user is moving through couch mode: hold the bigger (slower) collections back for a moment, so they
+    never land in the middle of an animation. Young objects are still collected."""
+    global _quiet_until
+    _quiet_until = max(_quiet_until, time.monotonic() + seconds)
 
 
 class MainThreadGC(QObject):
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
         self._ticks = 0
+        self._owed = 0                     # 1: a gen-1 collection is due, 2: a full one
+        self._owed_since = 0.0
         self._timer = QTimer(self)
         self._timer.setInterval(YOUNG_MS)
         self._timer.timeout.connect(self._collect)
@@ -40,11 +53,20 @@ class MainThreadGC(QObject):
     def _collect(self) -> None:
         self._ticks += 1
         if self._ticks % FULL_EVERY == 0:
-            gc.collect()
+            self._owe(2)
         elif self._ticks % 10 == 0:
-            gc.collect(1)
+            self._owe(1)
+        now = time.monotonic()
+        if self._owed and (now >= _quiet_until or now - self._owed_since > MAX_DEFER):
+            gc.collect() if self._owed == 2 else gc.collect(1)
+            self._owed = 0
         else:
             gc.collect(0)
+
+    def _owe(self, level: int) -> None:
+        if not self._owed:
+            self._owed_since = time.monotonic()
+        self._owed = max(self._owed, level)
 
 
 def install(app) -> MainThreadGC:

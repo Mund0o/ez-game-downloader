@@ -37,6 +37,7 @@ from ezgd.sources.base import (LayoutChangedError, ManualActionRequired, Page, R
                                SourceInfo)
 from ezgd.sources.hosts import HOST_LABELS, classify_host_link
 from ezgd.sources.steamrip import PAGE_SIZE, SteamRipAdapter, _wp_time
+from ezgd.sources import parsing
 
 log = logging.getLogger(__name__)
 
@@ -119,6 +120,11 @@ def _info(soup: BeautifulSoup) -> dict[str, str]:
         if out:
             break
     return out
+
+
+def parse_listing_posts(data: list, tags: dict[int, str]) -> list[Game]:
+    """Every post of an API page (run in the parse helper process)."""
+    return [g for g in (parse_listing_post(p, tags) for p in data) if g]
 
 
 def parse_listing_post(post: dict, tags: dict[int, str] | None = None) -> Game | None:
@@ -311,7 +317,7 @@ class FitGirlAdapter(SteamRipAdapter):
     async def genres(self) -> list[str]:
         return sorted(set(GENRE_TAGS.values()))
 
-    def _fitgirl_page(self, body: bytes, headers: dict, page: int, stale: bool, tags: dict[int, str]) -> Page:
+    async def _fitgirl_page(self, body: bytes, headers: dict, page: int, stale: bool, tags: dict[int, str]) -> Page:
         try:
             data = json.loads(body)
         except ValueError as exc:
@@ -320,7 +326,7 @@ class FitGirlAdapter(SteamRipAdapter):
             return Page([], page, False, None, stale)
         if not isinstance(data, list):
             raise LayoutChangedError("FitGirl's WordPress API returned an unexpected structure")
-        games = [g for g in (parse_listing_post(p, tags) for p in data) if g]
+        games = await parsing.parse(parse_listing_posts, data, tags)
         total, pages = headers.get("x-wp-total"), headers.get("x-wp-totalpages")
         has_more = int(pages) > page if pages and pages.isdigit() else len(data) >= PAGE_SIZE
         return Page(games, page, has_more and bool(data), int(total) if total and total.isdigit() else None, stale)
@@ -334,7 +340,7 @@ class FitGirlAdapter(SteamRipAdapter):
                 return Page([], page, False)
             params["tags"] = ",".join(map(str, ids))
         body, headers, stale = await self._json("posts", params)
-        return self._fitgirl_page(body, headers, page, stale, tags)
+        return await self._fitgirl_page(body, headers, page, stale, tags)
 
     async def search(self, query: str, page: int = 1) -> Page:
         query = query.strip()
@@ -344,7 +350,7 @@ class FitGirlAdapter(SteamRipAdapter):
         params = {"search": query, "search_columns": "post_title", "per_page": PAGE_SIZE, "page": max(1, page),
                   "categories": CAT_REPACK, "_fields": LIST_FIELDS}
         body, headers, stale = await self._json("posts", params, ttl=1800)
-        return self._fitgirl_page(body, headers, page, stale, tags)
+        return await self._fitgirl_page(body, headers, page, stale, tags)
 
     async def details(self, game: Game) -> Game:
         if (urlsplit(game.url).hostname or "").lower() not in SITE_HOSTS | {urlsplit(self.base).hostname}:
@@ -364,7 +370,7 @@ class FitGirlAdapter(SteamRipAdapter):
             game.merge_listing(fresh)
             for k, v in fresh.extra.items():
                 game.extra.setdefault(k, v)
-        game = parse_details((post.get("content") or {}).get("rendered") or "", game)
+        game = await parsing.parse(parse_details, (post.get("content") or {}).get("rendered") or "", game)
         if game.extra.get("hypervisor"):
             game.extra["warning"] = HYPERVISOR_WARNING
         return game

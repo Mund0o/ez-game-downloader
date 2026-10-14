@@ -35,6 +35,7 @@ from ezgd.core.fsutil import parse_size
 from ezgd.sources.base import (LayoutChangedError, ManualActionRequired, Page, ResolvedDownload,
                                SourceAdapter, SourceError, SourceInfo)
 from ezgd.sources.hosts import classify_host_link, resolve_pixeldrain
+from ezgd.sources import parsing
 
 log = logging.getLogger(__name__)
 
@@ -265,8 +266,8 @@ class SteamRipAdapter(SourceAdapter):
         cats = await self.categories()
         return sorted({g for g in (canonical_genre(n) for n in cats.values()) if g})
 
-    def _page(self, body: bytes, headers: dict, page: int, stale: bool, cats: dict[int, str]) -> Page:
-        games = parse_posts(body, cats, self.info.id)
+    async def _page(self, body: bytes, headers: dict, page: int, stale: bool, cats: dict[int, str]) -> Page:
+        games = await parsing.parse(parse_posts, body, cats, self.info.id)
         total = headers.get("x-wp-total")
         pages = headers.get("x-wp-totalpages")
         total_i = int(total) if total and total.isdigit() else None
@@ -282,7 +283,7 @@ class SteamRipAdapter(SourceAdapter):
                 return Page([], page, False)
             params["categories"] = ",".join(map(str, ids))
         body, headers, stale = await self._json("posts", params)
-        return self._page(body, headers, page, stale, cats)
+        return await self._page(body, headers, page, stale, cats)
 
     async def search(self, query: str, page: int = 1) -> Page:
         query = query.strip()
@@ -292,7 +293,7 @@ class SteamRipAdapter(SourceAdapter):
         params = {"search": query, "search_columns": "post_title", "per_page": PAGE_SIZE, "page": max(1, page),
                   "_embed": "wp:featuredmedia", "_fields": LIST_FIELDS}
         body, headers, stale = await self._json("posts", params, ttl=1800)
-        return self._page(body, headers, page, stale, cats)
+        return await self._page(body, headers, page, stale, cats)
 
     async def details(self, game: Game) -> Game:
         if (urlsplit(game.url).hostname or "").lower() not in SITE_HOSTS | {urlsplit(self.base).hostname}:
@@ -312,7 +313,8 @@ class SteamRipAdapter(SourceAdapter):
         fresh = parse_post(post, cats, self.info.id)
         if fresh:
             game.merge_listing(fresh)
-        return parse_content((post.get("content") or {}).get("rendered") or "", game, self.generic)
+        return await parsing.parse(parse_content, (post.get("content") or {}).get("rendered") or "", game,
+                                       self.generic)
 
     async def resolve(self, method: DownloadMethod, game: Game) -> ResolvedDownload:
         if method.resolver == "pixeldrain":

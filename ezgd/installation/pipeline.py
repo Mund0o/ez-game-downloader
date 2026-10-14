@@ -375,6 +375,9 @@ class PostProcessor:
             result = await asyncio.to_thread(ar.extract, archive, dest, password=password, progress=progress,
                                              cancel=cancel, rar_tool=rar_tool)
         except (ar.ArchiveError, InsufficientSpaceError, OSError) as exc:
+            if isinstance(exc, ar.ExtractionCancelled) and getattr(self, "_shutting_down", False):
+                log.info("extraction of %s stopped because the app is closing; it resumes next time", archive.name)
+                return False
             msg = self._describe(exc, password)
             log.warning("extraction of %s failed: %s", archive.name, msg)
             self.extractions.update(ext_id, status="cancelled" if isinstance(exc, ar.ExtractionCancelled)
@@ -536,6 +539,13 @@ class PostProcessor:
             log.info("deleted %d archive file(s) after extracting: %s", len(deleted), ", ".join(x.name for x in deleted))
             self._prune_empty(archive.parent)
         return deleted
+
+    def stop_all(self) -> None:
+        """The app is closing: stop every running extraction. Their rows stay "running", so ``recover`` marks them
+        interrupted at the next start and the core finishes them."""
+        self._shutting_down = True
+        for ev in list(self._cancel.values()):
+            ev.set()
 
     def cancel(self, ext_id: int) -> bool:
         ev = self._cancel.get(ext_id)

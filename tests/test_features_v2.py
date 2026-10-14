@@ -304,6 +304,36 @@ async def test_interrupted_install_is_finished_on_the_next_start(core, tmp_path)
     assert await core.interrupted_install(e.id) is None
 
 
+async def test_closing_the_app_stops_an_install_and_it_resumes_next_time(core, tmp_path, monkeypatch):
+    """A 40 GB install used to keep the app's process alive (invisibly) for hours after it was closed."""
+    import asyncio
+    import threading
+    from ezgd.installation import archives as ar
+    core.games.save(Game("fake", "4", "Big", "https://fake.example/big"))
+    arc = tmp_path / "dl" / "Big.zip"
+    arc.parent.mkdir(parents=True)
+    arc.write_bytes(zip_bytes({"Big/Big.exe": b"MZ"}))
+    e = core.library.import_folder("Big", arc, "fake:4")
+    started, stopped = threading.Event(), threading.Event()
+
+    def slow_extract(archive, dest, *, cancel=None, **_kw):       # stands in for hours of unpacking
+        started.set()
+        while not cancel.wait(0.05):
+            pass
+        stopped.set()
+        raise ar.ExtractionCancelled("Extraction cancelled")
+    monkeypatch.setattr(ar, "extract", slow_extract)
+    task = asyncio.create_task(core.post.extract(e, arc, tmp_path / "games" / "Big"))
+    await asyncio.to_thread(started.wait, 5)
+    core.post.stop_all()                                         # what shutdown() does first
+    assert await asyncio.wait_for(task, 5) is False
+    assert stopped.is_set()
+    row = core.extraction_repo.for_library(e.id)[-1]
+    assert row["status"] == "running"                            # so the next start finishes it
+    core.post._shutting_down = False
+    assert core.post.recover() == 1 and core.post.resumable[0]["archive"] == str(arc)
+
+
 # ------------------------------------------------------------------- wishlist
 def steam_items(appid: int, name: str, coming_soon=False) -> bytes:
     return json.dumps({"response": {"store_items": [{
@@ -511,9 +541,17 @@ async def test_app_update_check_download_verify_stage_and_swap(routes, tmp_path)
 async def test_app_update_status_from_source_checkout(core, routes):
     st = await core.app_update_status()
     assert st["packaged"] is False and st["can_install"] is False
-    with pytest.raises(Exception, match="GitHub repository"):
-        await core.check_app_update()
+    from ezgd.core.selfupdate import DEFAULT_REPO, check
+    assert st["repo"] == DEFAULT_REPO                      # works out of the box: the official repository
+    routes.add(f"https://api.github.com/repos/{DEFAULT_REPO}", "{}", content_type="application/json")
+    info = await core.check_app_update()                   # it has no release yet: "newest", not an error
+    assert info["no_release"] and not info["newer"]
+    routes.add("https://api.github.com/repos/o/missing/releases/latest", "", status=404)
+    with pytest.raises(Exception, match="no published release"):
+        await check(core.client, "o/missing")              # a repository that does not exist is still an error
     assert await core.set_update_repo("https://github.com/o/r") == "o/r"
+    assert await core.set_update_repo(DEFAULT_REPO.upper()) == DEFAULT_REPO
+    assert core.settings.settings.update_repo == ""
     with pytest.raises(Exception, match="runs from source"):
         await core.download_app_update()
 
@@ -546,6 +584,67 @@ def test_gamepad_buttons_dpad_stick_and_duplicates(qtbot):
     g._event(a, gp.EV_ABS, gp.ABS_Y, 30000)                     # down
     g._event(a, gp.EV_KEY, 0x2C, 1)                             # a keyboard key code: ignored
     assert got == ["a", "b", "x", "rb", "right", "up", "down"]
+    g.stop()
+
+
+@linux_only
+def test_gamepad_reads_presses_from_a_device_node(qtbot, tmp_path, monkeypatch):
+    """The real path: rescan() opens the node and a QSocketNotifier reads it. (Before 2026-10-13 the notifier's
+    second argument replaced the device path, so no controller — DualSense, Xbox, anything — did anything.)"""
+    import os
+    from ezgd.ui import gamepad as gp
+    node = tmp_path / "event77"
+    os.mkfifo(node)
+    monkeypatch.setattr(gp, "gamepad_info", lambda: [(str(node), "DualSense Wireless Controller", 0x054C, 0x0CE6,
+                                                      1 << gp.BTN_TL2)])
+    g = gp.Gamepads()
+    got, families = [], []
+    g.action.connect(got.append)
+    g.family_changed.connect(families.append)
+    g.rescan()
+    assert str(node) in g.devices and g.family == "playstation" and families == ["playstation"]
+    w = os.open(node, os.O_WRONLY | os.O_NONBLOCK)
+    try:
+        ev = gp.EVENT.pack
+        os.write(w, ev(0, 0, gp.EV_KEY, gp.BTN_SOUTH, 1) + ev(0, 0, gp.EV_KEY, gp.BTN_SOUTH, 0)
+                 + ev(0, 0, gp.EV_ABS, gp.ABS_HAT0Y, 1) + ev(0, 0, gp.EV_ABS, gp.ABS_HAT0Y, 0)
+                 + ev(0, 0, gp.EV_KEY, gp.BTN_TR2, 1) + ev(0, 0, gp.EV_KEY, gp.BTN_MODE, 1))
+        qtbot.waitUntil(lambda: got == ["a", "down", "rt", "home"], timeout=3000)
+    finally:
+        g.stop()
+        os.close(w)
+        g.deleteLater()                                         # freed here, on the main thread
+        qtbot.wait(50)
+
+
+def test_gamepad_families_and_triggers(qtbot):
+    from ezgd.ui import gamepad as gp
+    assert gp.family_of(0x054C, 0x0CE6, "DualSense Wireless Controller") == "playstation"
+    assert gp.family_of(0x045E, 0x0B12, "Xbox Wireless Controller") == "xbox"
+    assert gp.family_of(0x28DE, 0x1205, "Steam Deck") == "steam"
+    assert gp.family_of(0x057E, 0x2009, "Nintendo Switch Pro Controller") == "nintendo"
+    assert gp.family_of(0x1234, 0x0001, "Some Pad") == "generic"
+    g = gp.Gamepads()
+    got, families = [], []
+    g.action.connect(got.append)
+    g.family_changed.connect(families.append)
+    xbox = gp._Device("/dev/input/event80", "Xbox Wireless Controller", -1, 0x045E, 0x0B12, 0)
+    xbox.ranges = {gp.ABS_Z: (0, 1023), gp.ABS_RZ: (0, 1023)}
+    ps = gp._Device("/dev/input/event81", "DualSense Wireless Controller", -1, 0x054C, 0x0CE6, 1 << gp.BTN_TL2)
+    virtual = gp._Device("/dev/input/event82", "Steam Virtual Gamepad", -1, 0x28DE, 0x11FF, 0)
+    g.devices = {d.path: d for d in (xbox, ps, virtual)}
+    g._event(xbox, gp.EV_ABS, gp.ABS_Z, 900)                    # left trigger pulled
+    g._event(xbox, gp.EV_ABS, gp.ABS_Z, 700)                    # still held: nothing new
+    g._event(xbox, gp.EV_ABS, gp.ABS_Z, 0)
+    g._event(xbox, gp.EV_ABS, gp.ABS_RZ, 1000)
+    assert got == ["lt", "rt"] and g.family == "xbox"
+    g._event(ps, gp.EV_KEY, gp.BTN_EAST, 1)
+    assert g.family == "playstation"
+    g._event(ps, gp.EV_ABS, gp.ABS_Z, 255)                      # DualSense: triggers come as buttons, not axes
+    assert got == ["lt", "rt", "b"]
+    g._event(virtual, gp.EV_KEY, gp.BTN_NORTH, 1)               # Steam's mirror of the pad in use: keeps its look
+    assert g.family == "playstation" and got[-1] == "x"
+    g.devices = {}
     g.stop()
 
 

@@ -36,6 +36,7 @@ from ezgd.catalog.normalize import canonical_genre, clean_title
 from ezgd.sources.base import (FeaturedSection, LayoutChangedError, ManualActionRequired, Page,
                                ResolvedDownload, SourceAdapter, SourceError, SourceInfo)
 from ezgd.sources.hosts import classify_host_link, resolve_pixeldrain
+from ezgd.sources import parsing
 
 log = logging.getLogger(__name__)
 
@@ -486,7 +487,7 @@ class OnlineFixAdapter(SourceAdapter):
         root = f"{self.base}/games/{slug}/" if slug else f"{self.base}/"
         url = root if page <= 1 else f"{root}page/{page}/"
         html, stale = await self._html(url)
-        games, has_more, last = parse_listing(html, self.base)
+        games, has_more, last = await parsing.parse(parse_listing, html, self.base)
         return Page(games, page, has_more, None, stale)
 
     async def search(self, query: str, page: int = 1) -> Page:
@@ -498,12 +499,12 @@ class OnlineFixAdapter(SourceAdapter):
         url = (f"{self.base}/index.php?do=search&subaction=search&search_start={start}"
                f"&full_search=0&result_from={(start - 1) * SEARCH_PAGE_SIZE + 1}&story={story}")
         html, stale = await self._html(url, ttl=1800)
-        games, has_more = parse_search(html, self.base)
+        games, has_more = await parsing.parse(parse_search, html, self.base)
         return Page(games, page, has_more, None, stale)
 
     async def featured(self) -> list[FeaturedSection]:
         html, _ = await self._html(f"{self.base}/")
-        return parse_featured(html, self.base)
+        return await parsing.parse(parse_featured, html, self.base)
 
     def featured_keys(self) -> dict[str, tuple[str, str]]:
         return {key: (title, site_label.capitalize()) for site_label, (key, title) in FEATURED_TITLES.items()}
@@ -514,7 +515,7 @@ class OnlineFixAdapter(SourceAdapter):
     async def details(self, game: Game) -> Game:
         self._check_site_url(game.url)
         html, _ = await self._html(game.url, ttl=1800)
-        game = parse_details(html, game, self.base)
+        game = await parsing.parse(parse_details, html, game, self.base)
         expanded: list[DownloadMethod] = []
         for m in game.download_methods or []:
             if m.kind is MethodKind.MIRRORS:

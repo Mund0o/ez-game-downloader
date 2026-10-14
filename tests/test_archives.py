@@ -266,3 +266,24 @@ def test_zip_with_zstandard_compression(tmp_path):
     assert {i.compress_type for i in zstd_zip.ZipFile(archive).infolist()} == {93}
     res = ar.extract(archive, tmp_path / "out")
     assert res.files == 2 and (tmp_path / "out" / "Absolver" / "readme.txt").read_bytes() == b"hello " * 1000
+
+
+@pytest.mark.skipif(ar.seven_zip() is None, reason="needs 7-Zip")
+def test_encrypted_zip_is_extracted_by_7zip_fast_and_checks_the_password(tmp_path):
+    """Password-protected zips (Cracked-Games, 40+ GB) took hours with Python's zipfile — which also held Python's
+    lock the whole time, so the app lagged. 7-Zip does it in its own process."""
+    import subprocess
+    src = tmp_path / "src"
+    (src / "Game").mkdir(parents=True)
+    (src / "Game" / "game.exe").write_bytes(os.urandom(200_000))
+    (src / "Game" / "data.pak").write_bytes(b"x" * 500_000)
+    a = tmp_path / "game.zip"
+    subprocess.run([ar.seven_zip(), "a", "-tzip", "-psecret", "-mem=ZipCrypto", "-bso0", "-bsp0", str(a), "Game"],
+                   cwd=src, check=True)
+    with pytest.raises(ar.PasswordRequiredError):
+        ar.extract(a, tmp_path / "bad", password="wrong")
+    seen = []
+    res = ar.extract(a, tmp_path / "out", password="secret", progress=lambda f, i: seen.append(f))
+    assert (tmp_path / "out" / "Game" / "data.pak").read_bytes() == b"x" * 500_000
+    assert res.files == 2 and seen and seen[-1] == 1.0
+    assert not [p for p in (tmp_path / "out").iterdir() if p.name.startswith(ar.STAGING_PREFIX)]

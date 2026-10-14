@@ -86,3 +86,30 @@ def test_default_order_interleaves_sources_without_dates():
     assert titles == ["SR 0", "CG 0", "SR 1", "CG 1", "SR 2", "CG 2"]
     recent = [g.title for g in filter_and_group(dated + undated, Filters(), sort=SortKey.RECENT)]
     assert recent[:3] == ["SR 0", "SR 1", "SR 2"]
+
+
+def test_pages_are_parsed_in_a_helper_process_with_a_thread_fallback(monkeypatch):
+    """Parsing in the app's own process held Python's lock for 10–70 ms per page, so the window stuttered when
+    new pages arrived while scrolling; the helper process has its own interpreter."""
+    import asyncio
+    import os
+    from concurrent.futures.process import BrokenProcessPool
+    from ezgd.sources import parsing
+
+    async def main():
+        pid = await parsing.parse(parsing._warm)
+        assert pid != os.getpid()                                # really another process
+        assert not parsing._disabled
+
+        class Broken:
+            def submit(self, *a, **k):
+                raise BrokenProcessPool("gone")
+        monkeypatch.setattr(parsing, "_pool", Broken())
+        monkeypatch.setattr(parsing, "_disabled", False)
+        assert await parsing.parse(os.getpid) == os.getpid()     # fell back to a thread, same result
+        assert parsing._disabled
+    try:
+        asyncio.run(main())
+    finally:
+        monkeypatch.setattr(parsing, "_disabled", False)
+        parsing.shutdown()

@@ -162,6 +162,7 @@ def _real_href(href: str, current: QUrl) -> str:
     return href
 PROBATION_SECONDS = 6          # a blank pop-up must go somewhere acceptable within this time
 HANG_SECONDS = 8               # a page whose script does not answer for this long is offered to be stopped
+HANG_STOP_SECONDS = 15         # … and is stopped by itself after this long
 
 if AVAILABLE:
     from PySide6.QtWebEngineCore import QWebEngineScript, QWebEngineSettings, QWebEngineUrlRequestInterceptor
@@ -507,6 +508,8 @@ def manager(actions) -> BrowserDownloads | None:
 class BrowserDownloadDialog(QDialog):
     """Only for the user's part: the check and the click. Hides itself as soon as a download starts."""
 
+    went_away = Signal()            # hidden (a download started) or closed — couch mode comes back then
+
     def __init__(self, actions, game, url: str, host_label: str, parent=None):
         super().__init__(parent)
         self.actions = actions
@@ -529,10 +532,15 @@ class BrowserDownloadDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 10, 10, 10)
         lay.setSpacing(8)
-        lay.addWidget(Banner("info", "Do the “I'm not a robot” check if one appears, then click the site's own "
-                                     "download button. This window closes by itself once the download starts — it "
-                                     "continues on the Downloads page and is added to your Library when done."))
-        bar = QHBoxLayout()
+        self._banner = Banner("info", "Do the “I'm not a robot” check if one appears, then click the site's own "
+                                      "download button. This window closes by itself once the download starts — it "
+                                      "continues on the Downloads page and is added to your Library when done.")
+        lay.addWidget(self._banner)
+        self.zoom = 1.0
+        from PySide6.QtWidgets import QWidget
+        self._bar_widget = QWidget(self)
+        bar = QHBoxLayout(self._bar_widget)
+        bar.setContentsMargins(0, 0, 0, 0)
         bar.addWidget(button("", "retry", "ghost", tooltip="Back", on_click=self.back))
         bar.addWidget(button("", "refresh", "ghost", tooltip="Reload", on_click=lambda: self.current.triggerAction(QWebEnginePage.Reload)))
         self.address = QLineEdit(url)
@@ -553,7 +561,7 @@ class BrowserDownloadDialog(QDialog):
         self.shield_count = label("", "small")
         bar.addWidget(self.shield_count)
         bar.addWidget(button("Cancel", variant="ghost", on_click=self.close))
-        lay.addLayout(bar)
+        lay.addWidget(self._bar_widget)
         self._shield_timer = QTimer(self)
         self._shield_timer.setInterval(1000)
         self._shield_timer.timeout.connect(self._update_shield)
@@ -590,6 +598,8 @@ class BrowserDownloadDialog(QDialog):
     def _attach(self, page):
         v = QWebEngineView(self.stack)
         v.setPage(page)
+        if self.zoom != 1.0:
+            v.setZoomFactor(self.zoom)
         for sig in (page.loadStarted, page.loadFinished):
             sig.connect(lambda *_a, page=page: self._page_loading(page))
         v.urlChanged.connect(lambda u, v=v: self.address.setText(u.toString()) if v is self.stack.currentWidget()
@@ -827,7 +837,8 @@ class BrowserDownloadDialog(QDialog):
                 self.notice.hide()
 
     def _watchdog(self) -> None:
-        """Every few seconds: is the page's script still answering? If not, offer to stop it."""
+        """Every few seconds: is the page's script still answering? If not, offer to stop it — and when it stays
+        frozen, stop it by itself (a hung page also ignores clicks, so the window looked frozen)."""
         if not self.isVisible():
             return
         now = time.monotonic()
@@ -835,9 +846,16 @@ class BrowserDownloadDialog(QDialog):
         if self._ping_sent and self._ping_page is page and now - self._ping_sent > HANG_SECONDS:
             if not self._hang_shown:
                 self._hang_shown = True
+                log.warning("browser: %s is not responding", page.url().toString()[:200])
                 self._show_notice("This page is not responding.", "Stop this page",
                                   lambda: self._replace_current(False))
                 self.notice.add_action("Reload", lambda: self._replace_current(True))
+            elif now - self._ping_sent > HANG_STOP_SECONDS:
+                log.warning("browser: stopped %s (no answer for %.0f s)", page.url().toString()[:200],
+                            now - self._ping_sent)
+                self._replace_current(False)
+                self._show_notice("The page stopped responding, so it was closed.", "Reload",
+                                  lambda: self._replace_current(True))
             return
         if self._ping_sent and self._ping_page is page:
             return                                  # still waiting for the last answer
@@ -931,12 +949,26 @@ class BrowserDownloadDialog(QDialog):
         self._pending, self._closed = [], []
         self.deleteLater()
 
+    def hideEvent(self, ev) -> None:
+        super().hideEvent(ev)
+        self.went_away.emit()
+
+    def couch_mode(self, zoom: float) -> None:
+        """Opened from couch mode: no desktop toolbar (the controller does all of it), pages zoomed for the TV."""
+        self._banner.hide()
+        self._bar_widget.hide()
+        self.layout().setContentsMargins(0, 0, 0, 0)
+        self.zoom = zoom
+        for v in self._views.values():
+            v.setZoomFactor(zoom)
+
     def closeEvent(self, ev) -> None:
         if any(d.state in ("downloading", "paused") for d in self.started):
             self.hide()                              # downloads keep running; disposed when they finish
             ev.ignore()
             return
         super().closeEvent(ev)
+        self.went_away.emit()
         self._dispose()
 
     def reject(self) -> None:          # Esc behaves like Cancel
@@ -973,13 +1005,14 @@ def shutdown() -> None:
     _INTERCEPTOR = None
 
 
-def open_browser_download(actions, game, url: str, host_label: str, parent) -> None:
+def open_browser_download(actions, game, url: str, host_label: str, parent):
     if not AVAILABLE:
         QMessageBox.information(parent, "In-app browser not installed",
                                 "The in-app browser component (Qt WebEngine) is not part of this build. Use “Open "
                                 "in browser” and then “Import downloaded file…”.")
-        return
+        return None
     # owned by the main window, not the game page: closing the game page must not stop the download
     dlg = BrowserDownloadDialog(actions, game, url, host_label, actions.parent() or parent)
     dlg.setAttribute(Qt.WA_DeleteOnClose, False)     # disposed explicitly once its downloads are done
     dlg.show()
+    return dlg

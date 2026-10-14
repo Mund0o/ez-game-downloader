@@ -37,6 +37,7 @@ from ezgd.catalog.normalize import canonical_genre
 from ezgd.core.fsutil import parse_size
 from ezgd.sources.base import (LayoutChangedError, ManualActionRequired, Page, ResolvedDownload,
                                SourceAdapter, SourceError, SourceInfo)
+from ezgd.sources import parsing
 
 log = logging.getLogger(__name__)
 
@@ -309,7 +310,7 @@ class CrackedGamesAdapter(SourceAdapter):
             html, stale = await self._get(f"/games/genre/{slug}", params)
         else:
             html, stale = await self._get("/games", params)
-        games, more = parse_listing(html, self.base)
+        games, more = await parsing.parse(parse_listing, html, self.base)
         return Page(games, page, more, None, stale)
 
     async def search(self, query: str, page: int = 1) -> Page:
@@ -321,7 +322,7 @@ class CrackedGamesAdapter(SourceAdapter):
             params["page"] = page
         # /games?search= is the allowed listing filter; /search itself is disallowed by robots.txt
         html, stale = await self._get("/games", params, ttl=1800)
-        games, more = parse_listing(html, self.base)
+        games, more = await parsing.parse(parse_listing, html, self.base)
         return Page(games, page, more, None, stale)
 
     async def details(self, game: Game) -> Game:
@@ -329,7 +330,7 @@ class CrackedGamesAdapter(SourceAdapter):
         if slug is None or slug != game.source_game_id:
             raise SourceError("refusing to fetch a non-cracked-games.org URL")
         html, _ = await self._get(f"/{slug}", ttl=1800)
-        return parse_details(html, game)
+        return await parsing.parse(parse_details, html, game)
 
     async def resolve(self, method: DownloadMethod, game: Game) -> ResolvedDownload:
         raise ManualActionRequired(method.note or BROWSER_NOTE, game.url)

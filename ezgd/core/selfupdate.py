@@ -32,6 +32,8 @@ from ezgd.library.updates import compare
 log = logging.getLogger(__name__)
 
 API = "https://api.github.com/repos/{repo}/releases/latest"
+REPO_API = "https://api.github.com/repos/{repo}"
+DEFAULT_REPO = "Mund0o/ez-game-downloader"       # the official releases; Settings can point elsewhere
 ASSETS = {"linux": "EZGameDownloader-linux-x86_64.tar.gz", "windows": "EZGameDownloader-windows-x64.zip"}
 NEW_SUFFIX, OLD_SUFFIX = ".update-new", ".update-old"
 MAX_ASSET = 1024 * 1024 * 1024
@@ -51,7 +53,7 @@ def parse_repo(text: str) -> str:
     m = re.match(r"^(?:https?://)?(?:www\.)?github\.com/([\w.-]+)/([\w.-]+?)(?:\.git)?(?:/.*)?$", t) or \
         re.match(r"^([\w.-]+)/([\w.-]+?)(?:\.git)?$", t)
     if not m or m.group(1) in (".", "..") or m.group(2) in (".", ".."):
-        raise UpdateError("Enter the GitHub repository as owner/name (for example mundo/ez-game-downloader) or its "
+        raise UpdateError(f"Enter the GitHub repository as owner/name (for example {DEFAULT_REPO}) or its "
                           "github.com link.")
     return f"{m.group(1)}/{m.group(2)}"
 
@@ -69,8 +71,15 @@ def version_of_tag(tag: str) -> str:
 
 async def check(client, repo: str) -> dict:
     repo = parse_repo(repo)
-    res = await client.fetch(API.format(repo=repo), max_bytes=2 * 1024 * 1024,
-                             headers={"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"})
+    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+    res = await client.fetch(API.format(repo=repo), max_bytes=2 * 1024 * 1024, headers=headers)
+    if res.status == 404 and (await client.fetch(REPO_API.format(repo=repo), max_bytes=2 * 1024 * 1024,
+                                                 headers=headers)).status == 200:
+        # the repository exists but has not published a release yet: nothing newer than this version
+        return {"repo": repo, "tag": "", "version": "", "current": __version__, "newer": False, "no_release": True,
+                "name": "", "notes": "", "published": None, "page": f"https://github.com/{repo}/releases",
+                "asset": None, "asset_url": None, "size": None, "sha256": None, "sums_url": None,
+                "checked_at": time.time()}
     if res.status == 404:
         raise UpdateError(f"GitHub has no published release for {repo} (or the repository is private or does not "
                           "exist).")

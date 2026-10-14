@@ -179,6 +179,7 @@ class SourceRegistry:
         for g in games:
             if g.withdrawn_known:
                 continue
+            await asyncio.sleep(0.5)           # background work: paced, so it never crowds the app (or the site)
             try:
                 fresh = await self.details(g)
             except Exception as exc:

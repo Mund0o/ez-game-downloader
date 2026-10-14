@@ -103,7 +103,7 @@ class MainWindow(QMainWindow):
         self._wishlist_timer = QTimer(self)
         self._wishlist_timer.setSingleShot(True)
         self._wishlist_timer.setInterval(300)
-        self._wishlist_timer.timeout.connect(lambda: self.pages["wishlist"].load())
+        self._wishlist_timer.timeout.connect(self._wishlist_changed)
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(1000)
         self._status_timer.timeout.connect(self._poll_summary)
@@ -283,6 +283,8 @@ class MainWindow(QMainWindow):
                 action = ("Open Wishlist", lambda: self.navigate("wishlist"))
             elif extra.get("app_update"):
                 action = ("Open Settings", lambda: self.navigate("settings"))
+            if self.couch is not None:
+                action = self._couch_action(extra, title)          # buttons that open couch mode's own pages
             host = self.couch.toasts if self.couch is not None else self.toasts
             host.show(title, text, kind, *([action] if action else []))
             window_active = self.isActiveWindow() or (self.couch is not None and self.couch.isActiveWindow())
@@ -299,6 +301,25 @@ class MainWindow(QMainWindow):
             pages["library"].saves_changed(payload)
         elif name in ("app_update", "app_update_progress"):
             pages["settings"].app_update_event(name, payload)
+
+    def _wishlist_changed(self) -> None:
+        self.pages["wishlist"].load()
+        if self.couch is not None:
+            self.couch.wishlist_changed()
+
+    def _couch_action(self, extra: dict, title: str):
+        """A message's button inside couch mode: it opens couch mode's page, not the hidden desktop window."""
+        from ezgd.ui import couch as c
+        if extra.get("library") or extra.get("diagnose"):
+            eid = extra.get("library") or extra.get("diagnose")
+            return ("Show in Library", lambda: self.couch and self.couch.go_to(c.T_LIBRARY, eid))
+        if title in ("Ready to play", "Game installed", "Ready to install", "Extraction finished"):
+            return ("Show in Library", lambda: self.couch and self.couch.go_to(c.T_LIBRARY))
+        if extra.get("wishlist"):
+            return ("Open Wishlist", lambda: self.couch and self.couch.go_to(c.T_WISHLIST))
+        if extra.get("app_update"):
+            return ("Open Settings", lambda: self.couch and self.couch.go_to(c.T_SETTINGS))
+        return None
 
     def _settings_loaded(self, s: dict, changed_key: str) -> None:
         self.settings.clear()
@@ -473,6 +494,7 @@ class MainWindow(QMainWindow):
             self.couch = None
         self._status_timer.stop()
         self._library_timer.stop()
+        self.covers.close()                        # no cover may arrive after the window is gone
         try:
             self.bridge.event.disconnect(self._on_event)
         except (RuntimeError, TypeError):

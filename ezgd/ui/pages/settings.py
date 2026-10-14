@@ -357,7 +357,8 @@ class SettingsPage(QWidget):
                                          "is installed; the previous version is kept until the new one has started.")
         rrow = QHBoxLayout()
         self.repo_edit = QLineEdit()
-        self.repo_edit.setPlaceholderText("owner/repository — e.g. mundo/ez-game-downloader")
+        from ezgd.core.selfupdate import DEFAULT_REPO
+        self.repo_edit.setPlaceholderText(DEFAULT_REPO)
         self.repo_edit.returnPressed.connect(self._save_repo)
         rrow.addWidget(self.repo_edit, 1)
         rrow.addWidget(button("Save", "check", on_click=self._save_repo))
@@ -423,10 +424,8 @@ class SettingsPage(QWidget):
     def _save_repo(self) -> None:
         def done(repo: str) -> None:
             self.repo_edit.setText(repo)
-            self.actions.toasts.show("Saved", f"Updates come from github.com/{repo}." if repo else
-                                     "App updates are off (no repository).", "success")
-            if repo:
-                self._check_app_update()
+            self.actions.toasts.show("Saved", f"Updates come from github.com/{repo}.", "success")
+            self._check_app_update()
         self.bridge.call(self.bridge.core.set_update_repo(self.repo_edit.text()), done,
                          lambda e: self.actions.fail("GitHub repository", e), owner=self)
 
@@ -436,10 +435,10 @@ class SettingsPage(QWidget):
             self.repo_edit.setText(st.get("repo") or "")
         latest = st.get("latest") or {}
         lines = [f"You have version {st.get('current')}."]
-        if not st.get("repo"):
-            lines.append("Enter the GitHub repository that publishes the app's releases.")
-        elif latest:
-            if latest.get("newer"):
+        if latest:
+            if latest.get("no_release"):
+                lines.append("No version has been published yet.")
+            elif latest.get("newer"):
                 lines.append(f"Version {latest['version']} is available"
                              + (f" (published {str(latest.get('published') or '')[:10]})." if latest.get("published")
                                 else "."))
@@ -484,7 +483,8 @@ class SettingsPage(QWidget):
         def done(info: dict) -> None:
             self.app_check_btn.setEnabled(True)
             self.actions.toasts.show("App update", f"Version {info['version']} is available." if info["newer"] else
-                                     f"You have the newest version ({info['current']}).",
+                                     f"You have the newest version ({info['current']})."
+                                     + (" No newer version has been published yet." if info.get("no_release") else ""),
                                      "success" if info["newer"] else "info")
             self.bridge.call(self.bridge.core.app_update_status(), self._app_status, owner=self)
 

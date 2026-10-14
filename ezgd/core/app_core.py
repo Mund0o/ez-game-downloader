@@ -193,7 +193,8 @@ class AppCore:
                     self._ensure_release(e)
         except Exception:
             log.exception("could not work out installed versions")
-        self._bg_tasks = [asyncio.create_task(self._resume_installs()),
+        from ezgd.sources import parsing
+        self._bg_tasks = [asyncio.create_task(parsing.warm_up()), asyncio.create_task(self._resume_installs()),
                           asyncio.create_task(self._game_updates_loop()),
                           asyncio.create_task(self._wishlist_loop()),
                           asyncio.create_task(self._app_update_loop())]
@@ -205,6 +206,11 @@ class AppCore:
             if self.db:
                 self.db.close()
             return
+        # a running install stops now (else the app would only exit once it is done — hours for a big game); it
+        # stays marked as running, so the next start finishes it
+        self.post.stop_all()
+        from ezgd.sources import parsing
+        parsing.shutdown()
         if getattr(self, "_verify_task", None):
             self._verify_task.cancel()
         if getattr(self, "_adblock_task", None):
@@ -2460,22 +2466,21 @@ class AppCore:
         st = self._app_update_state()
         app = selfupdate.install_dir()
         staged = bool(app and selfupdate.staged_version(app) and st.get("staged_version"))
-        return {**st, "current": __version__, "repo": self.settings.settings.update_repo,
+        return {**st, "current": __version__, "repo": self.settings.settings.update_repo or selfupdate.DEFAULT_REPO,
                 "packaged": app is not None, "install_dir": str(app) if app else None, "staged": staged,
                 "can_install": app is not None and os.name != "nt"}
 
     async def set_update_repo(self, text: str) -> str:
         from ezgd.core import selfupdate
         repo = selfupdate.parse_repo(text) if (text or "").strip() else ""
+        if repo.lower() == selfupdate.DEFAULT_REPO.lower():
+            repo = ""                                   # the official repository is the default; store nothing
         self.settings.set("update_repo", repo)
-        return repo
+        return repo or selfupdate.DEFAULT_REPO
 
     async def check_app_update(self, manual: bool = True) -> dict:
         from ezgd.core import selfupdate
-        repo = self.settings.settings.update_repo
-        if not repo:
-            raise SourceError("Set the GitHub repository with the app's releases first (Settings → App updates).")
-        info = await selfupdate.check(self.client, repo)
+        info = await selfupdate.check(self.client, self.settings.settings.update_repo or selfupdate.DEFAULT_REPO)
         st = self._app_update_state()
         st.update(last_check=time.time(), latest=info)
         if info["newer"] and st.get("notified") != info["version"]:
@@ -2496,7 +2501,7 @@ class AppCore:
             log.exception("removing the previous version failed")
         while True:
             s = self.settings.settings
-            if s.check_app_updates and s.update_repo and \
+            if s.check_app_updates and \
                     time.time() - self._app_update_state().get("last_check", 0) > self.APP_UPDATE_EVERY - 60:
                 try:
                     await self.check_app_update(manual=False)
