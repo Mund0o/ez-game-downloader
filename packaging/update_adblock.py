@@ -42,12 +42,18 @@ def main() -> int:
     OUT.mkdir(parents=True, exist_ok=True)
     header = (f"# StevenBlack/hosts (unified adware + malware), MIT licence — {adblock.SOURCE_URL}\n"
               f"# Date: {date or 'unknown'}\n")
-    with gzip.open(OUT / adblock.LIST_FILE, "wt", encoding="utf-8", compresslevel=9) as fh:
-        fh.write(header + "\n".join(sorted(domains)) + "\n")
+    _write_gz(OUT / adblock.LIST_FILE, header + "\n".join(sorted(domains)) + "\n")
     (OUT / "LICENSE-StevenBlack-hosts.txt").write_bytes(lic)
     print(f"ad blocklist refreshed: {len(domains)} domains, list date {date}")
     refresh_filter_lists()
     return 0
+
+
+def _write_gz(path: Path, text: str) -> None:
+    """Gzip without a timestamp: an unchanged list gives the same bytes, so a build does not show it as changed."""
+    data = gzip.compress(text.encode("utf-8"), compresslevel=9, mtime=0)
+    if not path.is_file() or path.read_bytes() != data:
+        path.write_bytes(data)
 
 
 def refresh_filter_lists() -> None:
@@ -64,8 +70,7 @@ def refresh_filter_lists() -> None:
         except Exception as exc:                   # never fail the build
             print(f"{fl.name} not refreshed ({exc}); keeping the bundled copy")
             continue
-        with gzip.open(out / f"{fl.key}.txt.gz", "wt", encoding="utf-8", compresslevel=9) as fh:
-            fh.write(text)
+        _write_gz(out / f"{fl.key}.txt.gz", text)
         print(f"{fl.name} refreshed: {n} rules")
 
 
