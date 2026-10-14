@@ -1,0 +1,122 @@
+[
+ {
+  "id": 26,
+  "count": 2655,
+  "name": "Action",
+  "slug": "action"
+ },
+ {
+  "id": 27,
+  "count": 2469,
+  "name": "Adventure",
+  "slug": "adventure"
+ },
+ {
+  "id": 29,
+  "count": 410,
+  "name": "Anime",
+  "slug": "anime"
+ },
+ {
+  "id": 53,
+  "count": 251,
+  "name": "Building",
+  "slug": "building"
+ },
+ {
+  "id": 52,
+  "count": 130,
+  "name": "First-person Shooter",
+  "slug": "fps"
+ },
+ {
+  "id": 32,
+  "count": 495,
+  "name": "Horror",
+  "slug": "horror"
+ },
+ {
+  "id": 33,
+  "count": 2624,
+  "name": "Indie",
+  "slug": "indie"
+ },
+ {
+  "id": 1538,
+  "count": 367,
+  "name": "Multiplayer",
+  "slug": "multiplayer"
+ },
+ {
+  "id": 1984,
+  "count": 32,
+  "name": "Nudity",
+  "slug": "nudity"
+ },
+ {
+  "id": 45,
+  "count": 277,
+  "name": "Open World",
+  "slug": "open-world"
+ },
+ {
+  "id": 35,
+  "count": 225,
+  "name": "Racing",
+  "slug": "racing"
+ },
+ {
+  "id": 63,
+  "count": 1201,
+  "name": "Role-playing Game",
+  "slug": "rpg"
+ },
+ {
+  "id": 70,
+  "count": 215,
+  "name": "Sci-fi",
+  "slug": "sci-fi"
+ },
+ {
+  "id": 41,
+  "count": 360,
+  "name": "Shooters",
+  "slug": "shooting"
+ },
+ {
+  "id": 37,
+  "count": 1600,
+  "name": "Simulation",
+  "slug": "simulation"
+ },
+ {
+  "id": 38,
+  "count": 240,
+  "name": "Sports",
+  "slug": "sports"
+ },
+ {
+  "id": 42,
+  "count": 1139,
+  "name": "Strategy",
+  "slug": "strategy"
+ },
+ {
+  "id": 119,
+  "count": 250,
+  "name": "Survival",
+  "slug": "survival"
+ },
+ {
+  "id": 1,
+  "count": 17,
+  "name": "Uncategorized",
+  "slug": "uncategorized"
+ },
+ {
+  "id": 39,
+  "count": 122,
+  "name": "Virtual Reality",
+  "slug": "vr"
+ }
+]

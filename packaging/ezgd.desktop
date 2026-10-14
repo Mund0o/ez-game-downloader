@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=EZ Game Downloader
+Comment=Game catalog, torrent/HTTP download manager and library
+Exec=ezgd
+Icon=ezgd
+Terminal=false
+Categories=Game;Network;FileTransfer;
+StartupWMClass=ezgd

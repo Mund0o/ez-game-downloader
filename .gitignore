@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+EZGameDownloader/
+packaging/build-assets/
+*.sqlite3
+*.egg-info/
+.claude/
+*.tar.gz
+SHA256SUMS
+Windows EZ Game Downloader/

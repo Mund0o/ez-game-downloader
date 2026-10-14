@@ -1,0 +1,69 @@
+# EZ Game Downloader — sample configuration
+#
+# Copy this file to your config folder as `config.toml` to seed settings on first
+# start, or import it any time with:  python -m ezgd --import-config config.toml
+#   Linux:   ~/.config/EZGameDownloader/config.toml
+#   Windows: %APPDATA%\EZGameDownloader\config.toml
+# Everything here can also be changed in the Settings page. Unknown keys are
+# reported and ignored. Values outside the allowed range are clamped.
+
+[storage]
+download_dir = "~/Downloads/EZ Games"     # where downloads are written
+install_dir = "~/Games"                   # where archives are extracted
+
+[downloads]
+max_concurrent_downloads = 3              # 1–16; applies to HTTP and torrent transfers together
+http_speed_limit_kbps = 0                 # shared HTTP limit in KiB/s, 0 = unlimited
+http_max_retries = 5                      # retries with exponential backoff for transient errors
+http_timeout_seconds = 30
+
+[torrent]
+torrent_listen_port = 6881                # 0 = random port
+torrent_max_connections = 200
+torrent_download_limit_kbps = 0           # 0 = unlimited
+torrent_upload_limit_kbps = 0
+torrent_enable_dht = true
+torrent_enable_lsd = true                 # local service discovery
+torrent_enable_upnp = true                # UPnP / NAT-PMP port mapping
+torrent_seed_after_complete = false
+torrent_stall_minutes = 10                # report "stalled" after this long without peers
+
+[extraction]
+auto_extract = true                       # extract supported archives after download
+delete_archive_after_extract = false
+extract_into_install_dir = true           # false = extract next to the downloaded archive
+unrar_tool = ""                           # optional path to unrar / 7z for RAR archives
+
+[catalog]
+hide_withdrawn_games = true               # hide OnlineFix games whose guide was closed ("Руководство закрыто")
+hide_adult_games = true                   # hide games a source marks 18+ (cracked-games.org)
+browser_adblock = true                    # in-app browser: block ad/pop-up/tracker domains and pop-unders
+
+[sources]
+# Enable or disable each source adapter
+onlinefix = { enabled = true }
+steamrip = { enabled = true }
+crackedgames = { enabled = true }
+fitgirl = { enabled = true }
+ankergames = { enabled = true }
+
+[cache]
+cache_ttl_minutes = 60                    # how long listing pages are reused before re-checking
+cover_cache_mb = 200
+
+[library]
+confirm_before_launch = true              # always confirm before running an executable
+launch_through_steam = true              # full Steam overlay: start games through Steam shortcuts (one Steam restart)
+steam_overlay = true                     # quick overlay for games not in Steam yet (friends list only)
+proton_version = ""                       # "" = newest detected Proton (Linux)
+steam_root = ""                           # "" = auto-detect
+
+[interface]
+theme_accent = "violet"                   # violet | cyan | emerald | crimson | amber
+theme_contrast = "dark"                   # dark | midnight
+card_size = "comfortable"                 # compact | comfortable | large
+reduce_motion = false
+notifications_enabled = true
+
+[diagnostics]
+log_level = "INFO"                        # DEBUG | INFO | WARNING | ERROR

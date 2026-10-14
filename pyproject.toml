@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ezgd"
+version = "0.2.0"
+description = "EZ Game Downloader - cross-platform game catalog, torrent/HTTP download manager and library"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "PySide6-Essentials>=6.8,<6.13",
+    "PySide6-WebEngine>=6.12,<6.13",
+    "httpx>=0.28,<0.29",
+    "httpcore>=1.0.7,<2",
+    "certifi>=2025.1.31",
+    "beautifulsoup4>=4.12,<5",
+    "lxml>=5,<7",
+    "libtorrent>=2.0.10,<2.2",
+    "py7zr>=0.22,<2",
+    "rarfile>=4.2,<5",
+    "adblock>=0.6,<0.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-qt>=4.4", "pytest-asyncio>=0.24", "pyinstaller>=6.10"]
+
+[project.gui-scripts]
+ezgd = "ezgd.app:run"
+
+[tool.setuptools.packages.find]
+include = ["ezgd*"]
+
+[tool.setuptools.package-data]
+"ezgd.resources" = ["certs/*.pem", "*.svg", "*.png", "*.ico", "adblock/*.gz", "adblock/filters/*.gz"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+qt_api = "pyside6"
+markers = [
+    "live: hits the real third-party websites (deselected by default; run with -m live)",
+    "slow: longer-running integration tests (torrent swarm, large files)",
+    "proton: launches a real Windows program through the installed Proton (run with -m proton)",
+]
+addopts = "-m 'not live and not proton'"
+filterwarnings = [
+    "ignore::DeprecationWarning:libtorrent",
+    "ignore:.*is deprecated.*:DeprecationWarning",
+    "ignore:create_torrent constructor from file_storage is deprecated:DeprecationWarning",
+]
