@@ -95,12 +95,32 @@ class CouchBrowser:
         self.dlg.couch_mode(max(1.0, min(1.75, s)))
         bar = round(self.bar_height())
         self.dlg.layout().setContentsMargins(0, 0, 0, bar)
-        self.dlg.showFullScreen()
+        # couch mode stays where it is, underneath: whichever way the browser closes, couch mode is right there
+        self.couch.wc.keep_above(False)
+        self.couch.place_window(self.dlg, self.wc)      # full screen (or the display settings' choice)
         self.dlg.raise_()
         self.dlg.activateWindow()
         self.overlay.setGeometry(self.dlg.rect())
         self.overlay.raise_()
         self.overlay.show()
+        # a way out without a controller: a big ✕ for the mouse, Esc on the keyboard
+        from PySide6.QtGui import QKeySequence, QShortcut
+        from PySide6.QtWidgets import QPushButton
+        s = self.couch._s()
+        self.close_button = QPushButton("✕  Close", self.dlg)
+        self.close_button.setCursor(Qt.PointingHandCursor)
+        self.close_button.setStyleSheet(
+            f"QPushButton {{ background: rgba(20,22,30,215); color: white; border: 2px solid rgba(255,255,255,90);"
+            f" border-radius: {round(22 * s)}px; padding: {round(8 * s)}px {round(22 * s)}px;"
+            f" font-size: {round(19 * s)}px; font-weight: 800; }}"
+            f" QPushButton:hover {{ background: {theme.CURRENT.danger}; border-color: white; }}")
+        self.close_button.clicked.connect(self.close)
+        self.close_button.adjustSize()
+        self.close_button.show()
+        self._place_close()
+        self._esc = QShortcut(QKeySequence(Qt.Key_Escape), self.dlg)
+        self._esc.setContext(Qt.WindowShortcut)
+        self._esc.activated.connect(self.close)
         self.active = True
         self.couch.pads.pointer_mode = True
         r = self.view_rect()
@@ -110,6 +130,15 @@ class CouchBrowser:
         QTimer.singleShot(300, self.dlg, lambda: (self.wc.keep_above(True), self.wc.activate()))
         self._follower = _ResizeFollower(self)
         self.dlg.installEventFilter(self._follower)
+
+    def _place_close(self) -> None:
+        b = getattr(self, "close_button", None)
+        if b is None:
+            return
+        s = self.couch._s()
+        bar = self.bar_height()
+        b.move(round(self.dlg.width() - b.width() - 24 * s), round(self.dlg.height() - bar + (bar - b.height()) / 2))
+        b.raise_()
 
     def _check_gone(self) -> None:
         import shiboken6
@@ -133,7 +162,8 @@ class CouchBrowser:
             return
         self.couch.pads.pointer_mode = False
         self.couch.browser = None
-        self.couch.come_back_from("browser")
+        self.couch._away = None
+        self.couch._come_back()                          # in front again (and filling its screen)
         if any(d.state in ("downloading", "paused", "completed") for d in getattr(self.dlg, "started", [])):
             self.couch.toasts.show("Download started", "It continues on the Downloads tab and goes into your "
                                                        "Library when it is done.", "success")
@@ -371,8 +401,11 @@ class CouchBrowser:
             x = couch._glyph(p, x, y, action, text)
         p.setFont(couch._font(16 * s, 600))
         p.setPen(QColor(255, 255, 255, 150))
+        if couch.pad_family == "" and self.overlay.keyboard is None and self.menu is None:
+            x = couch._glyph(p, x, y, "Esc", "Close")
         url = self.dlg.current.url().host() if self.dlg.current is not None else ""
-        p.drawText(QRectF(x, H - bar, W - x - 40 * s, bar), Qt.AlignVCenter | Qt.AlignRight,
+        room = W - x - 40 * s - (self.close_button.width() + 30 * s if getattr(self, "close_button", None) else 0)
+        p.drawText(QRectF(x, H - bar, max(0.0, room), bar), Qt.AlignVCenter | Qt.AlignRight,
                    f"{self.dlg.host_label} · {url}")
         if self.menu is not None:
             self._paint_menu(p, s, W, H)
@@ -426,4 +459,5 @@ class _ResizeFollower(QObject):
             self.cb.overlay.setGeometry(self.cb.dlg.rect())
             self.cb.dlg.layout().setContentsMargins(0, 0, 0, round(self.cb.bar_height()))
             self.cb.overlay.raise_()
+            self.cb._place_close()
         return False

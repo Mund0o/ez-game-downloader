@@ -861,6 +861,9 @@ class BrowserDownloadDialog(QDialog):
             return                                  # still waiting for the last answer
 
         def pong(_r, page=page) -> None:
+            import shiboken6
+            if not shiboken6.isValid(self):
+                return                              # an answer that arrived after the window was closed
             if page is self._ping_page:
                 self._ping_sent = 0.0
                 if self._hang_shown:
@@ -967,7 +970,10 @@ class BrowserDownloadDialog(QDialog):
             self.hide()                              # downloads keep running; disposed when they finish
             ev.ignore()
             return
-        super().closeEvent(ev)
+        # not QDialog.closeEvent: it turns the close into reject(), whose close() inside a close is dropped — so
+        # Alt+F4 / the title bar's ✕ were refused and the window stayed (a friend was locked in it)
+        ev.accept()
+        self.hide()
         self.went_away.emit()
         self._dispose()
 

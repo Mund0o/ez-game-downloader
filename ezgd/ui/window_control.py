@@ -77,6 +77,11 @@ class WindowControl:
             self.widget.raise_()
             self.widget.activateWindow()
 
+    def place(self, x: int, y: int, w: int, h: int) -> None:
+        """A borderless window at exactly this spot (Wayland apps cannot position their own windows)."""
+        if self.kwin:
+            self._kwin(f"w.noBorder = true; w.frameGeometry = {{x: {x}, y: {y}, width: {w}, height: {h}}};")
+
     def forget(self) -> None:
         """The window closes: nothing to undo (KWin forgets a closed window's state)."""
         self._above = None

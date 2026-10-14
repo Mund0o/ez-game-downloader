@@ -25,7 +25,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable
 
-from PySide6.QtCore import QEasingCurve, QObject, QPointF, QRectF, QSize, Qt, QTimer, QVariantAnimation, Signal
+from PySide6.QtCore import (QEasingCurve, QObject, QPointF, QRect, QRectF, QSize, Qt, QTimer, QVariantAnimation,
+                            Signal)
 from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QLinearGradient, QPainter, QPainterPath,
                            QPen, QPixmap, QRadialGradient)
 from PySide6.QtWidgets import QApplication, QWidget
@@ -902,12 +903,9 @@ class CouchWindow(QWidget):
 
     # ============================================================== showing
     def open(self, screen=None) -> None:
-        screen = screen or QApplication.primaryScreen()
-        self._target_screen = screen
-        if screen is not None:
-            self.setScreen(screen)
-            self.setGeometry(screen.geometry())       # X11 / Windows: start on that monitor (Wayland ignores it)
-        self.showFullScreen()
+        self._target_screen = screen or QApplication.primaryScreen()
+        self.place_window(self, self.wc)
+        screen = self.screen() or self._target_screen
         self.raise_()
         self.activateWindow()
         self.setFocus(Qt.ActiveWindowFocusReason)
@@ -936,30 +934,126 @@ class CouchWindow(QWidget):
             self._set_pace(screen)
         self._fit_screen()
 
+    def display_target(self):
+        """(screen, rectangle, mode) from the display settings: which screen, full screen / borderless / a custom
+        size (given in the screen's real pixels — what people know as their resolution)."""
+        st = self.actions.settings
+        screens = QApplication.screens()
+        name = st.get("couch_screen") or ""
+        screen = next((x for x in screens if x.name() == name), None) or getattr(self, "_target_screen", None) \
+            or self.screen() or QApplication.primaryScreen()
+        mode = st.get("couch_window") or "fullscreen"
+        geo = QRect(screen.geometry())
+        res = str(st.get("couch_resolution") or "")
+        if mode == "custom" and "x" in res:
+            try:
+                pw, ph = (int(v) for v in res.lower().split("x", 1))
+                dpr = max(1.0, float(screen.devicePixelRatio()))
+                geo = QRect(geo.x(), geo.y(), max(640, round(pw / dpr)), max(400, round(ph / dpr)))
+            except ValueError:
+                pass
+        return screen, geo, mode
+
+    def place_window(self, win, wc=None) -> None:
+        """Show ``win`` (couch mode or its browser) the way the display settings say."""
+        screen, geo, mode = self.display_target()
+        frameless = bool(win.windowFlags() & Qt.FramelessWindowHint)
+        if mode == "fullscreen":
+            if frameless:
+                win.setWindowFlag(Qt.FramelessWindowHint, False)
+            win.setScreen(screen)
+            win.setGeometry(geo)                      # X11 / Windows: on that monitor (Wayland places it itself)
+            win.showFullScreen()
+        else:
+            if win.isFullScreen():
+                win.showNormal()
+            if not frameless:
+                win.setWindowFlag(Qt.FramelessWindowHint, True)
+            win.setScreen(screen)
+            win.setGeometry(geo)
+            win.show()
+            if wc is not None:
+                wc.place(geo.x(), geo.y(), geo.width(), geo.height())
+        log.info("couch mode display: %s (%dx%d, scale %.2f, %.0f Hz) on %s, %d screen(s); %s %dx%d", screen.name(),
+                 screen.geometry().width(), screen.geometry().height(), screen.devicePixelRatio(),
+                 screen.refreshRate(), QApplication.platformName(), len(QApplication.screens()), mode, geo.width(),
+                 geo.height())
+
     def _fit_screen(self) -> None:
-        """Cover the whole screen, whatever its size, shape or scaling (a window manager may place a full-screen
-        window short of the edges — seen with mixed-DPI and ultra-wide screens)."""
+        """Cover what the display settings ask for — the whole screen by default, whatever its size, shape or
+        scaling (a window manager may place a full-screen window short of the edges)."""
         if self._exiting or not self.isVisible() or self.isMinimized():
             return
-        screen = self.screen() or getattr(self, "_target_screen", None)
-        if screen is None:
-            return
-        want = screen.geometry()
-        if self.geometry() != want or not self.isFullScreen():
-            log.info("couch mode: %s is %dx%d (scale %.2f, %.0f Hz) — the window was %dx%d; filling it",
-                     screen.name(), want.width(), want.height(), screen.devicePixelRatio(), screen.refreshRate(),
-                     self.width(), self.height())
-            self.setGeometry(want)
-            self.showFullScreen()
+        target, want, mode = self.display_target()
+        on = self.screen()
+        if mode == "fullscreen" and on is not None:
+            # several monitors: the compositor decides where a full-screen window goes — fill *that* monitor
+            # (forcing another monitor's size onto it left part of a bigger screen uncovered); move only when a
+            # screen was chosen in Settings
+            chosen = bool(self.actions.settings.get("couch_screen"))
+            if not (chosen and target is not None and target is not on):
+                want = on.geometry()
+        if self.geometry() != want or (mode == "fullscreen") != self.isFullScreen():
+            log.info("couch mode: the window was %dx%d on %s, should be %dx%d (%s); fixing it", self.width(),
+                     self.height(), on.name() if on is not None else "?", want.width(), want.height(), mode)
+            if mode == "fullscreen" and want == (on.geometry() if on is not None else None):
+                self.setGeometry(want)
+                self.showFullScreen()
+            else:
+                self.place_window(self, self.wc)
         self.images.clear()
         self._dirty = True
         super().update()
+
+    def apply_display(self, revert: dict | None = None) -> None:
+        """Display settings changed: show couch mode that way now. With ``revert`` (the previous values) ask
+        "Keep these display settings?" and go back by itself after 15 seconds — a setting that does not suit the
+        screen can never leave anyone stuck."""
+        self.reduce_motion = bool(self.actions.settings.get("reduce_motion"))
+        self.place_window(self, self.wc)
+        self._set_pace(self.screen())
+        QTimer.singleShot(400, self, self._fit_screen)
+        if revert is None:
+            return
+        left = [15]
+
+        def keep() -> None:
+            ticker.stop()
+            self._close_overlay()
+
+        def undo() -> None:
+            ticker.stop()
+            self._close_overlay()
+            for k, v in revert.items():
+                self.actions.settings[k] = v
+                self.bridge.call(self.bridge.core.set_setting(k, v), None, lambda _e: None, owner=self)
+            self.apply_display(None)
+            self.toasts.show("Display settings put back", "", "info")
+
+        def tick() -> None:
+            left[0] -= 1
+            if self.overlay is None or self.overlay.tag != "display":
+                ticker.stop()
+            elif left[0] <= 0:
+                undo()
+            else:
+                self.overlay.text = f"Going back to the previous settings in {left[0]} s."
+                self.update()
+        ticker = QTimer(self)
+        ticker.setInterval(1000)
+        ticker.timeout.connect(tick)
+        ticker.start()
+        self.show_overlay("Keep these display settings?", f"Going back to the previous settings in {left[0]} s.",
+                          [("Keep", keep, "primary"), ("Go back", undo, "ghost")], cancel=undo, tag="display")
 
     # ------------------------------------------------------- steady frames
     def _set_pace(self, screen) -> None:
         """Frames go out at one steady rate (60 Hz, or the screen's own rate when that is a multiple). On a VRR /
         FreeSync / G-Sync screen the refresh rate follows the app's frames: uneven frames made it jump around —
         the flicker people saw."""
+        if not self.actions.settings.get("couch_steady_frames", True):
+            self._pump.stop()                           # switched off in Settings: frames only when something moves
+            return
         hz = float(screen.refreshRate()) if screen is not None else 60.0
         if not hz or hz < 30:
             hz = 60.0
@@ -2180,7 +2274,8 @@ class CouchWindow(QWidget):
 
     # ============================================================== painting
     def _s(self) -> float:
-        return max(0.55, min(2.2, self.height() / 1080))
+        scale = int(self.actions.settings.get("couch_ui_scale") or 100) / 100
+        return max(0.4, min(3.0, max(0.55, min(2.2, self.height() / 1080)) * scale))
 
     def _font(self, px: float, weight: int = 400) -> QFont:
         key = (max(9, int(px)), weight)

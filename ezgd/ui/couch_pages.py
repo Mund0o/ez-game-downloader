@@ -413,6 +413,9 @@ class Keyboard:
 
 
 # ====================================================================== store
+SORT_NAMES = {"relevance": "Best match", "recent": "Newest", "title": "A – Z", "sources": "Most sites"}
+
+
 def source_tags(group) -> list[tuple[str, str]]:
     """(site name, site colour) for every site that offers this game — shown on its tile."""
     seen: list[str] = []
@@ -435,13 +438,13 @@ class Feed:
     """Games from the sites, page after page as you scroll down (like the desktop's All games page): the next page
     of every site that has more is fetched when the focus nears the end."""
 
-    def __init__(self, w, sids: list[str], query: str = "", genre: str | None = None, on_change=None):
+    def __init__(self, w, sids: list[str], query: str = "", genre: str | None = None, on_change=None, sort=None):
         from ezgd.catalog.search import SortKey
         self.w = w
         self.sids = list(sids)
         self.query = query
         self.genre = genre
-        self.sort = SortKey.RELEVANCE if query else SortKey.RECENT
+        self.sort = sort or (SortKey.RELEVANCE if query else SortKey.RECENT)
         self.games: dict[str, object] = {}
         self.groups: list = []
         self.pages: dict[str, int] = {}
@@ -469,6 +472,17 @@ class Feed:
             self.inflight.add(sid)
             coro = b.core.search(self.query, n, [sid]) if self.query else b.core.latest(n, [sid], self.genre)
             b.call(coro, lambda res, s=sid: self._loaded(s, res), lambda e, s=sid: self._failed(s, e), owner=self.w)
+
+    def seed(self, games) -> None:
+        """Games the app already knows (its catalog): shown at once, while the sites are asked for more."""
+        for g in games:
+            if not self.sids or g.source in self.sids:
+                self.games.setdefault(g.id, g)
+        self._regroup()
+
+    def set_sort(self, sort) -> None:
+        self.sort = sort
+        self._regroup()
 
     def _loaded(self, sid: str, res) -> None:
         if self.closed:
@@ -517,6 +531,7 @@ class StorePage(Page):
         self.shelf = 0                               # Discover: the focused shelf
         self.cols: dict[int, int] = {}               # Discover: focused tile per shelf
         self.gi = 0                                  # grids: the focused tile
+        self._all_sort = None                        # "All games": the order chosen last
         self.hscroll: dict[int, float] = {}
         self._gen = 0
 
@@ -526,10 +541,12 @@ class StorePage(Page):
         out = []
         if self.query:
             out.append(("search", f"“{self.query}”"))
-        out += [("discover", "Discover"), ("new", "New on the sites")]
+        out += [("discover", "Discover"), ("all", "All games"), ("new", "New on the sites")]
         out += [(f"sec:{k}", title) for k, (title, _g) in self.sections.items()]
         out += [(f"site:{sid}", theme.source_name(sid)) for sid in self._sources()]
         out.append(("genre", f"Genre: {self.genre}" if self.genre else "Genre ▾"))
+        if self.feed is not None:
+            out.append(("sort", f"Sort: {SORT_NAMES.get(self.feed.sort, 'Newest')} ▾"))
         return out
 
     def _sources(self) -> list[str]:
@@ -539,6 +556,9 @@ class StorePage(Page):
     def set_filter(self, key: str) -> None:
         if key == "genre":
             self._choose_genre()
+            return
+        if key == "sort":
+            self._choose_sort()
             return
         if key != "search" and self.query:
             self.query = ""
@@ -552,6 +572,13 @@ class StorePage(Page):
             self.feed = Feed(self.w, [key[5:]], on_change=self._feed_changed)
         elif key == "new":
             self.feed = Feed(self.w, self._sources(), on_change=self._feed_changed)
+        elif key == "all":
+            # every game from every site: what the app already knows at once, then page after page from all sites
+            self.feed = Feed(self.w, self._sources(), on_change=self._feed_changed, sort=self._all_sort)
+            feed = self.feed
+            b = self.w.bridge
+            b.call(b.core.cached_recent(5000), lambda games, f=feed: f.seed(games) if not f.closed else None,
+                   lambda _e: None, owner=self.w)
         elif key == "genre:set":
             self.feed = Feed(self.w, self._sources(), genre=self.genre, on_change=self._feed_changed)
             self.filter = "genre"
@@ -563,6 +590,27 @@ class StorePage(Page):
         self.chip = keys.index(self.filter) if self.filter in keys else 0
         self.w.refresh_bg()
         self.w.update()
+
+    def _choose_sort(self) -> None:
+        from ezgd.catalog.search import SortKey
+        options = [(SortKey.RECENT, "Newest first"), (SortKey.TITLE, "A – Z"),
+                   (SortKey.SOURCES, "On the most sites")]
+        if self.query:
+            options.insert(0, (SortKey.RELEVANCE, "Best match"))
+
+        def pick(sort) -> None:
+            self.w.close_overlay()
+            if self.feed is not None:
+                if self.filter == "all":
+                    self._all_sort = sort
+                self.gi = 0
+                self._focus_key = None
+                self.feed.set_sort(sort)
+            self.row = 2
+        rows = [(("✓  " if self.feed is not None and self.feed.sort == k else "") + t, lambda k=k: pick(k), "ghost",
+                 "") for k, t in options]
+        rows.append(("Close", self.w.close_overlay, "ghost", ""))
+        self.w.menu("Sort", rows)
 
     def _choose_genre(self) -> None:
         b = self.w.bridge
@@ -726,7 +774,7 @@ class StorePage(Page):
     # ------------------------------------------------------------- input
     def _cycle(self, d: int) -> None:
         """LT / RT: the previous / next filter, right away (the genre chip is chosen with A)."""
-        keys = [k for k, _l in self.chips() if k != "genre"]
+        keys = [k for k, _l in self.chips() if k not in ("genre", "sort", "search")]
         cur = self.filter if self.filter in keys else "discover"
         nxt = keys[(keys.index(cur) + d) % len(keys)]
         self.set_filter(nxt)
@@ -772,7 +820,7 @@ class StorePage(Page):
                 self.chip = max(0, min(len(chips) - 1, self.chip + (1 if name == "right" else -1)))
             elif name == "a":
                 self.set_filter(chips[self.chip][0])
-                if chips[self.chip][0] != "genre":
+                if chips[self.chip][0] not in ("genre", "sort"):
                     self.row = 2
             elif name == "down":
                 self.row = 2
@@ -832,7 +880,7 @@ class StorePage(Page):
             if click:
                 key = self.chips()[self.chip][0]
                 self.set_filter(key)
-                if key != "genre":
+                if key not in ("genre", "sort"):
                     self.row = 2
             return
         was = (self.row, self.shelf, self.cols.get(self.shelf, 0), self.gi)
@@ -1592,8 +1640,7 @@ def open_browser(w, game, method, target: str) -> None:
     if dlg is None:
         return
     from ezgd.ui.couch_browser import CouchBrowser
-    w.step_away("browser")
-    w.browser = CouchBrowser(w, dlg)                # full screen, the controller drives it
+    w.browser = CouchBrowser(w, dlg)                # full screen over couch mode, the controller drives it
     w.browser.start()
     if target != getattr(method, "url", target):
         w.toasts.show(f"Click “{label}” on the page", f"{label} only accepts visits from the game's page.", "info")
@@ -1922,6 +1969,7 @@ class SettingsPage(Page):
                               str(st.get("download_dir") or "")))
         items.append(Item("Pause all downloads", self._pause_all))
         items.append(Item("Resume all downloads", self._resume_all))
+        self._display_rows(items, st)
         for section, keys in TOGGLES:
             if section != "Downloads":
                 items.append(Item(section, kind="header"))
@@ -1946,6 +1994,81 @@ class SettingsPage(Page):
         self.items = items
         same = next((k for k, it in enumerate(items) if it.label == old), None)
         self.focus = same if same is not None else self._first(items)
+
+    # ------------------------------------------------------------ display
+    def _screens(self) -> list[tuple[str, str]]:
+        from PySide6.QtWidgets import QApplication
+        out = [("", "The app's screen")]
+        for sc in QApplication.screens():
+            g = sc.geometry()
+            dpr = sc.devicePixelRatio()
+            out.append((sc.name(), f"{sc.name()} · {round(g.width() * dpr)}×{round(g.height() * dpr)}"))
+        return out
+
+    def _resolutions(self) -> list[tuple[str, str]]:
+        screen, _geo, _mode = self.w.display_target()
+        g, dpr = screen.geometry(), screen.devicePixelRatio()
+        own = f"{round(g.width() * dpr)}x{round(g.height() * dpr)}"
+        common = ["1280x720", "1600x900", "1920x1080", "2560x1080", "2560x1440", "3440x1440", "3840x1600",
+                  "3840x2160", "5120x1440"]
+        vals = [own] + [c for c in common if c != own]
+        cur = str(self._get("couch_resolution") or "")
+        if cur and cur not in vals:
+            vals.insert(1, cur)
+        return [(v, v.replace("x", " × ") + ("  (this screen)" if v == own else "")) for v in vals]
+
+    def _display_rows(self, items: list, st: dict) -> None:
+        items.append(Item("Couch mode display", kind="header"))
+        screens = self._screens()
+        cur = str(st.get("couch_screen") or "")
+        label = next((t for v, t in screens if v == cur), screens[0][1])
+        items.append(Item("Screen", lambda: self._cycle_display("couch_screen", screens, 1), "", "choice", label,
+                          left=lambda: self._cycle_display("couch_screen", screens, -1),
+                          right=lambda: self._cycle_display("couch_screen", screens, 1)))
+        modes = [("fullscreen", "Full screen"), ("borderless", "Borderless window"), ("custom", "Custom size")]
+        mode = str(st.get("couch_window") or "fullscreen")
+        items.append(Item("Window", lambda: self._cycle_display("couch_window", modes, 1),
+                          "Try “Borderless window” or a custom size if couch mode does not fill your screen",
+                          "choice", dict(modes).get(mode, "Full screen"),
+                          left=lambda: self._cycle_display("couch_window", modes, -1),
+                          right=lambda: self._cycle_display("couch_window", modes, 1)))
+        if mode == "custom":
+            res = self._resolutions()
+            if not st.get("couch_resolution"):
+                st["couch_resolution"] = res[0][0]
+            cur_res = str(st.get("couch_resolution"))
+            items.append(Item("Resolution", lambda: self._cycle_display("couch_resolution", res, 1), "", "choice",
+                              dict(res).get(cur_res, cur_res),
+                              left=lambda: self._cycle_display("couch_resolution", res, -1),
+                              right=lambda: self._cycle_display("couch_resolution", res, 1)))
+        sizes = [75, 90, 100, 110, 125, 150, 175, 200]
+        size = int(st.get("couch_ui_scale") or 100)
+        items.append(Item("Interface size", lambda: self._cycle_scale(sizes, 1), "", "choice", f"{size} %",
+                          left=lambda: self._cycle_scale(sizes, -1), right=lambda: self._cycle_scale(sizes, 1)))
+        on = bool(st.get("couch_steady_frames", True))
+        items.append(Item("Steady frame rate (no flicker on VRR / FreeSync / G-Sync screens)",
+                          lambda: (self._set("couch_steady_frames", not bool(self._get("couch_steady_frames"))),
+                                   self.w._set_pace(self.w.screen())), "", "toggle", "on" if on else "off"))
+
+    def _cycle_display(self, key: str, options: list[tuple[str, str]], d: int) -> None:
+        values = [v for v, _t in options]
+        cur = str(self._get(key) or values[0])
+        i = values.index(cur) if cur in values else 0
+        new = values[(i + d) % len(values)]
+        if new == cur:
+            return
+        before = {k: self._get(k) for k in ("couch_screen", "couch_window", "couch_resolution")}
+        self._set(key, new)
+        self.w.apply_display(revert=before)           # asks "Keep these display settings?" (back in 15 s)
+
+    def _cycle_scale(self, sizes: list[int], d: int) -> None:
+        cur = int(self._get("couch_ui_scale") or 100)
+        i = min(range(len(sizes)), key=lambda k: abs(sizes[k] - cur))
+        self._set("couch_ui_scale", sizes[max(0, min(len(sizes) - 1, i + d))])
+        self.w._fonts.clear()
+        self.w._tab_fit.clear()
+        self.w.images.clear()
+        self.w.update()
 
     def _cycle_num(self, d: int) -> None:
         n = int(self._get("max_concurrent_downloads") or 3) + d

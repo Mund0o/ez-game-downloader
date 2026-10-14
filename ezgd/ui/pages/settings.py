@@ -323,6 +323,25 @@ class SettingsPage(QWidget):
         self._check(f, "reduce_motion", "Reduce animations")
         self._check(f, "notifications_enabled", "Show desktop notifications when downloads finish or fail")
 
+        f = self._section("Couch mode display", "Couch mode fills the screen the app is on by itself. If it does not "
+                                                "fit your setup, choose the screen, a borderless window or the exact "
+                                                "size here (also in couch mode: Settings → Couch mode display).")
+        from PySide6.QtGui import QGuiApplication
+        screens = [("", "The app's screen")]
+        for sc in QGuiApplication.screens():
+            g, dpr = sc.geometry(), sc.devicePixelRatio()
+            screens.append((sc.name(), f"{sc.name()} · {round(g.width() * dpr)}×{round(g.height() * dpr)}"))
+        self._combo(f, "couch_screen", "Screen", screens)
+        self._combo(f, "couch_window", "Window", [("fullscreen", "Full screen"), ("borderless", "Borderless window"),
+                                                  ("custom", "Custom size")])
+        res = [("", "The screen's size")] + [(r, r.replace("x", " × ")) for r in (
+            "1280x720", "1600x900", "1920x1080", "2560x1080", "2560x1440", "3440x1440", "3840x1600", "3840x2160",
+            "5120x1440")]
+        self._combo(f, "couch_resolution", "Custom size", res)
+        self._combo(f, "couch_ui_scale", "Interface size", [(v, f"{v} %") for v in (75, 90, 100, 110, 125, 150,
+                                                                                       175, 200)])
+        self._check(f, "couch_steady_frames", "Steady frame rate (stops flicker on VRR / FreeSync / G-Sync screens)")
+
         f = self._section("Cache & logs")
         self.cache_label = label("", "small")
         f.addRow("", self.cache_label)

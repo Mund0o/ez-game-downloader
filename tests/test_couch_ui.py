@@ -280,7 +280,7 @@ def test_couch_store_search_game_page_download_and_downloads_menu(ui, qtbot):
     assert store.query == "" and store.filter == "discover"
     # filters: LT/RT flip through them; a site's grid keeps loading pages as you scroll
     couch.command("rt")
-    assert store.filter == "new" and store.feed is not None
+    assert store.filter == "all" and store.feed is not None
     qtbot.waitUntil(lambda: bool(store._grid_items()), timeout=10000)
     couch.grab()
     assert not couch._paint_failed
@@ -621,3 +621,92 @@ def test_browser_stops_a_page_that_stays_frozen(ui, qtbot, server, monkeypatch):
     assert dlg.current is not old                                # then: stopped by itself
     assert "stopped responding" in dlg.notice.text.text()
     dlg.close()
+
+
+def test_store_all_games_from_every_site_with_sorting(ui, qtbot):
+    from ezgd.catalog.models import Game
+    from ezgd.ui.couch import T_STORE
+    win, core, _ = ui
+    for src, sid, title in (("onlinefix", "1", "Zeta Run"), ("fitgirl", "2", "Alpha Quest"),
+                            ("steamrip", "3", "Mid Game"), ("fitgirl", "4", "Zeta Run")):
+        core.games.save(Game(src, sid, title, f"https://{src}.example/{sid}"))
+    couch = _open_couch(win, qtbot)
+    couch._switch_tab(T_STORE)
+    store = couch.pages[T_STORE]
+    store.set_filter("all")
+    qtbot.waitUntil(lambda: {"Zeta Run", "Alpha Quest", "Mid Game"} <= {g.title for g in store._grid_items()},
+                    timeout=10000)
+    zeta = next(g for g in store._grid_items() if g.title == "Zeta Run")
+    assert {e.source for e in zeta.entries} >= {"onlinefix", "fitgirl"}          # one tile, both sites
+    keys = [k for k, _l in store.chips()]
+    assert keys[:3] == ["discover", "all", "new"] and keys[-1] == "sort"
+    store.set_filter("sort")                                   # Sort ▾ → A – Z
+    labels = [b[0] for b in couch.overlay.buttons]
+    couch.overlay.focus = labels.index("A – Z")
+    couch.command("a")
+    titles = [g.title for g in store._grid_items()]
+    assert titles == sorted(titles, key=str.casefold)
+    couch.grab()
+    assert not couch._paint_failed
+    couch.force_close()
+    qtbot.waitUntil(lambda: win.isVisible(), timeout=5000)
+
+
+def test_couch_display_settings_ask_and_go_back(ui, qtbot):
+    from ezgd.ui.couch import T_SETTINGS
+    win, core, _ = ui
+    couch = _open_couch(win, qtbot)
+    couch._switch_tab(T_SETTINGS)
+    page = couch.pages[T_SETTINGS]
+    k = next(i for i, it in enumerate(page.items) if it.label == "Window")
+    page.focus = k
+    couch.command("right")                                     # Full screen → Borderless window
+    assert couch.actions.settings["couch_window"] == "borderless"
+    assert couch.overlay is not None and couch.overlay.tag == "display"
+    assert not couch.isFullScreen()
+    couch.grab()
+    couch.command("right")                                     # → "Go back"
+    couch.command("a")
+    assert couch.actions.settings["couch_window"] == "fullscreen" and couch.overlay is None
+    qtbot.waitUntil(lambda: core.settings.settings.couch_window == "fullscreen", timeout=5000)
+    s = couch._s()
+    page.focus = next(i for i, it in enumerate(page.items) if it.label == "Interface size")
+    couch.command("right")                                     # 100 % → 110 %
+    assert abs(couch._s() - s * 1.1) < 1e-6
+    couch.force_close()
+    qtbot.waitUntil(lambda: win.isVisible(), timeout=5000)
+
+
+@pytest.mark.parametrize("how", ["button", "escape", "alt-f4"])
+def test_couch_browser_every_way_out_lands_in_couch_mode(ui, qtbot, server, how):
+    """A friend got stuck in the browser (no controller: the desktop toolbar is hidden in couch mode) and closing it
+    with a key combination left couch mode in a bad state."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from ezgd.catalog.models import Game
+    from ezgd.ui import couch_pages
+    from ezgd.ui.dialogs import browser
+    if not browser.AVAILABLE:
+        pytest.skip("Qt WebEngine not installed")
+    win, core, _ = ui
+    server.add("/d/w", data=b"<html><body>page</body></html>", content_type="text/html")
+    g = Game("steamrip", "95", "Way Out", "https://steamrip.com/way-out/")
+    core.games.save(g)
+    couch = _open_couch(win, qtbot)
+    couch_pages.open_browser(couch, g, None, server.url("/d/w"))
+    cb = couch.browser
+    qtbot.waitUntil(lambda: cb.dlg.current.url().path() == "/d/w", timeout=20000)
+    assert couch.isVisible() and not couch.isMinimized()       # couch mode stays underneath
+    assert cb.close_button.isVisible()
+    if how == "button":
+        QTest.mouseClick(cb.close_button, Qt.LeftButton)
+    elif how == "escape":
+        cb._esc.activated.emit()
+    else:
+        cb.dlg.close()                                         # the window manager's close (Alt+F4)
+    qtbot.waitUntil(lambda: couch.browser is None, timeout=5000)
+    assert not couch.pads.pointer_mode and couch.isVisible() and not couch.isMinimized()
+    assert couch._accepts_input()
+    couch.command("rb")                                        # the controller drives couch mode again
+    couch.force_close()
+    qtbot.waitUntil(lambda: win.isVisible(), timeout=5000)

@@ -823,8 +823,9 @@ def test_slow_source_does_not_hold_up_the_others(ui, qtbot, routes):
     """Each source loads on its own (FitGirl's API can take 15 s): the fast sources show up first."""
     win, core, _ = ui
 
-    def slow_posts(req):
-        time.sleep(3)
+    async def slow_posts(req):
+        import asyncio
+        await asyncio.sleep(3)                     # a slow site (it never blocks the app's other requests)
         return httpx.Response(200, content=fixture_bytes("steamrip_posts.json"),
                               headers={"content-type": "application/json", "x-wp-totalpages": "1"})
     routes.add_handler("https://steamrip.com/wp-json/wp/v2/posts?*", slow_posts)

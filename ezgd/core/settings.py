@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import logging
 import os
 import threading
@@ -80,6 +81,12 @@ class Settings:
     theme_contrast: str = "dark"                 # dark | midnight
     card_size: str = "comfortable"               # compact | comfortable | large
     reduce_motion: bool = False
+    # couch mode display (when the automatic full screen does not fit a setup)
+    couch_screen: str = ""                       # "" = the screen the app is on; else a screen's name ("DP-1")
+    couch_window: str = "fullscreen"             # fullscreen | borderless | custom
+    couch_resolution: str = ""                   # custom size in screen pixels, "2560x1440"
+    couch_ui_scale: int = 100                    # interface size in percent (100 = fitted to the screen)
+    couch_steady_frames: bool = True             # one steady frame rate (no flicker on VRR screens)
     notifications_enabled: bool = True
     # diagnostics
     log_level: str = "INFO"
@@ -96,12 +103,14 @@ class Settings:
         "torrent_stall_minutes": (1, 240),
         "cache_ttl_minutes": (1, 7 * 24 * 60),
         "cover_cache_mb": (10, 10_000),
+        "couch_ui_scale": (50, 250),
     }
     _CHOICES = {
         "theme_accent": tuple(ACCENTS),
         "theme_contrast": ("dark", "midnight"),
         "card_size": ("compact", "comfortable", "large"),
         "log_level": ("DEBUG", "INFO", "WARNING", "ERROR"),
+        "couch_window": ("fullscreen", "borderless", "custom"),
     }
 
     @classmethod
@@ -130,6 +139,10 @@ class Settings:
             value = str(value)
             if key.endswith("_dir") or key in ("steam_root", "unrar_tool"):
                 value = os.path.expanduser(value) if value else value
+            if key == "couch_resolution":
+                value = value.strip().lower().replace("×", "x").replace(" ", "")
+                if value and not re.fullmatch(r"\d{3,5}x\d{3,5}", value):
+                    raise ValueError("couch_resolution must look like 1920x1080")
             choices = cls._CHOICES.get(key)
             if choices:
                 if key == "log_level":

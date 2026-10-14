@@ -98,3 +98,17 @@ Offline suite: **496 passed, 1 skipped**.
 * Speed: covers decoded and cards drawn once off the GUI thread, site pages parsed in a helper process, zip and 7z
   extracted with 7-Zip (40× faster for encrypted zips, the app stays responsive), closing the app stops a running
   extraction (it resumes on the next start).
+
+## Version 0.3.1 (2026-10-14): couch display settings, browser exits, all games in one place
+
+Offline suite: **502 passed, 2 skipped**.
+
+* Couch mode on several monitors: it fills the monitor the compositor put it on (it used to force the first
+  monitor's size onto it, leaving part of a bigger screen uncovered) — tested with two simulated screens of
+  different sizes (`tests/test_couch_multimonitor.py`).
+* Couch display settings (couch Settings and desktop Settings): screen, full screen / borderless / custom size,
+  resolution, interface size, steady frame rate; changes revert by themselves after 15 s unless kept.
+* The in-app browser closes from the window manager again (Alt+F4 and the title-bar ✕ were refused), has a
+  ✕ Close button and Esc in couch mode, and couch mode stays underneath and takes the controller back — tested for
+  each way out.
+* Store: an "All games" filter (every site in one grid, endless) and a sort menu.
