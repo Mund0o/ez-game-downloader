@@ -6,7 +6,7 @@ import time
 
 from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QSize, Qt, QTimer, Signal
 from PySide6.QtWidgets import (QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLayout, QPushButton, QSizePolicy,
-                               QToolButton, QVBoxLayout, QWidget)
+                               QSpinBox, QToolButton, QVBoxLayout, QWidget)
 
 from ezgd.ui import theme
 from ezgd.ui.icons import icon
@@ -39,6 +39,13 @@ def tool(icon_name: str, tooltip: str, on_click=None, color: str | None = None) 
     if on_click:
         b.clicked.connect(lambda _checked=False: on_click())
     return b
+
+
+def spin_box() -> QSpinBox:
+    """A number box with its text inset like the other fields (Qt ignores a spin box's horizontal padding)."""
+    w = QSpinBox()
+    w.lineEdit().setTextMargins(8, 0, 0, 0)
+    return w
 
 
 def label(text: str = "", role: str | None = None, wrap: bool = False, selectable: bool = False) -> QLabel:
@@ -421,6 +428,8 @@ def relative_time(ts: float | None) -> str:
         return f"{int(d // 60)} min ago"
     if d < 86400:
         return f"{int(d // 3600)} h ago"
+    if d < 86400 * 2:
+        return "yesterday"
     if d < 86400 * 30:
         return f"{int(d // 86400)} days ago"
     return time.strftime("%Y-%m-%d", time.localtime(ts))

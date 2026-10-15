@@ -65,6 +65,10 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence(Qt.Key_F1), self, self.show_shortcuts)
         self.couch = None
         self._couch_gpu_failed = False            # couch mode's GPU drawing failed this run: draw it with the CPU
+        self._quick_pads = None                   # the guide button while a game runs and couch mode is closed
+        self._bpm_timer = QTimer(self)            # … and Steam's Big Picture taking it (Steam Input)
+        self._bpm_timer.setInterval(1500)
+        self._bpm_timer.timeout.connect(self._bpm_tick)
         self._clip_seen: set[str] = set()                # clipboard links already offered
         self._tray_hint_shown = False
         self.setAcceptDrops(True)
@@ -78,6 +82,7 @@ class MainWindow(QMainWindow):
         self.toasts.reduce_motion = bool(settings.get("reduce_motion"))
         self.covers = CoverCache(bridge, self)
         self.actions = Actions(bridge, self.covers, self.toasts, settings, self)
+        self.actions.on_launch = self._launch_requested   # a game started again is never "the one to close"
         self.actions.navigate.connect(self.navigate)
         bridge.error.connect(lambda msg: self.toasts.show("Something went wrong", msg, "error"))
 
@@ -431,6 +436,7 @@ class MainWindow(QMainWindow):
             self._close_if_pending(payload)
             if self.couch is not None:
                 self.couch.game_state(payload)
+            self._watch_quick_button()
             running = len(pages["library"].running)
             self.nav_buttons["library"].setText(f"  Library  ● {running} playing" if running else "  Library")
         elif name == "library_changed":
@@ -502,6 +508,8 @@ class MainWindow(QMainWindow):
             self.toasts.show("Theme updated", "Some colours update fully after a restart.")
         self._apply_settings_to_pages()
         self.pages["settings"].load(s, info=False)        # a change made in couch mode shows here too
+        if self.couch is not None:
+            self.couch.settings_changed(changed_key)      # … and one made here, in couch mode
         if changed_key in ("sources_enabled", "hide_withdrawn_games", "hide_adult_games"):
             self.pages["games"].reload()
             self.pages["home"].load_sources()
@@ -525,7 +533,11 @@ class MainWindow(QMainWindow):
 
     def _poll_summary(self) -> None:
         def show(s: dict) -> None:
-            text = f"↓ {format_speed(s['speed'])}  ·  {s['active']} active, {s['queued']} queued"
+            if not s["active"] and not s["queued"]:
+                text = "No downloads running"
+            else:
+                speed = format_speed(s["speed"]) if s["speed"] else "starting…" if s["active"] else "waiting"
+                text = f"↓ {speed}  ·  {s['active']} active, {s['queued']} queued"
             if s.get("waits_until"):
                 text += f"\n⏾ Downloads wait until {s['waits_until']}"
             elif s.get("limited_for_game"):
@@ -571,7 +583,10 @@ class MainWindow(QMainWindow):
     def open_couch(self) -> None:
         """Full-screen couch mode on the screen this window is on; this window comes back when it closes."""
         if self.couch is not None:
-            self.couch.open(self.couch.screen())
+            if self.couch.background:
+                self.couch._promote()                   # the quick menu's hidden couch mode: shown for real
+            else:
+                self.couch.open(self.couch.screen())
             return
         from ezgd.ui.couch import make_couch
         screen = self.screen()
@@ -583,18 +598,93 @@ class MainWindow(QMainWindow):
             self.toasts.show("Couch mode could not start", "The error is in the log.", "error")
             return
         self.couch = couch
+        couch.suspended = set(self.pages["library"].suspended)        # (e.g. frozen here on the desktop)
+        couch.focus_entry(self.pages["library"].current_id)          # the game chosen here
+        self._watch_quick_button()                        # (couch mode listens to the controllers itself)
         couch.closed.connect(self._couch_closed)
         if hasattr(couch, "gpu_failed"):
             couch.gpu_failed.connect(self._couch_gpu_failure)
         self._main_toasts = self.toasts
         self.actions.toasts = couch.toasts                 # messages from game actions show in couch mode
         QApplication.instance().setQuitOnLastWindowClosed(False)
+        log.info("couch mode opens from the desktop window: %dx%d%s on %s", self.width(), self.height(),
+                 " (maximized)" if self.isMaximized() else " (full screen)" if self.isFullScreen() else "",
+                 screen.name() if screen is not None else "?")
         try:
             couch.open(screen)
             self.hide()
         except Exception:
             log.exception("couch mode could not be shown")
             self._couch_closed()
+
+    # ------------------------------------------------- the quick menu over a game started from the desktop
+    def _watch_quick_button(self) -> None:
+        """While one of our games runs and couch mode is closed: listen for the guide button (tap or hold) to show
+        the quick menu over the game. Nothing listens otherwise."""
+        want = bool(self.pages["library"].running) and self.couch is None
+        if want and self._quick_pads is None:
+            from ezgd.ui.gamepad import Gamepads
+            pads = Gamepads(self)
+            pads.action.connect(lambda n: self._quick_menu_from_desktop() if n == "home" else None)
+            pads.home_held.connect(self._quick_menu_from_desktop)
+            pads.start()
+            self._quick_pads = pads
+        elif not want and self._quick_pads is not None:
+            self._quick_pads.stop()
+            self._quick_pads.deleteLater()
+            self._quick_pads = None
+        from ezgd.ui import steam_bpm
+        if want and steam_bpm.steam_running():
+            if not self._bpm_timer.isActive():
+                self._bpm_timer.start()
+        else:
+            self._bpm_timer.stop()
+
+    def _bpm_tick(self) -> None:
+        from ezgd.ui import steam_bpm
+        if self.couch is not None or not self.pages["library"].running:
+            self._bpm_timer.stop()
+            return
+        if steam_bpm.big_picture_in_front() and steam_bpm.close_big_picture():
+            QTimer.singleShot(600, self, self._quick_menu_from_desktop)
+            for ms in (1800, 3300):                   # after Steam's desktop window came and went again
+                QTimer.singleShot(ms, self, lambda: self.couch._regain_screen() if self.couch is not None else None)
+
+    def _quick_menu_from_desktop(self) -> None:
+        """The guide button over a game started from the desktop (couch mode closed): the quick menu, with couch
+        mode made in the background behind it — shown only if the menu asks for it (couch mode, switch game, …)."""
+        if self.couch is not None or not self.pages["library"].running:
+            return
+        from ezgd.ui.couch import make_couch
+        try:
+            couch = make_couch(self.actions, list(self.pages["library"].entries.values()),
+                                set(self.pages["library"].running), gpu_drawing=not self._couch_gpu_failed)
+        except Exception:
+            log.exception("the quick menu could not start")
+            return
+        couch.background = True
+        couch.suspended = set(self.pages["library"].suspended)
+        couch._target_screen = self.screen() or QApplication.primaryScreen()
+        couch.resize(couch._target_screen.geometry().size())   # (never shown: sizes the menu and its prompts)
+        couch.on_promote = self._background_couch_shown
+        self.couch = couch
+        couch.closed.connect(self._couch_closed)
+        if hasattr(couch, "gpu_failed"):
+            couch.gpu_failed.connect(self._couch_gpu_failure)
+        self._quit_before_bg = QApplication.instance().quitOnLastWindowClosed()
+        QApplication.instance().setQuitOnLastWindowClosed(False)    # (the menu closing must not end the app)
+        self._watch_quick_button()                        # couch mode's own controllers take over
+        couch.guide_pressed()                            # (Steam may answer the same press with its window)
+        couch._home_held()
+
+    def _background_couch_shown(self) -> None:
+        """The quick menu opened couch mode for real: it replaces this window, as when opened from here."""
+        couch = self.couch
+        if couch is None:
+            return
+        self._main_toasts = self.toasts
+        self.actions.toasts = couch.toasts
+        self.hide()
 
     def _couch_gpu_failure(self, why: str) -> None:
         """Couch mode's OpenGL drawing did not start: open it again drawn by the CPU (for the rest of this run)."""
@@ -613,6 +703,13 @@ class MainWindow(QMainWindow):
 
     def _couch_closed(self) -> None:
         couch = self.couch
+        if couch is not None and couch.background:      # only the quick menu's hidden couch mode: nothing to undo
+            self.couch = None
+            from ezgd.ui.window_control import release_all
+            release_all()
+            QApplication.instance().setQuitOnLastWindowClosed(getattr(self, "_quit_before_bg", True))
+            self._watch_quick_button()
+            return
         if couch is not None and couch.pending_kill:
             # left couch mode (quitting its games) while one was still starting: close it when it appears
             import time as _t
@@ -620,6 +717,9 @@ class MainWindow(QMainWindow):
             log.info("couch mode closed while %s were starting: they are closed when they appear", couch.pending_kill)
         self.couch = None
         self.actions.toasts = getattr(self, "_main_toasts", self.toasts)
+        picked = couch.selected_entry_id() if couch is not None else None
+        if picked is not None:                           # the desktop's Library is on the game couch mode was on
+            QTimer.singleShot(300, self, lambda: self.pages["library"].select(picked))
         from ezgd.ui.window_control import release_all
         release_all()                                    # "keep above" was for couch mode only
         QTimer.singleShot(600, self, release_all)        # (and once more, after anything still on its way)
@@ -629,8 +729,15 @@ class MainWindow(QMainWindow):
             self.activateWindow()
             self._reload_library()
         QApplication.instance().setQuitOnLastWindowClosed(True)
+        self._watch_quick_button()
         from ezgd.ui import gcguard                        # couch mode's pictures (hundreds of MB) go back now
         QTimer.singleShot(1500, self, gcguard.release)
+
+    def _launch_requested(self, entry_id: int) -> None:
+        """The user starts a game: it is not the one couch mode was left to close (that one was still starting)."""
+        pending = getattr(self, "_kill_on_start", None)
+        if pending:
+            pending.pop(entry_id, None)
 
     def _close_if_pending(self, payload: dict) -> None:
         """A game started from couch mode appeared after couch mode was left with "Quit game": close it now."""

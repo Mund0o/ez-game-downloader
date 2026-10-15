@@ -13,3 +13,4 @@ packaging/build-assets/
 *.tar.gz
 SHA256SUMS
 Windows EZ Game Downloader/
+.EZGameDownloader.update-*/

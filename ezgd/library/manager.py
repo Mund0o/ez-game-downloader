@@ -47,6 +47,20 @@ def _prefix_processes(prefix: Path) -> list[int]:
     return pids
 
 
+def _proc_state(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return ""
+
+
+def _proc_name(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except OSError:
+        return str(pid)
+
+
 def _stop_prefix_processes(prefix: Path, wait: float = 10.0) -> None:
     """Let a throw-away prefix's wineserver finish (it exits a few seconds after the game), then stop leftovers."""
     import signal
@@ -531,10 +545,62 @@ class LibraryManager:
             compat=e.compat_config, game_root=Path(e.install_path) if e.install_path else None,
             log_dir=self.paths.logs, fix_env=fx.env, fix_wrappers=fx.wrappers, fix_args=fx.args,
             fix_notes=fx.notes)
+        live = self._mangohud_env(e)
+        if live:
+            plan.env = {**plan.env, **live}
         if launcher.is_windows_binary(Path(exe)) and "WINEDEBUG" not in plan.env and not plan.env.get("PROTON_LOG"):
             # error pop-ups' text goes into the game's log (ezgd.library.errorbox) — the assistant reads it
             plan.env = {**plan.env, "WINEDEBUG": errorbox.PLAY_WINEDEBUG}
         return plan
+
+    # ------------------------------------------------------------ MangoHud, live
+    def mangohud_conf(self, entry_id: int) -> Path:
+        return self.paths.data / "mangohud" / f"game-{entry_id}.conf"
+
+    def _mangohud_env(self, e: LibraryEntry) -> dict:
+        """Every game starts with MangoHud loaded (when it is installed) but hidden unless switched on, reading its
+        own config file: switching MangoHud on or off then shows / hides it over the running game at once (MangoHud
+        reloads a config file that changes). Vulkan games — Proton's DirectX too."""
+        if os.name == "nt" or not getattr(self.settings.settings, "mangohud_live", True) or \
+                not shutil.which("mangohud"):
+            return {}
+        conf = self._write_mangohud_conf(e.id, "mangohud" in e.compat_config.fixes)
+        return {"MANGOHUD": "1", "MANGOHUD_CONFIGFILE": str(conf)} if conf else {}
+
+    def _write_mangohud_conf(self, entry_id: int, visible: bool) -> Path | None:
+        """The game's MangoHud config: the user's own MangoHud.conf, shown or hidden (``no_display``). Written in
+        place (MangoHud watches the file itself, not its folder)."""
+        conf = self.mangohud_conf(entry_id)
+        base = ""
+        for p in (Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "MangoHud" / "MangoHud.conf",):
+            try:
+                base = p.read_text("utf-8", "replace")
+                break
+            except OSError:
+                continue
+        lines = [ln for ln in base.splitlines() if ln.strip().split("=", 1)[0].strip() != "no_display"]
+        if not visible:
+            lines.append("no_display")
+        text = "\n".join(lines).strip() + "\n"
+        try:
+            conf.parent.mkdir(parents=True, exist_ok=True)
+            if not conf.exists() or conf.read_text("utf-8", "replace") != text:
+                with open(conf, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+            return conf
+        except OSError as exc:
+            log.info("MangoHud config for entry %s could not be written: %s", entry_id, exc)
+            return None
+
+    def set_mangohud(self, entry_id: int, on: bool) -> dict:
+        """MangoHud on / off for this game: from its next start, and over it right now if it runs with MangoHud
+        loaded (it was started with "MangoHud ready" on)."""
+        enabled = {s["key"] for s in self.fixes_for(entry_id) if s["enabled"]}
+        enabled = (enabled | {"mangohud"}) if on else (enabled - {"mangohud"})
+        self.set_fixes(entry_id, sorted(enabled))
+        live = self.is_running(entry_id) and self.mangohud_conf(entry_id).exists()
+        self._write_mangohud_conf(entry_id, on)
+        return {"on": on, "live": live}
 
     # ---------------------------------------------------------------- fixes
     def _context(self, e: LibraryEntry) -> fixes.GameContext:
@@ -938,13 +1004,22 @@ class LibraryManager:
         pids = self.game_processes(entry_id)
         if not pids:
             raise LibraryError("The game's processes were not found.")
-        stopped = []
-        for pid in pids:
-            try:
-                os.kill(pid, _signal.SIGSTOP)
-                stopped.append(pid)
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
+        stopped: list[int] = []
+        for _round in range(4):                      # until no new process turns up (one may start meanwhile)
+            new = [p for p in pids if p not in stopped]
+            if not new:
+                break
+            for pid in new:
+                try:
+                    os.kill(pid, _signal.SIGSTOP)
+                    stopped.append(pid)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            time.sleep(0.05)
+            pids = self.game_processes(entry_id)
+        running = [p for p in stopped if _proc_state(p) not in ("T", "t", "Z", "X", "")]
+        log.info("game %s: frozen %s%s", entry_id, ", ".join(sorted({_proc_name(p) for p in stopped})),
+                 f" — still running: {running}" if running else "")
         self._suspended[entry_id] = {"at": time.monotonic(), "pids": stopped}
         try:
             self.running_dir.mkdir(parents=True, exist_ok=True)

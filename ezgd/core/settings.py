@@ -97,6 +97,7 @@ class Settings:
     couch_sounds_volume: int = 15                # … how loud, in percent
     couch_intro_volume: int = 17                 # the intro video's sound, in percent
     couch_steady_frames: bool = True             # one steady frame rate (no flicker on VRR screens)
+    mangohud_live: bool = True                   # MangoHud loaded (hidden) in every game: on/off live from the menu
     gpu_acceleration: bool = False               # couch mode drawn by the GPU; GPU help for the in-app browser
     couch_gpu: bool = True                       # couch mode's frames shown through OpenGL (off: as before)
     couch_controller_only: bool = True           # couch Store: only games with (full or partial) controller support

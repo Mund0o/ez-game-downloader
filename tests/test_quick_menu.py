@@ -146,6 +146,7 @@ def test_quick_menu_is_only_for_games_the_app_runs(ui, qtbot, tmp_path):
     qtbot.waitUntil(lambda: couch.isMinimized(), timeout=3000)
     couch._home_held()                                    # and again
     qtbot.waitUntil(lambda: q.isVisible(), timeout=3000)
+    q.opened_at -= 2                                      # (a moment later — not the hold that opened it)
     couch._home_held()                                    # held once more: back to the game
     qtbot.waitUntil(lambda: not q.isVisible(), timeout=3000)
     win.bridge.run_sync(core.library_call("stop_completely", e.id, 3))
@@ -168,13 +169,17 @@ def test_switching_games_suspends_the_one_being_played(ui, qtbot, tmp_path):
     q.command("a")
     assert q.view == "switch" and [e.id for e in q.grid] == [b.id]
     q.grab()
-    q.command("a")                                        # play the other one
+    q.command("a")                                        # the other one: "Play …?" right here in the menu
+    assert q.view == "confirm" and q.target.id == b.id and q.isVisible()
+    assert core.library.is_running(a.id) and not core.library.is_suspended(a.id)     # (nothing happens yet)
+    q.grab()
+    q.command("a")                                        # ▶ Play
     qtbot.waitUntil(lambda: core.library.is_suspended(a.id), timeout=5000)
-    qtbot.waitUntil(lambda: couch.overlay is not None and couch.overlay.title.startswith(("Play", "Starting")),
-                    timeout=5000)                         # couch mode starts it ("Play …?" first, as always)
-    assert a.id in couch.suspended and not q.isVisible()
-    couch._close_overlay()
-    couch._launching = False
+    qtbot.waitUntil(lambda: core.library.is_running(b.id), timeout=10000)
+    qtbot.waitUntil(lambda: not q.isVisible(), timeout=10000)         # it is up: the menu gets out of the way
+    assert couch.overlay is None                          # couch mode never came forward to ask
+    assert a.id in couch.suspended and b.id in couch.launched
+    win.bridge.run_sync(core.library_call("stop_completely", b.id, 3))
     # the suspended game waits in couch mode: A on it continues it
     tile = next(e for e in couch.entries if e.id == a.id)
     assert couch.state_text(tile) == "Suspended"
@@ -199,8 +204,12 @@ def test_go_to_couch_mode_then_leaving_couch_mode_resumes_the_game(ui, qtbot, tm
     q.command("a")
     qtbot.waitUntil(lambda: core.library.is_suspended(a.id), timeout=5000)
     qtbot.waitUntil(lambda: not q.isVisible() and couch.isVisible() and not couch.isMinimized(), timeout=5000)
-    couch._home_held()                                    # only suspended games and couch mode in front: nothing
-    assert not q.isVisible()
+    couch._home_held()                                    # held in couch mode: the menu lists the suspended game
+    qtbot.waitUntil(lambda: q.isVisible() and q._shown >= 1.0, timeout=5000)
+    assert q.game is None and any(r.key == f"game-{a.id}" for r in q.rows)
+    q.command("b")                                        # (closed again: stays suspended)
+    qtbot.waitUntil(lambda: not q.isVisible(), timeout=3000)
+    assert core.library.is_suspended(a.id)
     couch.force_close()                                   # nothing may stay frozen without couch mode
     qtbot.waitUntil(lambda: not core.library.is_suspended(a.id), timeout=5000)
     win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
@@ -279,4 +288,201 @@ def test_sound_volume_settings(ui, qtbot):
     couch.command("left")
     couch.command("left")
     assert couch.actions.settings["couch_sounds_volume"] == 10
+    couch.force_close()
+
+
+@linux_only
+def test_a_tap_of_the_guide_button_opens_and_closes_the_quick_menu(ui, qtbot, tmp_path, monkeypatch):
+    win, core, _ = ui
+    a = _running(win, core, tmp_path, qtbot, "Tap Game")
+    couch = _open_couch(win, qtbot)
+    qtbot.waitUntil(lambda: a.id in couch.running, timeout=5000)
+    monkeypatch.setattr(couch, "isActiveWindow", lambda: False)      # the game has the screen
+    couch._pad("home")                                               # a tap (like the PS button on a PS5)
+    qtbot.waitUntil(lambda: couch.quick is not None and couch.quick.isVisible(), timeout=5000)
+    q = couch.quick
+    couch._home_held()                                               # the same press, held: not "close it again"
+    assert q.isVisible()
+    q.opened_at -= 2
+    couch._pad("home")                                               # tapped again: back to the game
+    qtbot.waitUntil(lambda: not q.isVisible(), timeout=3000)
+    monkeypatch.undo()
+    win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
+    couch.force_close()
+
+
+@linux_only
+def test_quick_menu_over_a_desktop_game_with_couch_mode_closed(ui, qtbot, tmp_path):
+    """Started from the desktop, couch mode never opened: the guide button still brings the quick menu, with couch
+    mode hidden behind it — the desktop stays as it was unless the menu asks for couch mode."""
+    win, core, _ = ui
+    win.show()
+    a = _running(win, core, tmp_path, qtbot, "Desk Only")
+    assert win.couch is None
+    win._quick_menu_from_desktop()
+    couch = win.couch
+    assert couch is not None and couch.background and not couch.isVisible()
+    qtbot.waitUntil(lambda: couch.quick is not None and couch.quick.isVisible(), timeout=5000)
+    assert couch.quick.game.id == a.id and win.isVisible()
+    couch.quick.command("b")                                         # back to the game
+    qtbot.waitUntil(lambda: win.couch is None, timeout=5000)         # the hidden couch mode is gone again
+    assert win.isVisible()
+    win._quick_menu_from_desktop()                                   # again — this time: Go to couch mode
+    couch = win.couch
+    qtbot.waitUntil(lambda: couch.quick is not None and couch.quick._shown >= 1.0, timeout=5000)
+    q = couch.quick
+    q.focus = next(k for k, r in enumerate(q.rows) if r.key == "couch")
+    q.command("a")
+    qtbot.waitUntil(lambda: couch.isVisible() and not couch.background, timeout=5000)
+    qtbot.waitUntil(lambda: not win.isVisible(), timeout=5000)       # couch mode for real, as from the desktop
+    couch.force_close()
+    qtbot.waitUntil(lambda: win.isVisible(), timeout=5000)
+    win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
+
+
+def test_a_game_that_ran_is_never_closed_when_started_again(ui, qtbot):
+    """Leaving couch mode right after a game ended noted it as "still starting — close it when it appears", and
+    starting it again a minute later closed it after two seconds."""
+    win, core, _ = ui
+    couch = _open_couch(win, qtbot)
+    couch._launch_at[42] = __import__("time").monotonic()            # started from couch mode …
+    couch.launched.add(42)
+    couch.game_state({"id": 42, "running": True})                    # … it runs …
+    assert 42 not in couch._launch_at
+    couch.game_state({"id": 42, "running": False})                   # … and ends
+    assert 42 not in couch._starting_ids() and not couch.pending_kill
+    couch.force_close()
+    qtbot.waitUntil(lambda: win.couch is None, timeout=5000)
+    win._kill_on_start = {7: __import__("time").monotonic() + 90}   # really left while it was starting
+    win.actions.launch_requested(7)                                  # the user starts it again: never closed
+    assert 7 not in win._kill_on_start
+
+
+@linux_only
+def test_back_from_game_settings_goes_into_the_game(ui, qtbot, tmp_path, monkeypatch):
+    win, core, _ = ui
+    a = _running(win, core, tmp_path, qtbot, "Settings Game")
+    couch = _open_couch(win, qtbot)
+    qtbot.waitUntil(lambda: a.id in couch.running, timeout=5000)
+    entry = next(e for e in couch.entries if e.id == a.id) if any(e.id == a.id for e in couch.entries) else a
+    went = []
+    monkeypatch.setattr(couch, "go_to_game", lambda e: went.append(e.id))
+    couch.open_game_settings(entry, back_to_game=True)              # (what the quick menu opens)
+    page = couch.current_page()
+    assert page.items[0].label == "▶  Back to the game"
+    assert ("b", "Back to the game") in page.hints()
+    couch.command("b")
+    assert went == [a.id] and couch.current_page() is not page
+    monkeypatch.undo()
+    win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
+    couch.force_close()
+
+
+@linux_only
+def test_the_ps_button_still_opens_the_menu_when_running_came_before_started(ui, qtbot, tmp_path, monkeypatch):
+    """The game's "running" came before couch mode's "started": the launch flag stayed on for the whole game, every
+    PS tap was ignored, and putting Steam's window away pulled couch mode over the game."""
+    from ezgd.ui import steam_bpm, window_control
+    win, core, _ = ui
+    a = _running(win, core, tmp_path, qtbot, "Order Game")
+    couch = _open_couch(win, qtbot)
+    qtbot.waitUntil(lambda: a.id in couch.running, timeout=5000)
+    couch.running.discard(a.id)
+    couch._launching = True                                        # Play pressed in couch mode …
+    couch._launch_at[a.id] = __import__("time").monotonic()
+    couch.game_state({"id": a.id, "running": True})                # … "running" arrives before "started"
+    assert not couch._launching and a.id in couch.launched
+    monkeypatch.setattr(couch, "isActiveWindow", lambda: False)    # the game has the screen
+    monkeypatch.setattr(steam_bpm, "steam_running", lambda: True)
+    monkeypatch.setattr(window_control, "hide_steam_windows", lambda only_active=True: True)
+    pulled = []
+    monkeypatch.setattr(couch.wc, "activate", lambda: pulled.append(1))
+    couch._pad("home")                                             # a tap: the quick menu
+    qtbot.waitUntil(lambda: couch.quick is not None and couch.quick.isVisible(), timeout=5000)
+    couch.quick.command("b")                                       # back to the game
+    qtbot.waitUntil(lambda: not couch.quick.isVisible(), timeout=3000)
+    couch._front = "game"
+    couch._regain_screen()                                         # (after Steam was put away)
+    assert not pulled                                              # couch mode never comes over the game
+    monkeypatch.undo()
+    win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
+    couch.force_close()
+
+
+async def test_mangohud_is_ready_hidden_and_switches_live(core, tmp_path, monkeypatch):  # noqa: F811
+    """MangoHud from the quick menu over the running game, not after a restart: every game starts with MangoHud
+    loaded but hidden, reading its own config — switching rewrites it, and MangoHud reloads a changed config."""
+    import shutil
+    cfg = tmp_path / "xdg"
+    (cfg / "MangoHud").mkdir(parents=True)
+    (cfg / "MangoHud" / "MangoHud.conf").write_text("fps\ngpu_temp\nno_display\n")      # the user's own setup
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(cfg))
+    real_which = shutil.which
+    monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/mangohud" if n == "mangohud" else real_which(n))
+    lib = core.library
+    folder = tmp_path / "games" / "Hud Game"
+    folder.mkdir(parents=True)
+    exe = folder / "game.sh"
+    exe.write_text("#!/bin/sh\nexit 0\n")
+    exe.chmod(0o755)
+    e = lib.import_folder("Hud Game", folder, None)
+    lib.set_executable(e.id, str(exe))
+    plan = lib.launch_plan(e.id)
+    conf = lib.mangohud_conf(e.id)
+    assert plan.env["MANGOHUD"] == "1" and plan.env["MANGOHUD_CONFIGFILE"] == str(conf)
+    assert conf.read_text().split() == ["fps", "gpu_temp", "no_display"]          # loaded, hidden
+    lib.set_mangohud(e.id, True)                                                   # switched on: shown …
+    assert conf.read_text().split() == ["fps", "gpu_temp"]
+    assert "mangohud" in lib.get(e.id).compat_config.fixes                         # … and from the next start
+    lib.set_mangohud(e.id, False)
+    assert conf.read_text().split() == ["fps", "gpu_temp", "no_display"]
+    core.settings.set("mangohud_live", False)                                      # switched off in Settings
+    assert "MANGOHUD" not in lib.launch_plan(e.id).env
+
+
+@linux_only
+def test_mangohud_switch_in_the_quick_menu(ui, qtbot, tmp_path, monkeypatch):
+    import shutil
+    win, core, _ = ui
+    real_which = shutil.which
+    monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/mangohud" if n == "mangohud" else real_which(n))
+    a = _running(win, core, tmp_path, qtbot, "Hud Menu")
+    couch = _open_couch(win, qtbot)
+    qtbot.waitUntil(lambda: a.id in couch.running, timeout=5000)
+    couch._home_held()
+    qtbot.waitUntil(lambda: couch.quick is not None and couch.quick._shown >= 1.0, timeout=5000)
+    q = couch.quick
+    row = next(r for r in q.rows if r.key == "mangohud")
+    assert row.value == "Off" and row.extra == {"toggle": False}            # (drawn as an on / off switch)
+    q.focus = q.rows.index(row)
+    q.command("a")
+    qtbot.waitUntil(lambda: "mangohud" in core.library.get(a.id).compat_config.fixes, timeout=5000)
+    qtbot.waitUntil(lambda: next(r for r in q.rows if r.key == "mangohud").value == "On", timeout=5000)
+    assert next(r for r in q.rows if r.key == "mangohud").extra == {"toggle": True}
+    monkeypatch.undo()
+    win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
+    couch.force_close()
+
+
+def test_the_wheel_moves_through_the_quick_menu(ui, qtbot, tmp_path):
+    """A Steam controller's left trackpad is a scroll wheel in Steam's desktop layout: it moves the selection."""
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QWheelEvent
+    win, core, _ = ui
+    a = _running(win, core, tmp_path, qtbot, "Wheel Menu")
+    couch = _open_couch(win, qtbot)
+    qtbot.waitUntil(lambda: a.id in couch.running, timeout=5000)
+    couch._home_held()
+    qtbot.waitUntil(lambda: couch.quick is not None and couch.quick._shown >= 1.0, timeout=5000)
+    q = couch.quick
+
+    def wheel(dy):
+        q.wheelEvent(QWheelEvent(QPointF(10, 10), QPointF(10, 10), QPoint(), QPoint(0, dy), Qt.NoButton,
+                                 Qt.NoModifier, Qt.NoScrollPhase, False))
+    start = q.focus
+    wheel(-120)
+    assert q.focus > start
+    wheel(120)
+    assert q.focus == start
+    win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
     couch.force_close()

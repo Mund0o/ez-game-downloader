@@ -61,6 +61,7 @@ class GameCardDelegate(QStyledItemDelegate):
         self.covers = covers
         self.installed: set[str] = set()
         self.card_width = CARD_WIDTHS["comfortable"]
+        self.fill_width = 0                      # a wrapping grid: the width that fills its rows (0: card_width)
         self._lock: QPixmap | None = None
         from ezgd.ui import ratings
         self.ratings = ratings.store(covers.bridge)
@@ -97,7 +98,7 @@ class GameCardDelegate(QStyledItemDelegate):
         return self._lock
 
     def card_size(self) -> QSize:
-        w = self.card_width
+        w = self.fill_width or self.card_width
         return QSize(w + 14, int(w * 0.5625) + 84)
 
     def sizeHint(self, option, index) -> QSize:
@@ -191,11 +192,19 @@ class GameCardDelegate(QStyledItemDelegate):
         p.setFont(f)
         bfm = QFontMetrics(f)
         x = cover.left() + 8
-        for src in group.sources:
+        limit = cover.right() - (38 if group.key in self.installed else 8)      # (never under the ✓)
+        sources = list(group.sources)
+        for k, src in enumerate(sources):
             color = QColor(theme.SOURCE_COLORS.get(src, pal.accent))
             text = theme.source_name(src)
             locked = bool(theme.source_password(src))
             bw = bfm.horizontalAdvance(text) + 14 + (14 if locked else 0)
+            more = bfm.horizontalAdvance(f"+{len(sources) - k - 1}") + 14 if k < len(sources) - 1 else 0
+            if x + bw + (more + 5 if more else 0) > limit:          # the rest as "+N"
+                text, locked, color = f"+{len(sources) - k}", False, QColor(pal.muted)
+                bw = bfm.horizontalAdvance(text) + 14
+                if x + bw > limit:
+                    break
             badge = QRectF(x, cover.top() + 8, bw, 19)
             bg = QColor(color)
             bg.setAlpha(232)
@@ -208,6 +217,8 @@ class GameCardDelegate(QStyledItemDelegate):
                 lock_rect = QRectF(badge.right() - 18, badge.top() + 3, 13, 13)
                 p.drawPixmap(lock_rect.toRect(), self._lock_pixmap())
             x += bw + 5
+            if text.startswith("+"):
+                break
         if group.key in self.installed:
             badge = QRectF(cover.right() - 30, cover.top() + 8, 22, 22)
             p.setPen(Qt.NoPen)
@@ -348,7 +359,24 @@ class GameGridView(QListView):
         self.delegate.card_width = CARD_WIDTHS.get(key, CARD_WIDTHS["comfortable"])
         if self.horizontal:
             self._fit_height()
+        else:
+            self._fill_rows(force=True)
         self.model_.layoutChanged.emit()
+
+    def _fill_rows(self, force: bool = False) -> None:
+        """A wrapping grid: cards a little wider so each row fills the width (no empty strip on the right).
+        Measured as if the scroll bar shows, so it never flips between two widths."""
+        if self.horizontal:
+            return
+        avail = self.width() - 2 * self.frameWidth() - self.verticalScrollBar().sizeHint().width() - 8
+        base = self.delegate.card_width + 14
+        n = max(1, avail // base)
+        w = min(int(self.delegate.card_width * 1.35), avail // n - 14)
+        w = max(self.delegate.card_width, w)
+        if force or abs(w - (self.delegate.fill_width or 0)) > 1:
+            self.delegate.fill_width = w
+            if not force:
+                self.model_.layoutChanged.emit()
 
     def set_groups(self, groups) -> None:
         """Replace the items but keep the scroll position (incremental loading appends pages)."""
@@ -464,3 +492,4 @@ class GameGridView(QListView):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._place_arrows()
+        self._fill_rows()

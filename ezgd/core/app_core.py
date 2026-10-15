@@ -648,7 +648,7 @@ class AppCore:
                    "remove_steam_shortcuts", "last_run_status", "start_steam", "stop_completely",
                    "backup_saves", "save_backups", "restore_save_backup", "delete_save_backup",
                    "suspend", "resume", "resume_all", "suspended_ids", "game_volume", "set_game_volume", "protons",
-                   "session_seconds", "game_processes", "auto_executable"}
+                   "session_seconds", "game_processes", "auto_executable", "set_mangohud"}
         if method not in allowed:
             raise ValueError(f"unknown library call {method}")
         fn = getattr(self.library, method)
@@ -789,15 +789,30 @@ class AppCore:
                     # the folder the file was imported from: "delete the archive after extraction" applies here too
                     if not await self.post.extract(entry, a, dest, password, download_root=a.parent):
                         break
-            task = asyncio.create_task(run())
-            self._import_tasks.add(task)
-            task.add_done_callback(self._import_tasks.discard)
+            self._watch_task(asyncio.create_task(run()), "Installing failed", entry.title, entry.id)
         try:
             await self.lookup_steam_app_id(entry.id)
         except Exception as exc:              # best effort, as after a download
             log.info("Steam App ID lookup for %s failed: %s", entry.title, exc)
         return {"entry_id": entry.id, "title": entry.title, "verified": verified, "sha256": actual,
                 "extracting": extracting, "files": [p.name for p in files]}
+
+    def _watch_task(self, task: asyncio.Task, what: str, title: str = "", entry_id: int | None = None) -> None:
+        """A job running in the background: kept until done, and if it fails, logged and shown to the user — never
+        lost silently (an import whose zip used an unsupported compression vanished without a word)."""
+        self._import_tasks.add(task)
+
+        def done(t: asyncio.Task) -> None:
+            self._import_tasks.discard(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is None:
+                return
+            log.error("%s: %s", what, title or "background job", exc_info=exc)
+            extra = {"library": entry_id} if entry_id is not None else {}
+            self.emit("notify", (what, f"{title}: {exc}" if title else str(exc), extra))
+        task.add_done_callback(done)
 
     async def _import_volumes(self, g: Game, volumes: dict, others: list[Path], verified, extract: bool) -> dict:
         entry = None
@@ -821,10 +836,9 @@ class AppCore:
                 extracting = True
             # record the parts and, once complete, extract in the background (it can take minutes)
             dest = self.post.update_dest(entry) if (entry.release or {}).get("updating") else None
-            task = asyncio.create_task(self.post.add_volume(entry, part, volumes[part], password, extract=extract,
-                                                            dest=dest))
-            self._import_tasks.add(task)
-            task.add_done_callback(self._import_tasks.discard)
+            self._watch_task(asyncio.create_task(self.post.add_volume(entry, part, volumes[part], password,
+                                                                      extract=extract, dest=dest)),
+                             "Installing failed", entry.title, entry.id)
         for p in others:                            # e.g. a separately downloaded fix archive
             if entry is not None and detect_format(p):
                 await self.extract_entry(entry.id, str(p))
@@ -1569,7 +1583,6 @@ class AppCore:
                                                    tested=seen_ev is not None and not applied)
         verdict["applied"] = applied
         if rounds and rounds[-1]["outcome"] == "ran":
-            last = rounds[-1]
             step("Testing", "running", "it ran — checking once more", at=0.9)
             again = await asyncio.to_thread(self.library.run_trial, entry_id,
                                             {"label": "Second check", "overrides": {}}, len(rounds) + 1,
@@ -1581,7 +1594,6 @@ class AppCore:
                 return verdict
             step("Testing", "running", f"✗ the second check failed ({again['detail']})")
             rounds.append(again)
-            del last
         if self._trial_cancel.is_set():
             verdict.update(status="not_fixed", kept=None, trials=rounds, reason="Stopped by you.")
             step("Testing", "done", "stopped", at=1.0)

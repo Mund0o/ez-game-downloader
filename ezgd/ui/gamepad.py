@@ -60,14 +60,27 @@ def family_of(vendor: int, product: int, name: str) -> str:
     return "generic"
 
 
-def steam_hardware(base: Path = Path("/sys/bus/hid/devices")) -> bool:
-    """Is a Valve controller connected (Steam Controller, Steam Deck)? While Steam runs it takes the controller over
-    and, outside games, turns it into keyboard and mouse input — couch mode then only sees keys, but the person is
-    holding a Steam controller and should see its buttons. (HID devices are named BUS:VENDOR:PRODUCT.N.)"""
+def steam_products(base: Path = Path("/sys/bus/hid/devices")) -> set[int]:
+    """Product ids of the connected Valve controllers (Steam Controller, Steam Deck, the new Steam Controller).
+    While Steam runs it takes them over and, outside games, turns them into keyboard and mouse input — couch mode
+    then only sees keys. (HID devices are named BUS:VENDOR:PRODUCT.N.)"""
+    out = set()
     try:
-        return any(":28DE:" in d.name.upper() for d in base.iterdir())
+        for d in base.iterdir():
+            parts = d.name.upper().split(":")
+            if len(parts) >= 3 and parts[1] == "28DE":
+                try:
+                    out.add(int(parts[2].split(".")[0], 16))
+                except ValueError:
+                    pass
     except OSError:
-        return False
+        pass
+    from ezgd.ui.steam_input import VIRTUAL
+    return out - VIRTUAL                                   # (not Steam Input's virtual pads)
+
+
+def steam_hardware(base: Path = Path("/sys/bus/hid/devices")) -> bool:
+    return bool(steam_products(base))
 
 
 def _sys_id(sys_event_dir: Path) -> tuple[int, int]:
@@ -141,7 +154,7 @@ class _Device:
         self.trigger = {ABS_Z: False, ABS_RZ: False}
         self.ranges: dict[int, tuple[int, int]] = {}
         self.axes = {ABS_X: 0.0, ABS_Y: 0.0, ABS_RX: 0.0, ABS_RY: 0.0}   # -1 … 1 (the pointer in the browser)
-        for code in (ABS_X, ABS_Y, ABS_Z, ABS_RZ, ABS_RX, ABS_RY):
+        for code in (ABS_X, ABS_Y, ABS_Z, ABS_RZ, ABS_RX, ABS_RY, ABS_HAT0X, ABS_HAT0Y):
             try:
                 buf = fcntl.ioctl(fd, _eviocgabs(code), bytes(ABSINFO.size))
                 _v, lo, hi, _f, _flat, _r = ABSINFO.unpack(buf)
@@ -178,7 +191,13 @@ class Gamepads(QObject):
         self._home_timer.setInterval(int(HOME_HOLD * 1000))
         self._home_timer.timeout.connect(self.home_held.emit)
         self.family = ""                                 # "" until a controller is connected
-        self.steam_hw = False                            # a Valve controller is plugged in (see steam_hardware)
+        self.steam_hw = False                            # a Valve controller is plugged in (see steam_products)
+        from ezgd.ui.steam_input import DesktopKeys, GuideWatch
+        self.desktop = DesktopKeys()                     # … the keys Steam turns its buttons into (steam_input)
+        self.guide = GuideWatch(self)                    # … and its Steam button, from Steam's log
+        self.guide.tapped.connect(lambda: self._steam_guide(False))
+        self.guide.held.connect(lambda: self._steam_guide(True))
+        self._home_seen = 0.0                            # the guide button read from a controller, last
         self.pointer_mode = False                        # the left stick moves a pointer: no stick → directions
         self._repeat = QTimer(self)
         self._repeat.setInterval(int(REPEAT_EVERY * 1000))
@@ -196,6 +215,7 @@ class Gamepads(QObject):
         self._scan.start()
 
     def stop(self) -> None:
+        self.guide.stop()
         self._scan.stop()
         self._repeat.stop()
         self._home_timer.stop()
@@ -233,8 +253,55 @@ class Gamepads(QObject):
             self.family_changed.emit(family)
 
     # ------------------------------------------------------------- devices
+    def _steam_direct(self) -> bool:
+        """The Valve controller is read directly (Steam does not have it: no keys come from it)."""
+        return any(not d.virtual and d.family == "steam" for d in self.devices.values())
+
+    def steam_key(self, qt_key: int) -> str | None:
+        """A key that Steam sent for its controller's button → the couch action of that button (None: not one)."""
+        if not self.steam_hw or self._steam_direct():
+            return None
+        return self.desktop.action(qt_key)
+
+    def steam_as_keys(self) -> bool:
+        """Steam has the Valve controller and turns it into keys and mouse input (outside games)."""
+        return self.steam_hw and not self._steam_direct()
+
+    def reachable(self, action: str) -> bool:
+        """Can the controller in use do ``action`` here? Always — except a Steam controller sent as keys, whose
+        Desktop Configuration may leave buttons without a key (the triggers are mouse clicks in Steam's defaults)."""
+        if not self.steam_as_keys() or action not in ("a", "b", "x", "lb", "rb", "lt", "rt", "start", "select"):
+            return True
+        return action in self.desktop.keys.values()
+
+    def steam_labels(self) -> dict[str, str]:
+        """What the Steam controller's buttons are called (LB / RB on the original, L1 / R1 on the others; Y or X for
+        Manage — whichever sends a key)."""
+        return self.desktop.labels
+
+    def _steam_guide(self, held: bool) -> None:
+        """Steam logged its Steam button: a tap means "home", a long hold the quick menu — unless the button was read
+        from the controller itself just now (the same press)."""
+        if time.monotonic() - self._home_seen < 1.5 or self._steam_direct():
+            return
+        self._set_family("steam")
+        if held:
+            self.home_held.emit()
+        else:
+            self.action.emit("home")
+
     def rescan(self) -> None:
-        steam_hw = steam_hardware()
+        products = steam_products()
+        steam_hw = bool(products)
+        if steam_hw and not self._steam_direct():
+            from ezgd.ui import steam_bpm
+            if steam_bpm.steam_running():
+                self.desktop.update(products)
+                self.guide.start()
+            else:
+                self.guide.stop()
+        else:
+            self.guide.stop()
         if steam_hw != self.steam_hw:
             self.steam_hw = steam_hw
             log.info("Steam controller %s", "connected (Steam may hand it over as keyboard and mouse)" if steam_hw
@@ -330,6 +397,10 @@ class Gamepads(QObject):
                     self._emit(dev, name)
         elif typ == EV_ABS:
             if code in (ABS_HAT0X, ABS_HAT0Y):
+                lo, hi = dev.ranges.get(code, (-1, 1))
+                if max(abs(lo), abs(hi)) > 1:
+                    return    # a trackpad's touch position (Steam Controller / Deck, kernel hid-steam): its click
+                    #           comes as the d-pad buttons — resting a thumb on it must not move anything
                 neg, pos = ("left", "right") if code == ABS_HAT0X else ("up", "down")
                 self._direction(dev, neg if value < 0 else pos if value > 0 else None, neg, pos)
             elif code in (ABS_Z, ABS_RZ) and getattr(dev, "analog_triggers", False) and code in dev.ranges:
@@ -397,6 +468,7 @@ class Gamepads(QObject):
                 return
             self._raw_owner[name] = (dev.path, now, True)
             if name == "home":
+                self._home_seen = now
                 self._home_timer.start()
             self.button.emit(name, True)
             return
@@ -408,6 +480,7 @@ class Gamepads(QObject):
                 return                            # not the device that pressed it
             self._raw_owner[name] = (owner[0], owner[1], False)
         if name == "home":
+            self._home_seen = now
             self._home_timer.stop()
         self.button.emit(name, False)
 

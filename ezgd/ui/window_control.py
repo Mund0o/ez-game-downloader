@@ -52,6 +52,64 @@ GAME_SCRIPT = """
 """
 
 
+STEAM_HIDE_SCRIPT = """
+(function () {
+    var list = workspace.windowList ? workspace.windowList() : workspace.clientList();
+    var active = workspace.activeWindow !== undefined ? workspace.activeWindow : workspace.activeClient;
+    for (var i = 0; i < list.length; i++) {
+        var w = list[i], cls = String(w.resourceClass).toLowerCase(), name = String(w.resourceName).toLowerCase();
+        var steam = cls === "steam" || cls === "steamwebhelper" || name === "steamwebhelper";
+        if (steam && w.normalWindow && !w.minimized && (w === active || %(all)s)) w.minimized = true;
+    }
+})();
+"""
+
+
+STEAM_GUARD_SCRIPT = """
+(function () {
+    var t0 = Date.now();
+    var last = workspace.activeWindow !== undefined ? workspace.activeWindow : workspace.activeClient;
+    function isSteam(w) {
+        if (!w) return false;
+        var c = String(w.resourceClass).toLowerCase(), n = String(w.resourceName).toLowerCase();
+        return c === "steam" || c === "steamwebhelper" || n === "steamwebhelper";
+    }
+    function activate(w) {
+        if (workspace.activeWindow !== undefined) workspace.activeWindow = w; else workspace.activeClient = w;
+    }
+    function handle(w) {
+        if (Date.now() - t0 > %(ms)d || !w) return;
+        if (!isSteam(w)) { last = w; return; }
+        if (String(w.caption).toLowerCase().indexOf("big picture") !== -1) w.closeWindow();   // Big Picture: closed
+        else w.minimized = true;                                                            // Steam: to the back
+        if (last && !isSteam(last) && !last.minimized) activate(last);
+    }
+    var sig = workspace.windowActivated !== undefined ? workspace.windowActivated : workspace.clientActivated;
+    sig.connect(handle);
+    if (isSteam(last)) { var was = last; last = null; handle(was); }
+})();
+"""
+
+
+def guard_steam(ms: int = 3000) -> bool:
+    """The guide button was pressed: for the next ``ms``, the moment Steam answers it with a window of its own
+    (Steam Input), KWin puts it away — Big Picture closed, Steam's window minimized — and gives the screen straight
+    back to the window that had it (the quick menu, couch mode or the game). Instant (KWin's own activation event, no
+    polling). Only Steam's client windows; never a game. False without KWin."""
+    if not WindowControl._kwin_available():
+        return False
+    return _run_kwin(STEAM_GUARD_SCRIPT % {"ms": int(ms)}, "guard against Steam's window", keep_ms=ms + 500)
+
+
+def hide_steam_windows(only_active: bool = True) -> bool:
+    """Steam answered the guide button by bringing its own window up (Steam Input on the controller): put that window
+    away again. Only Steam's own client windows (class steam / steamwebhelper) — never a game started through Steam
+    (its class is steam_app_…). False without KWin."""
+    if not WindowControl._kwin_available():
+        return False
+    return _run_kwin(STEAM_HIDE_SCRIPT % {"all": "false" if only_active else "true"}, "hide Steam's window")
+
+
 def bring_game_forward(pids: list[int]) -> bool:
     """Give the screen back to a game: its biggest (or full-screen) window comes to the front with the focus.
     Only windows of the game's own processes are touched. False when the compositor cannot do it (then the game is
@@ -127,8 +185,8 @@ class WindowControl:
 
     @staticmethod
     def _kwin_available() -> bool:
-        if os.name == "nt" or QGuiApplication.platformName() != "wayland":
-            return False
+        if os.name == "nt" or QGuiApplication.platformName() not in ("wayland", "xcb"):
+            return False                                   # (KWin takes these scripts on Wayland and on X11)
         if "KDE" not in os.environ.get("XDG_CURRENT_DESKTOP", "").upper():
             return False
         try:
@@ -212,8 +270,9 @@ class WindowControl:
 _kwin_n = 0
 
 
-def _run_kwin(script: str, what: str) -> bool:
-    """Load, run and unload a one-shot KWin script (over D-Bus, never waiting more than 1.5 s per call)."""
+def _run_kwin(script: str, what: str, keep_ms: int = 0) -> bool:
+    """Load, run and unload a one-shot KWin script (over D-Bus, never waiting more than 1.5 s per call).
+    ``keep_ms``: the script keeps listening (to KWin's signals) that long before it is unloaded."""
     global _kwin_n
     _kwin_n += 1
     name = f"ezgd-couch-{os.getpid()}-{_kwin_n}"
@@ -234,7 +293,17 @@ def _run_kwin(script: str, what: str) -> bool:
         sid = r.arguments()[0] if r.arguments() else -1
         if isinstance(sid, int) and sid >= 0:
             call(f"/Scripting/Script{sid}", "org.kde.kwin.Script", "run")
-        call("/Scripting", "org.kde.kwin.Scripting", "unloadScript", name)
+        if keep_ms > 0:
+            from PySide6.QtCore import QTimer
+
+            def unload() -> None:
+                try:
+                    call("/Scripting", "org.kde.kwin.Scripting", "unloadScript", name)
+                except Exception:
+                    pass
+            QTimer.singleShot(keep_ms, unload)
+        else:
+            call("/Scripting", "org.kde.kwin.Scripting", "unloadScript", name)
         log.debug("kwin: %s (%.0f ms)", what, (time.monotonic() - t) * 1000)
         return True
     except Exception:

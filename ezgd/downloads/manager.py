@@ -300,7 +300,12 @@ class DownloadManager:
     def _spawn_post(self, coro) -> None:
         job = asyncio.create_task(coro)
         self._post_jobs.add(job)
-        job.add_done_callback(self._post_jobs.discard)
+
+        def done(t: asyncio.Task) -> None:
+            self._post_jobs.discard(t)
+            if not t.cancelled() and t.exception() is not None:   # (never lost silently)
+                log.error("after-download step failed", exc_info=t.exception())
+        job.add_done_callback(done)
 
     async def _complete(self, task: DownloadTask, content: Path | None) -> None:
         task.status = DownloadStatus.COMPLETED
@@ -652,7 +657,6 @@ class DownloadManager:
                                                                    "play_speed_limit_kbps", 0))}
 
     def apply_settings(self, key: str, value: Any) -> None:
-        s = self.settings.settings
         if key in ("http_speed_limit_kbps", "play_speed_limit_kbps", "torrent_download_limit_kbps"):
             self._apply_rates()
         elif key in ("download_hours", "download_from", "download_to"):

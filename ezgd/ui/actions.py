@@ -168,11 +168,22 @@ class Actions(QObject):
                          lambda e: self.fail("Could not add the download", e))
 
     # --------------------------------------------------------------- launch
+    on_launch = None                     # (entry id) → the main window: the user starts this game now
+
+    def launch_requested(self, entry_id: int) -> None:
+        if self.on_launch is not None:
+            try:
+                self.on_launch(entry_id)
+            except Exception:
+                pass
+
     def launch(self, parent: QWidget, entry, *, confirm=None, couch: bool = False, started=None,
                failed=None) -> None:
         """Play ``entry``. Couch mode passes ``confirm(entry, plan, proceed)`` (its own full-screen question instead
         of a desktop dialog), ``couch=True`` (never asks to restart Steam: plays right away) and callbacks for when
         the game was started or could not be."""
+        self.launch_requested(entry.id)
+
         def go() -> None:
             self.bridge.call(self.core.library_call("steam_overlay_status", entry.id),
                              lambda st: self._start(parent, entry, st, couch, started, failed),

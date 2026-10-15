@@ -814,6 +814,9 @@ def test_couch_browser_every_way_out_lands_in_couch_mode(ui, qtbot, server, how)
     if how == "button":
         QTest.mouseClick(cb.close_button, Qt.LeftButton)
     elif how == "escape":
+        cb.open_keyboard()
+        cb._esc.activated.emit()                               # first only the on-screen keyboard closes
+        assert cb.overlay.keyboard is None and couch.browser is cb
         cb._esc.activated.emit()
     else:
         cb.dlg.close()                                         # the window manager's close (Alt+F4)

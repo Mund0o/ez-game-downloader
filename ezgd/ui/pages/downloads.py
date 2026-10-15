@@ -5,14 +5,14 @@ from __future__ import annotations
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (QButtonGroup, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QListWidget,
-                               QListWidgetItem, QMenu, QMessageBox, QProgressBar, QPushButton, QSpinBox, QSplitter,
+                               QListWidgetItem, QMenu, QMessageBox, QProgressBar, QPushButton, QSplitter,
                                QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from ezgd.core.fsutil import format_bytes, format_eta, format_speed
 from ezgd.ui import theme
 from ezgd.ui.dialogs.misc import open_folder, open_url
 from ezgd.ui.icons import icon
-from ezgd.ui.widgets.common import EmptyState, FlowLayout, button, chip, label, set_chip, source_chip, tool
+from ezgd.ui.widgets.common import EmptyState, FlowLayout, button, chip, label, set_chip, source_chip, spin_box, tool
 
 STATUS_TEXT = {"queued": "Queued", "metadata": "Fetching metadata", "checking": "Checking", "downloading":
                "Downloading", "paused": "Paused", "verifying": "Verifying", "completed": "Download complete",
@@ -269,7 +269,7 @@ class DownloadsPage(QWidget):
         sl.setContentsMargins(16, 0, 0, 0)
         sl.setSpacing(6)
         sl.addWidget(label("At once", "muted"))
-        self.concurrency = QSpinBox()
+        self.concurrency = spin_box()
         self.concurrency.setRange(1, 16)
         self.concurrency.setFixedWidth(70)
         self.concurrency.setToolTip("Maximum number of downloads running at the same time")
@@ -277,7 +277,7 @@ class DownloadsPage(QWidget):
         sl.addWidget(self.concurrency)
         sl.addSpacing(8)
         sl.addWidget(label("Speed limit", "muted"))
-        self.limit = QSpinBox()
+        self.limit = spin_box()
         self.limit.setRange(0, 1_000_000)
         self.limit.setSpecialValueText("unlimited")
         self.limit.setSuffix(" KiB/s")

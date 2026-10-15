@@ -13,16 +13,17 @@ QPainter like couch mode, using couch mode's images, fonts and button prompts.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from PySide6.QtCore import QEasingCurve, QRectF, Qt, QTimer, QVariantAnimation
+from PySide6.QtCore import QEasingCurve, QPointF, QRectF, Qt, QTimer, QVariantAnimation
 from PySide6.QtGui import QColor, QFontMetrics, QLinearGradient, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QApplication, QWidget
 
 from ezgd.ui import theme
-from ezgd.ui.window_control import WindowControl, bring_game_forward
+from ezgd.ui.window_control import WindowControl
 
 log = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ TITLE = "EZ Games — Quick menu"
 VOLUME_STEP = 10
 
 
-ICONS = ("resume", "switch", "couch", "volume", "settings", "quit")
+ICONS = ("resume", "switch", "couch", "volume", "mangohud", "settings", "quit")
 
 
 def draw_icon(p: QPainter, key: str, r: QRectF, color: QColor, s: float) -> None:
@@ -73,6 +74,13 @@ def draw_icon(p: QPainter, key: str, r: QRectF, color: QColor, s: float) -> None
         p.setBrush(Qt.NoBrush)
         p.drawArc(QRectF(x + w * 0.42, y + h * 0.3, w * 0.3, h * 0.4), -50 * 16, 100 * 16)
         p.drawArc(QRectF(x + w * 0.42, y + h * 0.1, w * 0.56, h * 0.8), -50 * 16, 100 * 16)
+    elif key == "mangohud":                                # a frame-time graph in a screen
+        p.drawRoundedRect(QRectF(x + w * 0.04, y + h * 0.12, w * 0.92, h * 0.76), 3 * s, 3 * s)
+        path = QPainterPath()
+        path.moveTo(x + w * 0.18, y + h * 0.62)
+        for fx, fy in ((0.36, 0.62), (0.46, 0.34), (0.58, 0.7), (0.68, 0.5), (0.82, 0.5)):
+            path.lineTo(x + w * fx, y + h * fy)
+        p.drawPath(path)
     elif key == "settings":                                # a gear
         import math
         c = r.center()
@@ -127,7 +135,9 @@ class QuickMenu(QWidget):
         self.setMouseTracking(True)
         self.wc = WindowControl(self, "Quick menu")
         self.game = None                   # the library entry the menu was opened for (None: only suspended ones)
-        self.view = "main"                 # main | switch
+        self.view = "main"                 # main | switch | confirm (Play X?) | starting
+        self.target = None                 # confirm / starting: the game to switch to
+        self.start_error = ""
         self.rows: list[Row] = []
         self.focus = 0
         self.grid: list = []               # switch view: library entries
@@ -141,6 +151,7 @@ class QuickMenu(QWidget):
         self._wide = 0.0                   # 0 → 1: the panel widening for the game grid
         self._closing_then: Callable[[], None] | None = None
         self._pending_art = False
+        self.opened_at = 0.0
         self._anim = QVariantAnimation(self)
         self._anim.setEasingCurve(QEasingCurve.OutCubic)
         self._anim.valueChanged.connect(self._shown_step)
@@ -160,6 +171,7 @@ class QuickMenu(QWidget):
     def open_for(self, game) -> None:
         """Show the menu for ``game`` (a library entry the app is running; None when every game is suspended)."""
         self.game = game
+        self.opened_at = time.monotonic()
         self.view = "main"
         self._wide = 0.0
         self.busy = ""
@@ -251,6 +263,12 @@ class QuickMenu(QWidget):
         return e is not None and e.id in self.couch.suspended
 
     def _build(self) -> None:
+        if self.view in ("confirm", "starting"):
+            self.rows = self._target_rows()
+            self.focus = min(self.focus, max(0, len(self.rows) - 1))
+            if self.rows and not self.rows[self.focus].focusable:
+                self.focus = self._first()
+            return
         rows: list[Row] = []
         g = self.game
         others = [e for e in self.couch.entries if e.id in self.couch.suspended and (g is None or e.id != g.id)]
@@ -267,7 +285,13 @@ class QuickMenu(QWidget):
                                 action=lambda: self._step_volume(VOLUME_STEP),
                                 left=lambda: self._step_volume(-VOLUME_STEP),
                                 right=lambda: self._step_volume(VOLUME_STEP)))
-            rows.append(Row("settings", "Game settings", "Proton, FPS limit, MangoHud — from its next start",
+            import shutil
+            if shutil.which("mangohud"):
+                hud = "mangohud" in g.compat_config.fixes
+                rows.append(Row("mangohud", "MangoHud", "FPS, frame times and temps — over the game now",
+                                "row", "On" if hud else "Off", action=self._toggle_mangohud,
+                                extra={"toggle": hud}))
+            rows.append(Row("settings", "Game settings", "Proton, FPS limit, launch options — from its next start",
                             action=self.game_settings))
             armed = time.monotonic() < self._confirm_quit
             rows.append(Row("quit", "Press again to quit" if armed else "Quit game",
@@ -284,6 +308,25 @@ class QuickMenu(QWidget):
         self.focus = min(self.focus, max(0, len(rows) - 1))
         if rows and not rows[self.focus].focusable:
             self.focus = self._first()
+
+    def _target_rows(self) -> list[Row]:
+        e, g = self.target, self.game
+        rows: list[Row] = []
+        if e is None:
+            return rows
+        waits = f"{g.title} waits, suspended, right where you are" if g is not None and \
+            g.id in self.couch.running else ""
+        if self.view == "confirm":
+            first = "" if e.executable_trusted else "First start of this file — only play games you trust. "
+            rows.append(Row("play", "▶  Play", (first + waits).strip(), "primary", action=self._play_target))
+            rows.append(Row("cancel", "Cancel", "", action=self._cancel_confirm))
+        elif self.start_error:
+            rows.append(Row("h-err", self.start_error, kind="header"))
+            if g is not None:
+                rows.append(Row("back", f"Back to {g.title}", "It continues right where it was", "primary",
+                                action=self.resume))
+            rows.append(Row("close", "Close", "", action=self.close_menu))
+        return rows
 
     def _first(self) -> int:
         return next((k for k, r in enumerate(self.rows) if r.focusable), 0)
@@ -307,7 +350,7 @@ class QuickMenu(QWidget):
     def open_switch(self) -> None:
         self.grid = self._switch_games()
         if not self.grid:
-            self.couch.toasts.show("No other games to play", "Games you install show up here.")
+            self.couch.actions.toasts.show("No other games to play", "Games you install show up here.")
             return
         self.view = "switch"
         self.grid_focus = 0
@@ -330,7 +373,7 @@ class QuickMenu(QWidget):
     def _then_suspend(self, next_step: Callable[[], None]) -> None:
         """Suspend the game the menu is for (when it is playing), then ``next_step``."""
         g = self.game
-        if g is None or g.id not in self.couch.running or g.id in self.couch.suspended:
+        if g is None or g.id in self.couch.suspended:
             next_step()
             return
         self.busy = f"Suspending {g.title}…"
@@ -344,32 +387,90 @@ class QuickMenu(QWidget):
         def failed(err) -> None:
             self.busy = ""
             log.warning("quick menu: could not suspend %s: %s", g.title, err)
-            self.couch.toasts.show(f"{g.title} could not be suspended", f"{err} — it keeps running.", "warning")
+            self.couch.actions.toasts.show(f"{g.title} could not be suspended", f"{err} — it keeps running.", "warning")
             next_step()
         b = self.couch.bridge
         b.call(b.core.library_call("suspend", g.id), done, failed, owner=self)
 
     def switch_to(self, e) -> None:
-        """Play ``e`` instead: the current game is suspended first; a suspended ``e`` continues where it was."""
+        """Play ``e`` instead. A game that is running or suspended: the current one is suspended and ``e`` comes
+        back right where it was. Any other game: "Play …?" right here in the menu — couch mode never comes forward."""
         if self.busy:
             return
         self.couch.sounds.play("select")
+        if e.id in self.couch.running:
+            self._then_suspend(lambda: self.close_menu(lambda: self.couch.go_to_game(e)))
+            return
+        self.target = e
+        self.start_error = ""
+        self.view = "confirm"
+        self.focus = 0
+        self._build()
+        self.update()
 
-        def go() -> None:
-            if e.id in self.couch.running:
-                self.close_menu(lambda: self.couch.go_to_game(e))
-            else:
-                def start() -> None:
-                    self.couch._come_back()
-                    self.couch.play(e)
-                self.close_menu(start)
-        self._then_suspend(go)
+    def _play_target(self) -> None:
+        """PLAY on the question: suspend the current game, start the new one; the menu says "Starting…" until it
+        runs, then gets out of the way."""
+        e, c = self.target, self.couch
+        if e is None:
+            return
+        self.view = "starting"
+        self._build()
+        self.update()
+
+        def started(entry) -> None:
+            c.launched.add(entry.id)
+            c._launch_at[entry.id] = time.monotonic()
+
+        def failed(err) -> None:
+            c._launch_at.pop(e.id, None)
+            if self.view == "starting" and self.target is e:
+                self.start_error = str(err) or "It did not start."
+                self._build()
+                self.update()
+
+        def launch() -> None:
+            c._launch_at[e.id] = time.monotonic()        # (the ✕ treats it as on its way)
+            c.actions.launch(self, e, confirm=lambda _entry, _plan, proceed: proceed(), couch=True,
+                             started=started, failed=failed)
+            QTimer.singleShot(45_000, self, lambda: self._start_timeout(e))
+            from ezgd.ui import steam_bpm
+            if steam_bpm.steam_running():               # started through Steam: its window may pop up meanwhile
+                for ms in (1500, 4000, 8000):
+                    QTimer.singleShot(ms, c, c._put_steam_away)
+        self._then_suspend(launch)
+
+    def target_running(self, entry_id: int) -> None:
+        """The game being switched to runs: give it the screen (its window may take a moment to appear)."""
+        e = self.target
+        if self.view != "starting" or e is None or e.id != entry_id:
+            return
+        self.game = e
+        self.close_menu(lambda: self.couch.bring_forward_soon(e))
+
+    def _start_timeout(self, e) -> None:
+        if self.view == "starting" and self.target is e and self.isVisible() and not self.start_error:
+            self.start_error = "It has not shown up yet — it may still be loading (Steam can take a while)."
+            self._build()
+            self.update()
+
+    def _cancel_confirm(self) -> None:
+        self.target = None
+        self.view = "switch"
+        self.update()
 
     def to_couch(self) -> None:
         if self.busy:
             return
         self.couch.sounds.play("select")
-        self._then_suspend(lambda: self.close_menu(self.couch._come_back))
+        g = self.game
+
+        def go() -> None:
+            self.couch._come_back()
+            if g is not None:
+                self.couch.toasts.show(f"{g.title} is suspended", "A on it continues it right where you were — or "
+                                       "hold the guide button.")
+        self._then_suspend(lambda: self.close_menu(go))
 
     def game_settings(self) -> None:
         g = self.game
@@ -377,7 +478,7 @@ class QuickMenu(QWidget):
 
         def go() -> None:
             self.couch._come_back()
-            self.couch.open_game_settings(g)
+            self.couch.open_game_settings(g, back_to_game=True)
         self.close_menu(go)
 
     def quit(self) -> None:
@@ -397,6 +498,26 @@ class QuickMenu(QWidget):
             self.couch._stop([g.id], then_exit=False)
         self.close_menu(go)
 
+    def _toggle_mangohud(self) -> None:
+        g = self.game
+        if g is None:
+            return
+        on = "mangohud" not in g.compat_config.fixes
+        b = self.couch.bridge
+
+        def done(r: dict) -> None:
+            def fresh(e) -> None:
+                if self.game is not None and self.game.id == e.id:
+                    self.game = e
+                    self._build()
+                    self.update()
+            b.call(b.core.library_call("get", g.id), fresh, lambda _e: None, owner=self)
+            if not r.get("live"):
+                self.couch.actions.toasts.show(f"MangoHud {'on' if on else 'off'}", "From the next start of "
+                                               f"{g.title} (it was started without MangoHud ready).")
+        b.call(b.core.library_call("set_mangohud", g.id, on), done,
+               lambda err: self.couch.actions.toasts.show("MangoHud", str(err), "error"), owner=self)
+
     def _step_volume(self, d: int) -> None:
         if self.game is None or self.volume is None:
             return
@@ -414,11 +535,18 @@ class QuickMenu(QWidget):
     def command(self, name: str) -> None:
         if self.busy or self._shown < 0.3 and self._closing_then is not None:
             return
-        if name == "home":
+        if name == "home":                               # the guide button again: back to the game
+            if time.monotonic() - self.opened_at > 0.4:
+                self.resume() if self.game is not None else self.close_menu()
             return
         before = (self.view, self.focus, self.grid_focus)
         if self.view == "switch":
             self._grid_command(name)
+        elif self.view in ("confirm", "starting") and name == "b":
+            if self.view == "confirm":
+                self._cancel_confirm()
+            elif self.start_error:
+                self.resume() if self.game is not None else self.close_menu()
         else:
             self._main_command(name)
         if (self.view, self.focus, self.grid_focus) != before and name not in ("a", "b"):
@@ -466,11 +594,27 @@ class QuickMenu(QWidget):
             self.close_switch()
 
     def keyPressEvent(self, e) -> None:                       # noqa: N802
-        name = {Qt.Key_Up: "up", Qt.Key_Down: "down", Qt.Key_Left: "left", Qt.Key_Right: "right",
-                Qt.Key_Return: "a", Qt.Key_Enter: "a", Qt.Key_Space: "a", Qt.Key_Escape: "b",
-                Qt.Key_Backspace: "b"}.get(e.key())
+        name = self.couch.key_action(e.key()) or {      # (a Steam controller's buttons, sent as keys by Steam)
+            Qt.Key_Up: "up", Qt.Key_Down: "down", Qt.Key_Left: "left", Qt.Key_Right: "right",
+            Qt.Key_Return: "a", Qt.Key_Enter: "a", Qt.Key_Space: "a", Qt.Key_Escape: "b",
+            Qt.Key_Backspace: "b"}.get(e.key())
         if name:
             self.command(name)
+
+    def wheelEvent(self, e) -> None:                          # noqa: N802
+        """A mouse wheel — and a Steam controller's left trackpad, a scroll wheel in Steam's desktop layout — moves
+        the selection."""
+        d = e.angleDelta().y() or e.angleDelta().x()
+        if not d:
+            return
+        if self.view == "switch":                       # the grid: one game at a time, row after row
+            i = max(0, min(len(self.grid) - 1, self.grid_focus + (-1 if d > 0 else 1)))
+            if i != self.grid_focus:
+                self.grid_focus = i
+                self.couch.sounds.play("move")
+                self.update()
+        else:
+            self.command("up" if d > 0 else "down")
 
     def _hit_at(self, pos) -> tuple[str, int] | None:
         for r, kind, idx in reversed(self._hits):
@@ -547,7 +691,7 @@ class QuickMenu(QWidget):
         return QRectF(x + (1 - t) * 60 * s, 0, pw, H)
 
     def _paint_backdrop(self, p: QPainter, t: float) -> None:
-        W, H = self.width(), self.height()
+        W = self.width()
         p.fillRect(self.rect(), QColor(4, 6, 12, int(120 * t)))          # the game stays visible behind
         g = QLinearGradient(W * 0.25, 0, W, 0)
         g.setColorAt(0.0, QColor(4, 6, 12, 0))
@@ -579,9 +723,14 @@ class QuickMenu(QWidget):
         y = self._paint_header(p, inner, 34 * s)
         if self.view == "switch":
             self._paint_switch(p, inner, y)
+        elif self.view in ("confirm", "starting") and self.target is not None:
+            y = self._paint_now_playing(p, inner, y + 18 * s, self.target)
+            self._paint_target_text(p, inner, y + 22 * s)
         else:
-            if self.game is not None:
-                y = self._paint_now_playing(p, inner, y + 18 * s)
+            if self.game is not None:                     # (the card gives way when the rows need the room)
+                room = self.height() - 96 * s - (y + 18 * s + 24 * s) - self._rows_height()
+                h = max(130 * s, min(inner.width() * 0.43, room))
+                y = self._paint_now_playing(p, inner, y + 18 * s, height=h)
             self._paint_rows(p, inner, y + 24 * s)
         self._paint_hints(p, inner)
         if self.busy:
@@ -604,12 +753,45 @@ class QuickMenu(QWidget):
         p.setFont(self.couch._font(15 * s, 800))
         p.setPen(QColor(255, 255, 255, 120))
         p.drawText(QRectF(r.left(), y + 38 * s, r.width(), 22 * s), Qt.AlignLeft | Qt.AlignVCenter,
-                   "SWITCH GAME" if self.view == "switch" else "QUICK MENU")
+                   {"switch": "SWITCH GAME", "confirm": "SWITCH GAME", "starting": "STARTING"}.get(self.view,
+                                                                                               "QUICK MENU"))
         return y + 66 * s
 
-    def _paint_now_playing(self, p: QPainter, r: QRectF, y: float) -> float:
-        s, g = self._s(), self.game
-        card = QRectF(r.left(), y, r.width(), r.width() * 0.43)
+    def _paint_target_text(self, p: QPainter, r: QRectF, y: float) -> None:
+        """Under the target's card: the question (and its buttons), or "Starting…"."""
+        s, e = self._s(), self.target
+        if self.view == "confirm" or self.start_error:
+            p.setFont(self.couch._font(28 * s, 900))
+            p.setPen(QColor("white"))
+            text = f"Play {e.title}?" if self.view == "confirm" else "Not started"
+            p.drawText(QRectF(r.left(), y, r.width(), 40 * s), Qt.AlignLeft | Qt.AlignVCenter,
+                       QFontMetrics(p.font()).elidedText(text, Qt.ElideRight, int(r.width())))
+            self._paint_rows(p, r, y + 56 * s)
+            return
+        p.setFont(self.couch._font(28 * s, 900))
+        p.setPen(QColor("white"))
+        p.drawText(QRectF(r.left(), y, r.width(), 40 * s), Qt.AlignLeft | Qt.AlignVCenter, "Starting")
+        t = time.monotonic()
+        x0 = r.left() + QFontMetrics(p.font()).horizontalAdvance("Starting") + 18 * s
+        for k in range(3):                               # three pulsing dots while it starts
+            a = 0.35 + 0.65 * max(0.0, math.sin(t * 5 - k * 0.7))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(255, 255, 255, int(255 * a)))
+            p.drawEllipse(QPointF(x0 + k * 22 * s, y + 26 * s), 5 * s, 5 * s)
+        p.setBrush(Qt.NoBrush)
+        g = self.game
+        p.setFont(self.couch._font(17 * s, 600))
+        p.setPen(QColor(255, 255, 255, 170))
+        note = (f"{g.title} is suspended — it waits right where you left it." if g is not None and
+                g.id in self.couch.suspended else "It gets the screen as soon as it is up.")
+        p.drawText(QRectF(r.left(), y + 50 * s, r.width(), 60 * s), Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap,
+                   note)
+        QTimer.singleShot(60, self, self.update)
+
+    def _paint_now_playing(self, p: QPainter, r: QRectF, y: float, entry=None, height=None) -> float:
+        s = self._s()
+        g = entry if entry is not None else self.game
+        card = QRectF(r.left(), y, r.width(), height or r.width() * 0.43)
         radius = 20 * s
         path = QPainterPath()
         path.addRoundedRect(card, radius, radius)
@@ -629,8 +811,10 @@ class QuickMenu(QWidget):
         p.setPen(QPen(QColor(255, 255, 255, 34), 1.2 * s))
         p.drawPath(path)
         sus = self._suspended(g)
-        chip_text = "SUSPENDED" if sus else "PLAYING"
-        chip_color = QColor(theme.CURRENT.warning if sus else theme.CURRENT.success)
+        chip_text = "SUSPENDED" if sus else "PLAYING" if g.id in self.couch.running else \
+            "STARTING" if self.view == "starting" else "READY TO PLAY"
+        chip_color = QColor(theme.CURRENT.warning if sus else theme.CURRENT.success if g.id in self.couch.running
+                            else theme.CURRENT.accent)
         p.setFont(self.couch._font(14 * s, 900))
         cw = QFontMetrics(p.font()).horizontalAdvance(chip_text) + 50 * s
         chip = QRectF(card.left() + 22 * s, card.bottom() - 100 * s, cw, 32 * s)
@@ -650,7 +834,7 @@ class QuickMenu(QWidget):
         p.setBrush(Qt.NoBrush)
         p.setPen(QColor("white"))
         p.drawText(chip.adjusted(30 * s, 0, -10 * s, 0), Qt.AlignLeft | Qt.AlignVCenter, chip_text)
-        if self.session is not None:
+        if self.session is not None and entry is None:
             p.setFont(self.couch._font(16 * s, 700))
             p.setPen(QColor(255, 255, 255, 190))
             p.drawText(QRectF(chip.right() + 14 * s, chip.top(), card.width(), chip.height()),
@@ -662,18 +846,27 @@ class QuickMenu(QWidget):
                    QFontMetrics(p.font()).elidedText(g.title, Qt.ElideRight, int(card.width() - 44 * s)))
         return card.bottom()
 
+    def _row_height(self, row: Row) -> float:
+        return (44 if row.kind == "header" else (92 if row.kind == "game" else 78 if row.note else 62) + 10) * self._s()
+
+    def _rows_height(self) -> float:
+        return sum(self._row_height(row) for row in self.rows)
+
     def _paint_rows(self, p: QPainter, r: QRectF, y: float) -> None:
         s = self._s()
-        bottom = self.height() - 96 * s
+        bottom = self.height() - 96 * s + 0.5              # (+ rounding)
         for k, row in enumerate(self.rows):
             if row.kind == "header":
+                nxt = self.rows[k + 1] if k + 1 < len(self.rows) else None
+                if nxt is None or y + self._row_height(row) + self._row_height(nxt) - 10 * s > bottom:
+                    break                                   # (never a heading with nothing under it)
                 p.setFont(self.couch._font(15 * s, 900))
                 p.setPen(QColor(theme.CURRENT.accent).lighter(140))
                 p.drawText(QRectF(r.left() + 4 * s, y + 10 * s, r.width(), 28 * s), Qt.AlignLeft | Qt.AlignVCenter,
                            row.label.upper())
                 y += 44 * s
                 continue
-            h = (92 if row.kind == "game" else 78 if row.note else 62) * s
+            h = self._row_height(row) - 10 * s
             if y + h > bottom:
                 break
             rect = QRectF(r.left(), y, r.width(), h)
@@ -729,7 +922,22 @@ class QuickMenu(QWidget):
                 p.fillPath(tp, QColor(255, 255, 255, 30))
             x = tr.right() + 18 * s
         right_w = 0.0
-        if row.value:
+        if "toggle" in row.extra:                           # an on / off switch
+            on = bool(row.extra["toggle"])
+            tw, th = 58 * s, 32 * s
+            track = QRectF(r.right() - pad - tw, r.center().y() - th / 2, tw, th)
+            tp = QPainterPath()
+            tp.addRoundedRect(track, th / 2, th / 2)
+            p.fillPath(tp, QColor(theme.CURRENT.success) if on else
+                       (QColor(0, 0, 0, 60) if light else QColor(255, 255, 255, 46)))
+            knob = th - 8 * s
+            kx = track.right() - 4 * s - knob if on else track.left() + 4 * s
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor("white"))
+            p.drawEllipse(QRectF(kx, track.top() + 4 * s, knob, knob))
+            p.setBrush(Qt.NoBrush)
+            right_w = tw + 12 * s
+        elif row.value:
             p.setFont(self.couch._font(19 * s, 800))
             text = f"◂  {row.value}  ▸" if row.kind == "choice" else row.value
             right_w = QFontMetrics(p.font()).horizontalAdvance(text) + 12 * s
@@ -861,6 +1069,10 @@ class QuickMenu(QWidget):
         p.drawLine(r.left(), y - 34 * s, r.right(), y - 34 * s)
         if self.view == "switch":
             hints = [("a", "Play"), ("dpad", "Choose"), ("b", "Back")]
+        elif self.view == "confirm":
+            hints = [("a", "Select"), ("b", "Back")]
+        elif self.view == "starting":
+            hints = [] if not self.start_error else [("a", "Select")]
         else:
             row = self.rows[self.focus] if 0 <= self.focus < len(self.rows) else None
             hints = [("a", "Select")]
@@ -868,7 +1080,7 @@ class QuickMenu(QWidget):
                 hints = [("lr", "Change")]
             hints.append(("b", "Back to the game" if self.game is not None else "Close"))
         x = r.left()
-        for action, text in hints:
+        for action, text in self.couch.usable_hints(hints):
             x = self.couch._glyph(p, x, y, action, text) + 26 * s
 
     def _paint_busy(self, p: QPainter, panel: QRectF) -> None:

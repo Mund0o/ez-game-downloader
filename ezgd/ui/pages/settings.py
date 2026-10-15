@@ -14,7 +14,7 @@ from ezgd.core.settings import ACCENTS
 from ezgd.ui import theme
 from ezgd.ui.dialogs.download_options import folder_row
 from ezgd.ui.dialogs.misc import EventsDialog, open_folder
-from ezgd.ui.widgets.common import button, card, label, relative_time
+from ezgd.ui.widgets.common import button, card, label, relative_time, spin_box
 
 
 class SettingsPage(QWidget):
@@ -131,7 +131,7 @@ class SettingsPage(QWidget):
 
     def _spin(self, form, key: str, text: str, lo: int, hi: int, suffix: str = "", special: str = "",
               step: int = 1) -> QSpinBox:
-        w = QSpinBox()
+        w = spin_box()
         w.setRange(lo, hi)
         w.setSingleStep(step)
         if suffix:
@@ -171,6 +171,7 @@ class SettingsPage(QWidget):
         w.sliderReleased.connect(save)
         w.valueChanged.connect(lambda _v: None if w.isSliderDown() else save())     # keys / clicks on the track
         row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(w)
         row.addWidget(value)
         row.addStretch(1)
@@ -223,13 +224,14 @@ class SettingsPage(QWidget):
         f = self._section("System check", "External tools for extracting archives, running Windows games and "
                                           "launch-option helpers.")
         self.system_label = label("Checking…", "small", wrap=True)
-        f.addRow("", self.system_label)
+        f.addRow(self.system_label)
         row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(button("Open system check…", "check", on_click=self._system_check))
         row.addStretch(1)
         w = QWidget()
         w.setLayout(row)
-        f.addRow("", w)
+        f.addRow(w)
 
         f = self._section("Storage", "Where downloads are saved and games are extracted.")
         self._folder(f, "install_dir", "Games folder")
@@ -241,9 +243,11 @@ class SettingsPage(QWidget):
         dl = self._folder(f, "download_dir", "Download folder")
         one.toggled.connect(lambda v: dl.parentWidget().setEnabled(not v))
         row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
         self.cleanup_btn = button("Delete archives of installed games…", "close",
                                   tooltip="Archives of games that were extracted successfully but are still on disk "
                                           "(from before “delete the archive” was on)", on_click=self._cleanup)
+        row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(self.cleanup_btn)
         row.addStretch(1)
         w = QWidget()
@@ -261,6 +265,7 @@ class SettingsPage(QWidget):
         hours.toggled.connect(lambda v: self._save("download_hours", v))
         self.widgets["download_hours"] = hours
         row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(10)
         row.addWidget(hours)
         times = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)]
@@ -301,6 +306,7 @@ class SettingsPage(QWidget):
         tool.setPlaceholderText("auto-detect unrar / 7z")
         tool.editingFinished.connect(lambda: self._save("unrar_tool", tool.text().strip()))
         row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(tool, 1)
         row.addWidget(button("Browse…", "folder", on_click=lambda: self._pick_tool(tool)))
         w = QWidget()
@@ -324,6 +330,7 @@ class SettingsPage(QWidget):
         cw.setLayout(self.custom_holder)
         f.addRow("Your sites", cw)
         add_row = QHBoxLayout()
+        add_row.setContentsMargins(0, 0, 0, 0)
         add_row.addWidget(button("Add a site…", "plus", on_click=self._add_site))
         add_row.addWidget(label("Add game download sites like SteamRIP (WordPress sites with a public posts API).",
                                 "small", wrap=True), 1)
@@ -341,6 +348,7 @@ class SettingsPage(QWidget):
                     "Checks GitHub for a newer StevenBlack list once a day (only downloads when it changed). A "
                     "download that does not look like a complete list is ignored.")
         arow = QHBoxLayout()
+        arow.setContentsMargins(0, 0, 0, 0)
         self.adblock_info = label("", "small", wrap=True)
         arow.addWidget(self.adblock_info, 1)
         self.adblock_btn = button("Update now", "refresh", "ghost", on_click=self._update_adblock)
@@ -383,6 +391,7 @@ class SettingsPage(QWidget):
                     "back automatically if Steam does not start normally. OnlineFix games do not see Steam's game "
                     "ids (they trigger OnlineFix's activation message).")
         row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(button("Remove the app's games from Steam…", "trash", "ghost",
                              tooltip="Takes out every game this app added to Steam (restarts Steam if it is open)",
                              on_click=self._remove_steam_shortcuts))
@@ -398,6 +407,7 @@ class SettingsPage(QWidget):
         self.env_label = label("", "small", wrap=True)
         f.addRow("", self.env_label)
         grow = QHBoxLayout()
+        grow.setContentsMargins(0, 0, 0, 0)
         self.ge_info = label("Checking for GE-Proton updates…", "small", wrap=True)
         grow.addWidget(self.ge_info, 1)
         self.ge_btn = button("Install latest GE-Proton", "download", "ghost", on_click=self._install_ge)
@@ -411,6 +421,7 @@ class SettingsPage(QWidget):
                     "Downloads ProtonDB's open report data (ODbL) and lets the assistant try the launch options and "
                     "Proton versions players used to get each game working. Only safe launch options are used.")
         prow = QHBoxLayout()
+        prow.setContentsMargins(0, 0, 0, 0)
         self.pdb_info = label("", "small", wrap=True)
         prow.addWidget(self.pdb_info, 1)
         self.pdb_btn = button("Update now", "refresh", "ghost", on_click=self._update_pdb)
@@ -422,6 +433,7 @@ class SettingsPage(QWidget):
 
         f = self._section("Interface")
         accents = QHBoxLayout()
+        accents.setContentsMargins(0, 0, 0, 0)
         self.accent_group = QButtonGroup(self)
         for key, color in ACCENTS.items():
             b = QPushButton()
@@ -447,6 +459,10 @@ class SettingsPage(QWidget):
                     "at 4K. The desktop window is composed on the graphics card and the in-app browser draws pages "
                     "and decodes video on it. If the graphics driver has a problem with it, the app falls back to "
                     "the processor by itself.")
+        self._check(f, "mangohud_live", "MangoHud ready in every game — switch it on or off over a running game "
+                                        "(quick menu, Game settings)",
+                    "Games start with MangoHud loaded but hidden (when MangoHud is installed), so it can be shown "
+                    "at once instead of after a restart. Untick if a game has trouble with MangoHud.")
         self._check(f, "reduce_motion", "Reduce animations")
         self._check(f, "notifications_enabled", "Show desktop notifications when downloads finish or fail")
         self._check(f, "start_with_session", "Start with the computer (in the tray)",
@@ -487,6 +503,7 @@ class SettingsPage(QWidget):
         self.cache_label = label("", "small")
         f.addRow("", self.cache_label)
         row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(button("Clear cache", "trash", on_click=self._clear_cache))
         row.addWidget(button("Open log folder", "folder", on_click=lambda: open_folder(self.paths.logs)))
         row.addWidget(button("Recent errors…", "warning", on_click=self._events))
@@ -504,6 +521,7 @@ class SettingsPage(QWidget):
         self.backup_label = label("", "small", wrap=True)
         f.addRow("", self.backup_label)
         row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(button("Back up now", "check", on_click=self._backup))
         row.addWidget(button("Restore from backup…", "retry", on_click=self._restore))
         row.addWidget(button("Open data folder", "folder", on_click=lambda: open_folder(self.paths.data)))
@@ -516,6 +534,7 @@ class SettingsPage(QWidget):
                                          "Downloads are checked against the SHA-256 GitHub publishes before anything "
                                          "is installed; the previous version is kept until the new one has started.")
         rrow = QHBoxLayout()
+        rrow.setContentsMargins(0, 0, 0, 0)
         self.repo_edit = QLineEdit()
         from ezgd.core.selfupdate import DEFAULT_REPO
         self.repo_edit.setPlaceholderText(DEFAULT_REPO)
@@ -534,6 +553,7 @@ class SettingsPage(QWidget):
         self.app_update_bar.hide()
         f.addRow("", self.app_update_bar)
         urow = QHBoxLayout()
+        urow.setContentsMargins(0, 0, 0, 0)
         self.app_check_btn = button("Check now", "refresh", "ghost", on_click=self._check_app_update)
         urow.addWidget(self.app_check_btn)
         self.app_get_btn = button("Download update", "download", "primary", on_click=self._download_app_update)
@@ -818,6 +838,7 @@ class SettingsPage(QWidget):
         enabled = self.actions.settings.get("sources_enabled", {})
         for s in custom:
             row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
             c = QCheckBox(f"{s['name']} ({s['homepage'].split('://', 1)[-1]})")
             c.setChecked(bool(enabled.get(s["id"], True)))
             c.toggled.connect(self._sources_changed)

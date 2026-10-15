@@ -679,8 +679,11 @@ class DiagnoseDialog(QDialog):
             row.setStyleSheet(f"color: {color};")
 
     def _trials_done(self, results: list[dict]) -> None:
+        from shiboken6 import isValid
         self._trials_finished()
-        self._trial_head.setText(f"Results ({len(results)} setup{'s' if len(results) != 1 else ''} tested)")
+        head = getattr(self, "_trial_head", None)
+        if head is not None and isValid(head):            # (the results may have been cleared meanwhile)
+            head.setText(f"Results ({len(results)} setup{'s' if len(results) != 1 else ''} tested)")
         good = sorted([r for r in results if r["outcome"] == "ran"],          # really in the game first
                       key=lambda r: (bool(r.get("stuck")), -len(r.get("progress") or [])))
         if not results:

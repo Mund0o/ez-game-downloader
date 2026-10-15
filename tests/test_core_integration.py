@@ -222,3 +222,16 @@ async def test_browser_torrent_file_becomes_an_app_download(core, tmp_path):
     bad.write_bytes(b"<html>not a torrent</html>")
     with pytest.raises(Exception, match="not valid"):
         await core.add_browser_torrent("ankergames:atomfall", str(bad))
+
+
+async def test_a_failing_background_job_is_never_silent(core):
+    """An import whose zip could not be read failed in a background job without a word (0.1.0)."""
+    import asyncio
+
+    async def boom():
+        raise NotImplementedError("That compression method is not supported")
+    core._watch_task(asyncio.create_task(boom()), "Installing failed", "Some Game", 5)
+    await asyncio.sleep(0.05)
+    notes = [p for n, p in core.events if n == "notify"]
+    assert notes and notes[-1][0] == "Installing failed" and "compression" in notes[-1][1] and \
+        notes[-1][2] == {"library": 5}

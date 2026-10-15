@@ -2180,6 +2180,7 @@ TOGGLES = [
              ("gpu_acceleration", "GPU acceleration (recommended): couch mode next time it opens, the desktop "
                                   "after a restart"),
              ("couch_gpu", "Without GPU acceleration: frames shown through the graphics card"),
+             ("mangohud_live", "MangoHud ready in every game (switch it on from the quick menu)"),
              ("reduce_motion", "Reduce animations"),
              ("notifications_enabled", "Desktop notifications when downloads finish"),
              ("start_with_session", "Start with the computer (in the tray)"),
@@ -2614,9 +2615,10 @@ class GameSettingsPage(Page):
     """One game's start settings from the couch: Proton version, FPS limit, MangoHud, GameMode, the Steam overlay
     and launch options. The same settings as the desktop's Properties / Fixes; they apply at the next start."""
 
-    def __init__(self, w, entry):
+    def __init__(self, w, entry, back_to_game: bool = False):
         super().__init__(w)
         self.e = entry
+        self.back_to_game = back_to_game         # opened from the quick menu: B goes back into the game
         self.focus = 0
         self.items: list[Item] = []
         self.fixes: dict[str, dict] = {}         # fix key → its state (enabled, installed)
@@ -2662,6 +2664,9 @@ class GameSettingsPage(Page):
         e, items = self.e, []
         cfg = e.compat_config
         windows = "opt:wined3d" in self.fixes or "runtime" in self.fixes      # a Proton game (Fixes says so)
+        if e.id in self.w.running:
+            items.append(Item("▶  Back to the game", self._to_game, "Changes here apply from its next start",
+                              "primary"))
         items.append(Item("Starts with", kind="header"))
         if windows or e.proton_version:
             names = [""] + self.protons
@@ -2760,6 +2765,14 @@ class GameSettingsPage(Page):
         st = self.fixes.get(key)
         if st is None:
             return
+        if key == "mangohud":                                # on / off over the running game too
+            st["enabled"] = not st.get("enabled")
+            self._build()
+            b = self.w.bridge
+            b.call(b.core.library_call("set_mangohud", self.e.id, bool(st["enabled"])),
+                   lambda _r: b.call(b.core.library_call("get", self.e.id), self._saved, owner=self.w),
+                   self._failed, owner=self.w)
+            return
         st["enabled"] = not st.get("enabled")
         if st["enabled"] and st.get("group"):                # only one of a group (e.g. Godot's renderer)
             for k, other in self.fixes.items():
@@ -2840,10 +2853,19 @@ class GameSettingsPage(Page):
     def background(self) -> str | None:
         return self.w.hero_url(self.e)
 
+    def _to_game(self) -> None:
+        e = self.e
+        self.w.pop_page()
+        if e.id in self.w.running:
+            self.w.go_to_game(e)
+
     def command(self, name: str) -> str | None:
         r = self._list_command(self.items, "focus", name)
         if r == "back":
-            self.w.pop_page()
+            if self.back_to_game and self.e.id in self.w.running:
+                self._to_game()                          # opened over the game: B goes back into it
+            else:
+                self.w.pop_page()
             return None
         return r
 
@@ -2854,12 +2876,13 @@ class GameSettingsPage(Page):
                 self.items[idx].action()
 
     def hints(self) -> list[tuple[str, str]]:
+        back = ("b", "Back to the game" if self.back_to_game and self.e.id in self.w.running else "Back")
         it = self.items[self.focus] if 0 <= self.focus < len(self.items) else None
         if it is not None and it.kind == "choice":
-            return [("lr", "Change"), ("b", "Back")]
+            return [("lr", "Change"), back]
         if it is not None and it.kind == "toggle":
-            return [("a", "Switch on/off"), ("b", "Back")]
-        return [("a", "Select"), ("b", "Back")]
+            return [("a", "Switch on/off"), back]
+        return [("a", "Select"), back]
 
     def paint(self, p: QPainter) -> None:
         w = self.w

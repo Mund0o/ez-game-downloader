@@ -46,3 +46,17 @@ def test_moving_and_pressing_make_sounds(ui, qtbot):
     assert played[n:] == []
     couch.actions.settings["couch_sounds"] = True
     couch.force_close()
+
+
+def test_sounds_are_mixed_into_one_stream():
+    """One always-open stream (sounds were sometimes not heard as separate, freshly started streams)."""
+    from array import array
+    from ezgd.ui.couch_sounds import mix
+    voices = []
+    assert mix(voices, 4) == bytes(8)                                 # silence while nothing plays
+    voices = [[array("h", [1000, 1000, 1000]), 0]]
+    assert array("h", mix(voices, 2)).tolist() == [1000, 1000] and voices[0][1] == 2
+    assert array("h", mix(voices, 2)).tolist() == [1000, 0] and voices == []      # finished: dropped
+    voices = [[array("h", [30000, 5]), 0], [array("h", [30000, 5, 7]), 0]]
+    assert array("h", mix(voices, 3)).tolist() == [32767, 10, 7]      # overlapping sounds add up (clipped)
+    assert voices == []

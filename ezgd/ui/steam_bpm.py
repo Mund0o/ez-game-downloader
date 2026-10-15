@@ -40,20 +40,40 @@ def active_x_title() -> str:
     return t.group(1) if t else ""
 
 
+def steam_running() -> bool:
+    """Is Steam running? (Its pid file, ~/.steam/steam.pid — no process listing needed.)"""
+    import os
+    from pathlib import Path
+    forced = os.environ.get("EZGD_STEAM_ROOT")
+    if forced and not Path(forced).is_dir():
+        return False                                    # (the tests: never this computer's real Steam)
+    try:
+        pid = int((Path.home() / ".steam" / "steam.pid").read_text().strip())
+        return pid > 0 and Path(f"/proc/{pid}").exists() and os.name != "nt"
+    except (OSError, ValueError):
+        return False
+
+
 def big_picture_in_front() -> bool:
     title = active_x_title()
     return any(t.lower() in title.lower() for t in TITLES)
 
 
 def close_big_picture() -> bool:
-    """Ask the running Steam to leave Big Picture (it does not start Steam, and never restarts it)."""
+    """Close Big Picture (Steam's own ``steam://close/bigpicture``; Steam keeps running, it is never restarted) and
+    keep Steam in the background: leaving Big Picture makes Steam show its desktop window, which is minimized again
+    as it appears."""
+    from ezgd.ui.window_control import hide_steam_windows
     steam = shutil.which("steam")
     if not steam:
-        return False
+        return hide_steam_windows(only_active=True)
     try:
         subprocess.Popen([steam, "steam://close/bigpicture"], env=host_env(), stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, start_new_session=True)
-        log.info("couch mode: Steam's Big Picture opened over couch mode (Steam button) — closed it")
-        return True
     except OSError:
-        return False
+        return hide_steam_windows(only_active=True)
+    log.info("couch mode: Steam's Big Picture came up over couch mode (Steam button) — closed it, Steam stays back")
+    from PySide6.QtCore import QTimer
+    for ms in (600, 1400, 2800):                          # (Steam's desktop window shows up a moment later)
+        QTimer.singleShot(ms, lambda: hide_steam_windows(only_active=False))
+    return True

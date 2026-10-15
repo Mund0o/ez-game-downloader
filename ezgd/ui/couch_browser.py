@@ -120,7 +120,7 @@ class CouchBrowser:
         self._place_close()
         self._esc = QShortcut(QKeySequence(Qt.Key_Escape), self.dlg)
         self._esc.setContext(Qt.WindowShortcut)
-        self._esc.activated.connect(self.close)
+        self._esc.activated.connect(self._escape)
         self.active = True
         self.couch.pads.pointer_mode = True
         r = self.view_rect()
@@ -300,6 +300,17 @@ class CouchBrowser:
             self.close()
         self.overlay.update()
 
+    def _escape(self) -> None:
+        """Esc: closes the on-screen keyboard or the menu first, then the browser."""
+        if self.overlay.keyboard is not None:
+            self.overlay.keyboard.cancel()
+        elif self.menu is not None:
+            self.menu = None
+        else:
+            self.close()
+            return
+        self.overlay.update()
+
     def back(self) -> None:
         page = self.dlg.current
         if page.history().canGoBack() or (len(self.dlg.tabs) > 1 and page is self.dlg.tabs[-1]):
@@ -409,9 +420,12 @@ class CouchBrowser:
         y = H - bar / 2
         x = 40 * s
         if self.overlay.keyboard is not None:
-            hints = [("a", "Type"), ("b", "Delete"), ("start", "Enter")]
+            hints = ([("start", "Enter"), ("b", "Close")] if couch.pad_family == ""
+                     else [("a", "Type"), ("b", "Delete"), ("start", "Enter")])
         elif self.menu is not None:
             hints = [("a", "Select"), ("b", "Back")]
+        elif couch.pad_family == "steam" and couch.pads.steam_as_keys():
+            hints = list(couch.pads.desktop.browser)     # Steam drives the real mouse and keys in the page
         else:
             hints = [("LS", "Pointer"), ("a", "Click"), ("RS", "Scroll"), ("x", "Type"), ("b", "Back")]
             if len(self.dlg.tabs) > 1:

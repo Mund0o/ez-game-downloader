@@ -70,6 +70,7 @@ class LibraryPage(QWidget):
         self.current_id: int | None = None
         self.extraction_state: dict[int, dict] = {}
         self.running: set[int] = set()
+        self.suspended: set[int] = set()         # running games frozen from couch mode's quick menu (or here)
         self._password: str | None = None
         actions.covers.ready.connect(self._cover_ready)
 
@@ -166,6 +167,13 @@ class LibraryPage(QWidget):
     def load_environment(self) -> None:
         self.bridge.call(self.bridge.core.library_environment(), self._env_loaded, owner=self)
         self.bridge.call(self.bridge.core.library_call("running_ids"), self._running_loaded, owner=self)
+        self.bridge.call(self.bridge.core.library_call("suspended_ids"), self._suspended_loaded, owner=self)
+
+    def _suspended_loaded(self, ids: list[int]) -> None:
+        self.suspended = set(ids)
+        self._refresh_items()
+        if self.current_id in self.suspended:
+            self._render(self.current_id)
 
     def _env_loaded(self, env: dict) -> None:
         self.env = env
@@ -218,6 +226,8 @@ class LibraryPage(QWidget):
 
     def _status_text(self, e) -> str:
         state = (e.setup or {}).get("state")
+        if e.id in self.suspended:
+            return "Suspended"
         if e.id in self.running:
             return "Installing" if state == "installing" else "Running"
         if state == "pending":
@@ -364,10 +374,13 @@ class LibraryPage(QWidget):
 
     def game_state(self, payload: dict) -> None:
         gid = payload["id"]
+        if "suspended" in payload:                     # frozen / continued (couch mode's quick menu, or here)
+            (self.suspended.add if payload["suspended"] else self.suspended.discard)(gid)
         if payload["running"]:
             self.running.add(gid)
         else:
             self.running.discard(gid)
+            self.suspended.discard(gid)
             played = payload.get("played", 0)
             e = self.entries.get(gid)
             if e is not None and played >= 60:
@@ -404,13 +417,20 @@ class LibraryPage(QWidget):
         col.addWidget(label(e.title, "title", wrap=True))
         chips = FlowLayout(spacing=6)
         chips.addWidget(source_chip(e.source) if e.source else chip("Imported manually", theme.CURRENT.muted))
-        if running:
+        if e.id in self.suspended:
+            chips.addWidget(chip("❚❚ Suspended — continues where it was", theme.CURRENT.warning))
+        elif running:
             chips.addWidget(chip("● " + self._status_text(e), theme.CURRENT.success))
         else:
             chips.addWidget(chip(self._status_text(e), theme.status_color(status)))
         col.addLayout(chips)
         play_row = FlowLayout(spacing=8)          # wraps under Play when the window is narrow
         play_row.addWidget(self._primary_button(e, running))
+        if e.id in self.suspended:
+            stop = button("  Stop", "close", on_click=lambda: self._stop(e))
+            stop.setProperty("variant", "stop")
+            stop.setMinimumHeight(44)
+            play_row.addWidget(stop)
         self._fixes_btn = button("  Fixes", "wrench", tooltip="Fixes for this game: tick the ones you want to try",
                                  on_click=lambda: self._open_fixes(e))
         self._fixes_btn.setMinimumHeight(44)
@@ -772,7 +792,12 @@ class LibraryPage(QWidget):
 
     def _primary_button(self, e, running: bool):
         state = (e.setup or {}).get("state")
-        if running:
+        if e.id in self.suspended:
+            b = button("  Resume", "play", tooltip="It continues exactly where it was frozen",
+                       on_click=lambda: self._resume(e))
+            b.setProperty("variant", "play")
+            b.setIcon(icon("play", "#ffffff"))
+        elif running:
             b = button("  Stop installer" if state == "installing" else "  Stop", "close",
                        on_click=lambda: self._stop(e))
             b.setProperty("variant", "stop")
@@ -1311,8 +1336,28 @@ class LibraryPage(QWidget):
         if r == QMessageBox.Yes:
             self._call("stop", e.id, ok_text="Game stopped")
 
+    def _resume(self, e) -> None:
+        """A suspended game: let it run again and give it the screen."""
+        def done(_r) -> None:
+            from ezgd.ui.window_control import bring_game_forward
+            self.bridge.call(self.bridge.core.library_call("game_processes", e.id), bring_game_forward,
+                             lambda _err: None, owner=self)
+        self.bridge.call(self.bridge.core.library_call("resume", e.id), done,
+                         lambda err: self.actions.fail("Could not resume the game", err), owner=self)
+
+    def _suspend(self, e) -> None:
+        self.bridge.call(self.bridge.core.library_call("suspend", e.id),
+                         lambda _r: self.actions.toasts.show(f"{e.title} is suspended", "It uses no processor or "
+                                                             "graphics time and continues where it was: Resume.",
+                                                             "success"),
+                         lambda err: self.actions.fail("Could not suspend the game", err), owner=self)
+
     def _more_menu(self, e, anchor) -> None:
         m = QMenu(self)
+        if e.id in self.suspended:
+            m.addAction("Resume the game", lambda: self._resume(e))
+        elif e.id in self.running:
+            m.addAction("Suspend (freeze) the game", lambda: self._suspend(e))
         self._organize_menu(m, e)
         m.addSeparator()
         m.addAction("Fixes…", lambda: self._open_fixes(e)).setEnabled(bool(e.executable))

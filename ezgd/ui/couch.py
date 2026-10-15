@@ -396,6 +396,10 @@ class CouchToasts:
         self._timer.stop()
 
 
+def on_wayland() -> bool:
+    return QApplication.platformName().startswith("wayland")
+
+
 STARTING_WINDOW = 90.0                    # a game started this recently may still be on its way (Steam is slow)
 
 # button prompts per controller family ("" = no controller: the keyboard)
@@ -470,6 +474,11 @@ class _Couch:
         self.running: set[int] = set(running)
         self.suspended: set[int] = set()         # running games frozen from the quick menu (continue where they were)
         self.quick = None                        # the quick menu (couch_quick.QuickMenu), made when first opened
+        self.background = False                  # made only for the quick menu over a desktop-started game: never
+        self.on_promote = None                   #   shown unless asked (then on_promote, and it opens for real)
+        self._bpm_timer = QTimer(self)           # Steam controller + a game: its Steam button opens the quick menu
+        self._bpm_timer.setInterval(1500)
+        self._bpm_timer.timeout.connect(self._bpm_tick)
         self._last_game: int | None = None       # the game played most recently (what the quick menu is for)
         self.launched: set[int] = set()          # games started from couch mode (the ✕ closes these)
         self._launch_at: dict[int, float] = {}   # when each was started (monotonic)
@@ -537,7 +546,7 @@ class _Couch:
         self._bg_va.valueChanged.connect(self._bg_value)
         self._clock = QTimer(self)
         self._clock.setInterval(15_000)
-        self._clock.timeout.connect(self.update)
+        self._clock.timeout.connect(lambda: self._update_top())      # (the clock: only the top bar)
         self._clock.start()
         self._poll = QTimer(self)
         self._poll.setInterval(1000)
@@ -583,6 +592,12 @@ class _Couch:
             n = len(self._items(tab))
             self.index[tab] = max(0, min(self.index[tab], n - 1))
         self.load_art([e.steam_app_id for e in entries if e.steam_app_id])
+        by_id_all = {e.id: e for e in entries}
+        for page in self.stack:                       # an open Game settings page shows the game as it is now
+            e_old = getattr(page, "e", None)
+            if hasattr(page, "fixes") and e_old is not None and e_old.id in by_id_all:
+                page.e = by_id_all[e_old.id]
+                page._build()
         if self._installing:                          # a repack installer we stepped aside for has finished
             by_id = {e.id: e for e in self.entries}
             done = {i for i in self._installing if (by_id.get(i) is None or
@@ -838,6 +853,16 @@ class _Couch:
             return
         if payload.get("running"):
             self._last_game = gid
+            if self.quick is not None and self.quick.isVisible():
+                self.quick.target_running(gid)            # switched to from the quick menu: it is up
+            ours = gid in self.launched or gid in self._launch_at     # started here (the "started" answer can
+            if ours:                                                  # come after this — the launch flag then
+                self.launched.add(gid)                                # stayed on for the whole game)
+            self._launch_at.pop(gid, None)                # it has started: no longer "on its way" (the ✕ must not
+            #                                               note a game that ran and ended as one to close later)
+            from ezgd.ui import steam_bpm
+            if not self._bpm_timer.isActive() and steam_bpm.steam_running():
+                self._bpm_timer.start()                   # Steam may take the guide button (Steam Input)
             self.running.add(gid)
             if gid in self.launched:
                 # the splash stays (and stays on top) until the game's window takes the focus — then couch mode
@@ -850,6 +875,7 @@ class _Couch:
         else:
             self.running.discard(gid)
             self.suspended.discard(gid)
+            self._launch_at.pop(gid, None)
             if gid in self.launched:
                 self._minimize_timer.stop()
                 played = int(payload.get("played") or 0)
@@ -915,6 +941,9 @@ class _Couch:
     def _come_back(self) -> None:
         if self._exiting:
             return
+        if self.background:                             # the quick menu's "couch mode": open it for real now
+            self._promote()
+            return
         _screen, _geo, mode = self.display_target()
         if mode == "fullscreen":
             if self.isMinimized() or not self.isFullScreen():
@@ -960,8 +989,16 @@ class _Couch:
                 self.update()
 
     def _summary(self, s: dict) -> None:
+        """Polled every second: a frame only when what it shows changed (it redrew the whole 4K screen every
+        second while couch mode sat idle) — and then only the top bar, except on the Downloads tab."""
+        if s == self.summary:
+            return
+        before = self._top_status()
         self.summary = s
-        self.update()
+        if self.tab == T_DOWNLOADS and not self.stack:
+            self.update()
+        elif self._top_status() != before:
+            self._update_top()
 
     def _downloads(self, items: list[dict]) -> None:
         order = {"downloading": 0, "metadata": 0, "checking": 1, "verifying": 1, "queued": 2, "paused": 3,
@@ -983,6 +1020,9 @@ class _Couch:
         self._target_screen = screen or QApplication.primaryScreen()
         self._move_tries.clear()
         self._size_tries = 0
+        if not self.background:
+            from ezgd.ui.display_trace import DisplayTrace
+            DisplayTrace(self).start()               # the compositor's answers, in the log (display_trace)
         self.place_window(self, self.wc)
         screen = self.screen() or self._target_screen
         self.raise_()
@@ -1074,7 +1114,7 @@ class _Couch:
         (Couch mode used to set the size Qt reports for the screen as well — with fractional scaling that number
         can be wrong, so a correct full screen shrank a moment after opening.)"""
         screen, geo, mode = self.display_target()
-        wayland = QApplication.platformName().startswith("wayland")
+        wayland = on_wayland()
         kwin = wc is not None and wc.kwin
         if mode == "borderless" and wayland and not kwin:
             mode = "fullscreen"         # no way to place a window here: Wayland's full screen *is* borderless
@@ -1083,12 +1123,20 @@ class _Couch:
             if frameless:
                 win.setWindowFlag(Qt.FramelessWindowHint, False)
             if win.screen() is not screen:
-                if win.isFullScreen():
+                if wayland and win.isVisible():
+                    # shown again on that screen: its full screen request names it. (Not showNormal() then
+                    # showFullScreen(): on Wayland that leaves full screen and never asks for it again — the window
+                    # ended up 800×500, tested on KWin; Qt sends only what differs from the compositor's last answer)
+                    win.hide()
+                elif win.isFullScreen():
                     win.showNormal()
                 win.setScreen(screen)
-                if not wayland:
-                    win.move(geo.topLeft())          # X11 / Windows: the monitor it goes full screen on
+            if not wayland and not win.isFullScreen():
+                win.setGeometry(screen.geometry())   # X11 / Windows: on that monitor, its size, then full screen
             win.showFullScreen()
+            if kwin and self.actions.settings.get("couch_screen"):
+                # a chosen screen: KWin puts it there and makes it fill it (Wayland apps cannot pick a screen)
+                QTimer.singleShot(150, win, lambda: wc.force_fullscreen(screen.name()))
         else:
             if win.isFullScreen():
                 win.showNormal()
@@ -1104,9 +1152,13 @@ class _Couch:
                 else:
                     wc.fill_screen(screen.name())
         log.info("couch mode display: %s (%dx%d, scale %.2f, window scale %.2f, %.0f Hz) on %s, %d screen(s); %s "
-                 "%dx%d", screen.name(), screen.geometry().width(), screen.geometry().height(),
-                 screen.devicePixelRatio(), self.real_scale(screen), screen.refreshRate(),
-                 QApplication.platformName(), len(QApplication.screens()), mode, geo.width(), geo.height())
+                 "%dx%d; desktop %s/%s, KWin control %s; screens: %s", screen.name(), screen.geometry().width(),
+                 screen.geometry().height(), screen.devicePixelRatio(), self.real_scale(screen), screen.refreshRate(),
+                 QApplication.platformName(), len(QApplication.screens()), mode, geo.width(), geo.height(),
+                 os.environ.get("XDG_CURRENT_DESKTOP", "?"), os.environ.get("XDG_SESSION_TYPE", "?"),
+                 "yes" if kwin else "no", ", ".join(f"{sc.name()} {sc.geometry().width()}x{sc.geometry().height()}"
+                                                    f"+{sc.geometry().x()}+{sc.geometry().y()}"
+                                                    for sc in QApplication.screens()))
 
     def _fit_screen(self) -> None:
         """Check couch mode is shown the way the display settings ask: full screen (the window manager decides the
@@ -1128,7 +1180,11 @@ class _Couch:
         if mode == "fullscreen":
             g = on.geometry() if on is not None else None
             short = g is not None and (self.width() < g.width() * 0.92 or self.height() < g.height() * 0.92)
-            if moved or not self.isFullScreen():
+            if moved and self.wc.kwin:
+                log.info("couch mode: on %s, not the chosen %s — KWin moves it", on.name(), target.name())
+                self.wc.force_fullscreen(target.name())
+                QTimer.singleShot(500, self, self._fit_screen)
+            elif moved or not self.isFullScreen():
                 log.info("couch mode: %s; asking for full screen again", "on the wrong screen" if moved else
                          "not full screen")
                 self.place_window(self, self.wc)
@@ -1139,12 +1195,18 @@ class _Couch:
                 log.warning("couch mode: full screen but only %dx%d of %dx%d — making it fill the screen",
                             self.width(), self.height(), g.width(), g.height())
                 if self.wc.kwin:
-                    self.wc.force_fullscreen(on.name())
-                else:
-                    self.showNormal()
+                    self.wc.force_fullscreen(on.name())     # KWin sizes it itself
+                    QTimer.singleShot(500, self, self._fit_screen)
+                elif not on_wayland():
+                    self.showNormal()                   # X11: the window can set its own size
                     self.setGeometry(g)
                     self.showFullScreen()
-                QTimer.singleShot(500, self, self._fit_screen)
+                    QTimer.singleShot(500, self, self._fit_screen)
+                else:
+                    # Wayland: a full-screen window's size is the compositor's answer (the log's display trace has
+                    # it). Leaving full screen to ask again ended in an 800×500 window (tested on KWin) — the bug
+                    # behind couch mode coming up small on a friend's PC — so nothing is changed here.
+                    self._size_tries = 2
         elif self.isFullScreen() or moved:
             self.place_window(self, self.wc)
         self._dirty = True
@@ -1326,9 +1388,71 @@ class _Couch:
         if self.browser is not None and self.browser.active:
             self.browser.button(name, pressed)
 
+    def guide_pressed(self) -> None:
+        """The PS / Xbox / Steam button: when Steam handles the controller (Steam Input) it answers the button too
+        and brings its own window up over couch mode or the game. Put it away again, right after — and give the
+        screen back to what had it when the button was pressed (never couch mode over a game)."""
+        from ezgd.ui import steam_bpm
+        if not steam_bpm.steam_running():
+            return
+        if self.quick is not None and self.quick.isVisible():
+            self._front = "quick"
+        elif self.isActiveWindow():
+            self._front = "couch"
+        elif [i for i in self.running if i not in self.suspended]:
+            self._front = "game"
+        else:
+            self._front = "couch"
+        from ezgd.ui.window_control import guard_steam
+        if guard_steam(3000):                           # instant: KWin puts Steam's window away as it appears
+            return
+        for ms in (200, 600, 1300):                     # (no KWin: look a few times instead)
+            QTimer.singleShot(ms, self, self._put_steam_away)
+
+    def _put_steam_away(self) -> None:
+        from ezgd.ui import steam_bpm
+        from ezgd.ui.window_control import hide_steam_windows
+        if self._exiting:
+            return
+        if steam_bpm.big_picture_in_front():
+            self._close_big_picture()                   # closed, Steam stays in the back
+        elif hide_steam_windows(only_active=True):
+            self._regain_screen()
+
+    def _close_big_picture(self) -> bool:
+        from ezgd.ui import steam_bpm
+        if not steam_bpm.close_big_picture():
+            return False
+        for ms in (1800, 3300):                         # after Steam has put its desktop window up (and it went)
+            QTimer.singleShot(ms, self, self._regain_screen)
+        return True
+
+    def _regain_screen(self) -> None:
+        """The screen goes back to what should have it: the quick menu (when open), else what had it when the guide
+        button was pressed — the game being played, or couch mode."""
+        if self._exiting:
+            return
+        playing = [i for i in self.running if i not in self.suspended]
+        front = getattr(self, "_front", "game" if playing else "couch")
+        if self.quick is not None and self.quick.isVisible():
+            self.quick.wc.activate()                    # the quick menu keeps the screen
+        elif front == "couch" or not playing:
+            if self.isVisible() and not self.isMinimized() and not self.background:
+                self.wc.activate()
+        elif self._last_game in self.running:
+            game = next((x for x in self.entries if x.id == self._last_game), None)
+            if game is not None and self._last_game not in self.suspended:
+                self.bridge.call(self.bridge.core.library_call("game_processes", game.id),
+                                 lambda pids: bring_game_forward(pids), lambda _err: None, owner=self)
+
     def _pad(self, name: str) -> None:
+        if name == "home":
+            self.guide_pressed()
         if self.quick is not None and self.quick.isVisible():
             self.quick.command(name)                      # the quick menu is over the game
+            return
+        if name == "home" and self._game_in_front():
+            self._home_held()                             # a tap of the guide button over a game: the quick menu
             return
         if self.browser is not None and self.browser.active:
             try:
@@ -1378,14 +1502,58 @@ class _Couch:
                     not (self.quick is not None and self.quick.isVisible()):
                 QTimer.singleShot(400, self, self._check_big_picture)
 
+    def _promote(self) -> None:
+        """Couch mode made in the background for the quick menu becomes the real, full-screen couch mode."""
+        self.background = False
+        self._opened = True                            # (no intro: it is a step in the middle of playing)
+        cb, self.on_promote = self.on_promote, None
+        if cb is not None:
+            cb()
+        self.open(self._target_screen or QApplication.primaryScreen())
+
+    def _dismiss_background(self) -> None:
+        """Back to the game from the quick menu of a desktop-started game: the hidden couch mode goes again (not
+        while it holds a suspended game — closing would let that one run again)."""
+        if self.background and not self._exiting and not self.suspended and \
+                not (self.quick is not None and self.quick.isVisible()):
+            self.force_close()
+
+    def bring_forward_soon(self, e) -> None:
+        """A game switched to from the quick menu: the screen is its as soon as its window is there (a big game
+        takes a while to show one)."""
+        self._last_game = e.id
+
+        def once() -> None:
+            if self.quick is not None and self.quick.isVisible():
+                return
+            self.bridge.call(self.bridge.core.library_call("game_processes", e.id),
+                             lambda pids: bring_game_forward(pids), lambda _err: None, owner=self)
+        for ms in (0, 3000, 10_000):
+            QTimer.singleShot(ms, self, once)
+        if self.background:
+            QTimer.singleShot(400, self, self._dismiss_background)
+
+    def _bpm_tick(self) -> None:
+        """While a game of ours runs: Steam owns a Steam controller, so its Steam button opens Steam's Big Picture —
+        close it and show the quick menu instead (what the guide button does on other controllers)."""
+        from ezgd.ui import steam_bpm
+        playing = [i for i in self.running if i not in self.suspended]
+        if self._exiting or not playing or not steam_bpm.steam_running():
+            self._bpm_timer.stop()
+            return
+        if self.quick is not None and self.quick.isVisible():
+            return
+        if steam_bpm.big_picture_in_front() and self._close_big_picture():
+            QTimer.singleShot(600, self, self._home_held)
+
     def _check_big_picture(self) -> None:
         """The Steam button opened Steam's Big Picture over couch mode: close it and come back (see steam_bpm)."""
         if self._exiting or self.isActiveWindow() or self._launching or self._playing_here() or self._away:
             return
         from ezgd.ui import steam_bpm
-        if not steam_bpm.big_picture_in_front():
+        if not steam_bpm.steam_running() or not steam_bpm.big_picture_in_front():
             return
-        if steam_bpm.close_big_picture():
+        if self._close_big_picture():
             self._switch_tab(T_HOME, force=True)        # the Steam button means "Home" in couch mode
             self._idle_away.stop()
             QTimer.singleShot(700, self, self._come_back)
@@ -1405,6 +1573,10 @@ class _Couch:
 
     def resizeEvent(self, e) -> None:                         # noqa: N802
         super().resizeEvent(e)
+        self._drop_caches()
+
+    def _drop_caches(self) -> None:
+        """Everything drawn ahead (tiles, layers, text) goes: the size, the scale or the colours changed."""
         self.images.clear()
         self._tag_cache.clear()
         self._layers.clear()
@@ -1419,10 +1591,16 @@ class _Couch:
         if not e.isAutoRepeat() and k not in (Qt.Key_Alt, Qt.Key_Meta, Qt.Key_Super_L, Qt.Key_Super_R) \
                 and self._skip_intro():
             return
+        steam = self.key_action(k)                            # a Steam controller's button, sent by Steam as a key
         if self.keyboard is not None:                         # typing into the on-screen keyboard
             nav = {Qt.Key_Up: "up", Qt.Key_Down: "down", Qt.Key_Left: "left", Qt.Key_Right: "right"}.get(k)
             try:
-                if nav:
+                if steam is not None and not nav:
+                    if steam in ("a", "b", "x", "start"):    # A types the key, B / Y delete, Start is Done
+                        if steam == "a":
+                            self.sounds.play("select")
+                        self.keyboard.command("b" if steam == "x" else steam)
+                elif nav:
                     before = self._focus_key()
                     self.keyboard.command(nav)
                     self._sound(nav, before)
@@ -1454,6 +1632,10 @@ class _Couch:
                 Qt.Key_Backspace: "b", Qt.Key_Menu: "x", Qt.Key_PageUp: "lt",
                 Qt.Key_PageDown: "rt", Qt.Key_Tab: "rb", Qt.Key_Backtab: "lb", Qt.Key_Home: "home",
                 Qt.Key_Slash: "select"}.get(k)
+        if steam is not None:
+            self.pad_family = "steam"             # Steam turns its controller into keys outside games
+            self.command(steam)
+            return
         if name is not None and k not in (Qt.Key_Escape, Qt.Key_Backspace, Qt.Key_Return, Qt.Key_Enter) and \
                 self.pad_family and not self.pads.steam_hw:
             self.pad_family = ""                  # typing on the keyboard: show keyboard keys
@@ -1487,6 +1669,13 @@ class _Couch:
         self.update()
 
     MOVES = ("up", "down", "left", "right", "lb", "rb", "lt", "rt", "start", "home")
+
+    def key_action(self, key) -> str | None:
+        """While Steam drives a Steam controller as keyboard + mouse (its Desktop Configuration), the keys mean that
+        controller's buttons — e.g. B, Y and the bumpers send Space, Page Down, Ctrl and Alt on the original Steam
+        Controller: read as B / Y (Manage) / tabs, not as a keyboard would. Which key is which button comes from
+        Steam's own configuration (steam_input). None for any other key (and without a Steam controller)."""
+        return self.pads.steam_key(int(key))
 
     def _keys_from_a_pad(self) -> bool:
         """Do the keys reaching the on-screen keyboard come from a controller? (A Steam controller is connected, or
@@ -1654,6 +1843,43 @@ class _Couch:
         self.refresh_bg()
         self._kick_focus()
 
+    def focus_entry(self, entry_id: int | None) -> None:
+        """Put the selection on this game (Home's shelf and the Library grid) — e.g. the one chosen on the desktop."""
+        if entry_id is None:
+            return
+        for tab in (T_HOME, T_LIBRARY):
+            pos = next((k for k, x in enumerate(self._items(tab)) if x.id == entry_id), None)
+            if pos is not None:
+                self.index[tab] = pos
+        self.refresh_bg()
+        self.update()
+
+    def selected_entry_id(self) -> int | None:
+        """The game couch mode was on (for the desktop's Library when it closes)."""
+        e = self._focused_entry()
+        if e is None and self.stack:
+            e = getattr(self.stack[-1], "e", None)
+        return getattr(e, "id", None) or self._last_game
+
+    def settings_changed(self, key: str) -> None:
+        """A setting changed (here, or on the desktop while couch mode is open): what couch mode keeps of it follows."""
+        st = self.actions.settings
+        if key == "reduce_motion":
+            self.reduce_motion = bool(st.get("reduce_motion"))
+            self.toasts.reduce_motion = self.reduce_motion
+        elif key in ("couch_ui_scale", "theme_accent", "theme_contrast"):
+            self._drop_caches()
+        elif key == "couch_steady_frames":
+            self._set_pace(self.screen())
+        elif key in ("couch_screen", "couch_window", "couch_resolution") and self.isVisible() and \
+                not self.isActiveWindow():
+            self.apply_display(None)                  # (changed on the desktop; couch mode's own change asks)
+        page = self.pages.get(T_SETTINGS)
+        if page is not None and self.tab == T_SETTINGS and not self.stack:
+            page._build()
+        self._dirty = True
+        self.update()
+
     def _move(self, i: int) -> None:
         if i == self.index[self.tab]:
             return
@@ -1685,10 +1911,11 @@ class _Couch:
         self.refresh_bg()
         self.update()
 
-    def open_game_settings(self, e) -> None:
-        """A game's start settings (Manage → Game settings, or the quick menu while it runs)."""
+    def open_game_settings(self, e, back_to_game: bool = False) -> None:
+        """A game's start settings (Manage → Game settings, or the quick menu while it runs — then B goes back
+        into the game)."""
         from ezgd.ui.couch_pages import GameSettingsPage
-        page = GameSettingsPage(self, e)
+        page = GameSettingsPage(self, e, back_to_game)
         self.stack.append(page)
         self.zone = "main"
         page.activate()
@@ -1747,7 +1974,7 @@ class _Couch:
     def mousePressEvent(self, e) -> None:                     # noqa: N802
         if self._skip_intro():
             return
-        if e.button() == Qt.BackButton:
+        if e.button() in (Qt.BackButton, Qt.RightButton):     # (a Steam controller's left trigger is a right click)
             self.command("b")
             return
         if e.button() != Qt.LeftButton:
@@ -2027,7 +2254,7 @@ class _Couch:
                                                        ("Manage", self._details, "ghost")])
 
     def _starting_text(self) -> str:
-        guide = PAD_LABELS.get(self.pad_family or "generic", PAD_LABELS["generic"])["home"]
+        guide = self._pad_labels(self.pad_family or "generic")["home"]
         hold = f" Hold {guide} on the controller for the quick menu." if self.pads.names() else ""
         return "The game opens in a moment." + hold
 
@@ -2080,8 +2307,8 @@ class _Couch:
         self.update()
 
     def _launch_over(self) -> None:
-        """Nothing has shown up for a while: stop holding the focus (the user may need Steam's window)."""
-        if self._launching and not self._playing_here():
+        """Nothing has shown up for a while (or the game runs): stop holding the focus."""
+        if self._launching:
             self._launching = False
             self._refocus.stop()
 
@@ -2121,6 +2348,8 @@ class _Couch:
             lines.append(("Version", v))
         rows: list[tuple] = []
         if e.id in self.running:
+            rows.append(("▶  Resume the game" if e.id in self.suspended else "▶  Back to the game",
+                         lambda e=e: (self._close_overlay(), self.go_to_game(e)), "play", ""))
             rows.append(("■  Stop the game", lambda e=e: self.ask_stop(e), "danger", ""))
         elif self.ready(e):
             rows.append(("▶  Play", lambda e=e: (self._close_overlay(), self.play(e)), "play", ""))
@@ -2787,6 +3016,10 @@ class _Couch:
         if not self._exiting:
             self.update()
 
+    def _game_in_front(self) -> bool:
+        """One of our games is being played and has the screen (couch mode is not the active window)."""
+        return bool([i for i in self.running if i not in self.suspended]) and not self.isActiveWindow()
+
     def _home_held(self) -> None:
         """The PS / Xbox / Steam button held: the quick menu over the game (back to it, switch games with the
         current one suspended, couch mode, volume, settings, quit). Only for games this app runs — directly or
@@ -2794,13 +3027,12 @@ class _Couch:
         if self._exiting or (self.overlay is not None and self.overlay.tag in ("closing", "quit-game")):
             return
         if self.quick is not None and self.quick.isVisible():
-            self.quick.command("b")                   # held again: back to the game
+            if time.monotonic() - self.quick.opened_at > 1.2:   # (not the hold of the tap that just opened it)
+                self.quick.command("b")               # held again: back to the game
             return
         playing = [i for i in self.running if i not in self.suspended]
         if not playing and not self.suspended:
             return                                    # no game of ours: couch mode is never steered otherwise
-        if not playing and self.isActiveWindow():
-            return                                    # in couch mode with only suspended games: they are right here
         current = self._last_game if self._last_game in playing else (playing[-1] if playing else None)
         game = next((e for e in self.entries if e.id == current), None)
         self.keyboard = None
@@ -2826,7 +3058,9 @@ class _Couch:
 
         def front(_r=None) -> None:
             self.suspended.discard(e.id)
-            if not self._exiting:
+            if self.background:
+                QTimer.singleShot(400, self, self._dismiss_background)
+            elif not self._exiting:
                 self.overlay = None
                 self._minimize_timer.stop()
                 self.wc.keep_above(False)
@@ -2939,7 +3173,7 @@ class _Couch:
             browser.overlay.hide()
             browser.dlg.close()                          # (a download keeps going: the window only hides)
         for t in (self._tick, self._clock, self._poll, self._minimize_timer, self._pump, self._idle_away,
-                  self._refocus):
+                  self._bpm_timer, self._refocus):
             t.stop()
         self.wc.forget()
         self.toasts.stop()
@@ -3153,6 +3387,9 @@ class _Couch:
             p.drawImage(QPointF(0, 0), cur)
             p.setOpacity(1.0)
 
+    def _update_top(self) -> None:
+        self.update_area(QRectF(0, 0, self.width(), 100 * self._s()))
+
     def _top_status(self) -> str:
         browsing = [d for d in self.browser_downloads if d.get("state") == "downloading"]
         if not (int(self.summary.get("active") or 0) + int(self.summary.get("extracting") or 0) + len(browsing)):
@@ -3283,13 +3520,30 @@ class _Couch:
             p.drawText(QRectF(r.left() - 160 * s, r.bottom() + 4 * s, r.width() + 160 * s, 24 * s),
                        Qt.AlignRight | Qt.AlignVCenter, "Leave couch mode")
 
+    def usable_hints(self, hints: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        """The prompts the controller in use can follow (a Steam controller sent as keys: only buttons with a key —
+        a trigger that is a mouse click in Steam's layout gets no prompt)."""
+        if self.pad_family != "steam":
+            return hints
+        ok = [self.pads.reachable(a) for a, _t in hints]
+        return [h for i, h in enumerate(hints) if ok[i] and not          # (and ("lt", "") of a pair that went)
+                (h[1] == "" and i + 1 < len(hints) and not ok[i + 1])]
+
+    def _pad_labels(self, fam: str | None = None) -> dict[str, str]:
+        """The button names of the controller in use (a Steam controller's from Steam's configuration)."""
+        fam = self.pad_family if fam is None else fam
+        labels = PAD_LABELS.get(fam, PAD_LABELS["generic"])
+        if fam == "steam":
+            labels = {**labels, **self.pads.steam_labels()}
+        return labels
+
     def _glyph(self, p: QPainter, x: float, y: float, action: str, text: str = "") -> float:
         """A button prompt for the controller in use (PlayStation symbols, Xbox/Steam letters, keyboard keys) and its
         meaning. Returns the x after it."""
         s = self._s()
         d = 32 * s
         fam = self.pad_family
-        labels = PAD_LABELS.get(fam, PAD_LABELS["generic"])
+        labels = self._pad_labels()
         label = labels.get(action, action)
         face = action in ("a", "b", "x") and fam != ""
         if face:
@@ -3369,6 +3623,8 @@ class _Couch:
     def _bottom_hints(self) -> list[tuple[str, str]]:
         """The button prompts along the bottom: (action, meaning)."""
         if self.keyboard is not None:
+            if not self.pad_family:                     # a real keyboard: letters type; Enter / Esc
+                return [("start", self.keyboard.done_label), ("b", "Close")]
             return [("a", "Type"), ("b", "Delete"), ("start", self.keyboard.done_label)]
         if self.overlay is not None:
             return [] if self.overlay.busy else [("a", "Select"), ("b", "Back")]
@@ -3394,12 +3650,13 @@ class _Couch:
     def _paint_bottom(self, p: QPainter) -> None:
         s, W, H = self._s(), self.width(), self.height()
         h = 76 * s
-        hints = self._bottom_hints()
+        hints = self.usable_hints(self._bottom_hints())
         fam = self.pad_family
         names = self.pads.names()
         txt = (FAMILY_NAMES.get(fam, "Controller") + (f"  ·  {len(names)} connected" if len(names) > 1 else "")) \
-            if names else "Keyboard: arrows · Enter · Esc · Tab"
-        key = ("bottom", W, round(s, 3), tuple(hints), fam, txt)
+            if names else "Steam controller (through Steam)" if fam == "steam" and self.pads.steam_as_keys() \
+            else "Keyboard: arrows · Enter · Esc · Tab"
+        key = ("bottom", W, round(s, 3), tuple(hints), fam, txt, tuple(self._pad_labels().items()))
         self.blit(p, 0, H - h, key, W, h, lambda q: self._draw_bottom(q, hints, txt))
 
     def _draw_bottom(self, p: QPainter, hints: list[tuple[str, str]], txt: str) -> None:

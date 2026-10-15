@@ -137,6 +137,8 @@ QLineEdit#search {{ font-size: 11pt; padding: 10px 14px 10px 36px; border-radius
 QComboBox::drop-down {{ border: none; width: 22px; }}
 QComboBox QAbstractItemView {{ background: {p.bg2}; border: 1px solid {p.border}; selection-background-color: {p.accent}; }}
 QSpinBox::up-button, QSpinBox::down-button {{ width: 16px; border: none; }}
+QSpinBox {{ padding-top: 5px; padding-bottom: 5px; }}
+QAbstractSpinBox QLineEdit {{ background: transparent; border: none; padding: 0; margin: 0; }}
 QCheckBox {{ spacing: 8px; background: transparent; }}
 QCheckBox::indicator {{ width: 18px; height: 18px; border-radius: 5px; border: 1px solid {p.border}; background: {p.bg2}; }}
 QCheckBox::indicator:checked {{ background: {p.accent}; border-color: {p.accent}; }}
