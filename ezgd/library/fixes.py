@@ -227,6 +227,9 @@ def effects(ctx: GameContext) -> FixEffects:
     if "pulse_latency" in on:
         env["PULSE_LATENCY_MSEC"] = "60"
         notes.append("audio buffer")
+    if cfg.fps_limit > 0:                          # DirectX through DXVK (9–11) and VKD3D-Proton (12)
+        env["DXVK_FRAME_RATE"] = env["VKD3D_FRAME_RATE"] = str(cfg.fps_limit)
+        notes.append(f"{cfg.fps_limit} FPS limit")
     for key, tool in (("gamemode", "gamemoderun"), ("mangohud", "mangohud")):
         if key in on:
             path = shutil.which(tool)

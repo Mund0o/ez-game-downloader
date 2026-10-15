@@ -215,6 +215,10 @@ class AppCore:
         # a running install stops now (else the app would only exit once it is done — hours for a big game); it
         # stays marked as running, so the next start finishes it
         self.post.stop_all()
+        try:
+            self.library.resume_all()    # a game frozen from the quick menu must not stay frozen after the app
+        except Exception:
+            log.exception("could not resume suspended games")
         from ezgd.sources import parsing
         parsing.shutdown()
         if getattr(self, "_verify_task", None):
@@ -642,7 +646,9 @@ class AppCore:
                    "reset_prefix", "installer_info", "verify_repack", "run_installer", "delete_repack",
                    "steam_overlay_status", "prepare_steam_shortcuts", "launch_via_steam",
                    "remove_steam_shortcuts", "last_run_status", "start_steam", "stop_completely",
-                   "backup_saves", "save_backups", "restore_save_backup", "delete_save_backup"}
+                   "backup_saves", "save_backups", "restore_save_backup", "delete_save_backup",
+                   "suspend", "resume", "resume_all", "suspended_ids", "game_volume", "set_game_volume", "protons",
+                   "session_seconds", "game_processes", "auto_executable"}
         if method not in allowed:
             raise ValueError(f"unknown library call {method}")
         fn = getattr(self.library, method)
@@ -918,6 +924,11 @@ class AppCore:
         if self.library.is_running(e.id):
             raise SourceError("Stop the game before uninstalling it.")
         items = {i["key"]: i for i in await asyncio.to_thread(self._uninstall_items, entry_id)}
+        from ezgd.library import saves as _saves
+        if backup_saves and "prefix" in keys and "prefix" in items and \
+                not _saves.users_dir(self.library.prefix_dir(entry_id)).is_dir():
+            log.info("uninstall of %s: no saves to back up (never started) — uninstalling", e.title)
+            backup_saves = False                       # nothing to keep: never a reason not to uninstall
         if "prefix" in keys and "prefix" in items and backup_saves:
             # the prefix holds the saves: zip them first (kept after the uninstall, found again on a reinstall)
             try:

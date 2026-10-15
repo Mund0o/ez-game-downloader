@@ -142,3 +142,17 @@ async def test_leftover_folders(core, tmp_path):
     r = await core.delete_leftovers([str(old), str(games)])             # the second one is in use: refused
     assert r["deleted"] == [str(old)] and not old.exists() and games.exists()
     assert r["failed"][0]["path"] == str(games)
+
+
+async def test_a_never_started_game_uninstalls_with_save_backup_ticked(core, tmp_path):
+    """No saves to back up (the game was never started — its prefix has no users folder): the uninstall goes ahead
+    whether "back up my saves" is ticked or not (it used to refuse: "your saves could not be backed up")."""
+    games = tmp_path / "games" / "Never Played"
+    games.mkdir(parents=True)
+    (games / "game.exe").write_bytes(b"MZ" + b"\0" * 100)
+    e = core.library.import_folder("Never Played", games, None)
+    core.library.prefix_dir(e.id).mkdir(parents=True)                  # made, but the game never ran
+    plan = {i["key"] for i in (await core.uninstall_plan(e.id))["items"]}
+    assert "prefix" in plan                                           # (what used to need the backup)
+    r = await core.uninstall_game(e.id, sorted(plan), backup_saves=True)
+    assert not games.exists() and core.library.repo.get(e.id) is None and not r["kept"]

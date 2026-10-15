@@ -541,6 +541,7 @@ def test_couch_browser_is_driven_by_the_controller(ui, qtbot, server):
     from PySide6.QtCore import QPointF
     cb.pointer = QPointF(r.center().x(), r.top() + r.height() * 0.2)    # over the button
     cb.button("a", True)
+    assert couch.sounds.played[-1] == "click"                   # the pointer's mouse button is heard
     cb.button("a", False)
     qtbot.waitUntil(lambda: dlg.current.title() == "clicked", timeout=10000)
     cb.pointer = QPointF(r.center().x(), r.top() + r.height() * 0.75)   # the text box: the keyboard opens
@@ -551,13 +552,16 @@ def test_couch_browser_is_driven_by_the_controller(ui, qtbot, server):
         cb.overlay.keyboard.type(ch)
     cb.overlay.grab()
     cb.command("start")                                        # Start on the keyboard = Enter: it types
-    assert cb.overlay.keyboard is None
+    assert cb.overlay.keyboard is None and couch.sounds.played[-1] == "select"
     got = []
     dlg.current.runJavaScript("document.getElementById('t').value", 0, got.append)
     qtbot.waitUntil(lambda: bool(got), timeout=5000)
     assert got[0] == "hades"
     cb.command("start")                                        # the menu
     assert cb.menu is not None and cb.menu[-1][0] == "Close the browser"
+    n = len(couch.sounds.played)
+    cb.command("down")
+    assert couch.sounds.played[n:] == ["move"]
     cb.overlay.grab()
     cb.command("b")                                            # B closes the menu
     assert cb.menu is None

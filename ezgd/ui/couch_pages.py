@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen, QTextLayout
 
 from ezgd.core.fsutil import format_bytes, free_space, safe_dirname
@@ -127,7 +127,7 @@ class Page:
         setattr(self, scroll_attr + "_t", target)
         off = self._smooth(scroll_attr, target)
         p.save()
-        p.setClipRect(rect.adjusted(-30 * s, -14 * s, 30 * s, 14 * s))
+        p.setClipRect(rect.adjusted(-30 * s, -14 * s, 30 * s, 14 * s), Qt.IntersectClip)
         for k, it in enumerate(items):
             y = rect.top() + tops[k] - off
             h = heights[k]
@@ -265,6 +265,9 @@ class Page:
 # =================================================================== keyboard
 KEY_ROWS = ["1234567890", "qwertyuiop", "asdfghjkl'", "zxcvbnm-.:"]
 SPECIAL = [("SPACE", 4), ("⌫", 2), ("CLEAR", 2), ("DONE", 2)]
+# for launch options (MANGOHUD=1 %command% -dx11): a row of symbols and a shift key for capitals
+SYMBOL_ROW = "=%_/+,\"!?~"
+SYMBOL_SPECIAL = [("⇧", 2), ("SPACE", 3), ("⌫", 1), ("CLEAR", 2), ("DONE", 2)]
 
 
 class Keyboard:
@@ -272,20 +275,25 @@ class Keyboard:
     types into it too."""
 
     def __init__(self, w, title: str, on_done: Callable[[str], None], text: str = "", done_label: str = "Search",
-                 on_cancel: Callable[[], None] | None = None):
+                 on_cancel: Callable[[], None] | None = None, symbols: bool = False, limit: int = 80):
         self.w = w
         self.title = title
         self.text = text
         self.on_done = on_done
         self.on_cancel = on_cancel
         self.done_label = done_label
+        self.rows = KEY_ROWS + [SYMBOL_ROW] if symbols else KEY_ROWS
+        self.special = SYMBOL_SPECIAL if symbols else SPECIAL
+        self.shift = False                   # capitals (symbols keyboards only)
+        self.typed = False                   # a real keyboard typed into it (then Enter / Esc mean done / close)
+        self.limit = limit
         self.row, self.col = 1, 0
 
     def _row_len(self, r: int) -> int:
-        return len(SPECIAL) if r == len(KEY_ROWS) else len(KEY_ROWS[r])
+        return len(self.special) if r == len(self.rows) else len(self.rows[r])
 
     def command(self, name: str) -> None:
-        n = len(KEY_ROWS) + 1
+        n = len(self.rows) + 1
         if name == "up":
             self.row = max(0, self.row - 1)
             self.col = self._map_col(self.row + 1, self.row)
@@ -311,23 +319,26 @@ class Keyboard:
         """Keep the column roughly where it was when moving between the letter rows and the wide bottom row."""
         if frm == to:
             return self.col
-        if to == len(KEY_ROWS):                          # into the bottom row
+        if to == len(self.rows):                         # into the bottom row
             unit = 0
-            for k, (_lbl, wdt) in enumerate(SPECIAL):
+            for k, (_lbl, wdt) in enumerate(self.special):
                 unit += wdt
                 if self.col < unit:
                     return k
-            return len(SPECIAL) - 1
-        if frm == len(KEY_ROWS):
-            return min(len(KEY_ROWS[to]) - 1, sum(wdt for _l, wdt in SPECIAL[:self.col]))
-        return min(self.col, len(KEY_ROWS[to]) - 1)
+            return len(self.special) - 1
+        if frm == len(self.rows):
+            return min(len(self.rows[to]) - 1, sum(wdt for _l, wdt in self.special[:self.col]))
+        return min(self.col, len(self.rows[to]) - 1)
 
     def press(self, r: int, c: int) -> None:
-        if r < len(KEY_ROWS):
-            self.type(KEY_ROWS[r][c])
+        if r < len(self.rows):
+            ch = self.rows[r][c]
+            self.type(ch.upper() if self.shift else ch)
             return
-        key = SPECIAL[c][0]
-        if key == "SPACE":
+        key = self.special[c][0]
+        if key == "⇧":
+            self.shift = not self.shift
+        elif key == "SPACE":
             self.type(" ")
         elif key == "⌫":
             self.text = self.text[:-1]
@@ -337,7 +348,7 @@ class Keyboard:
             self.done()
 
     def type(self, ch: str) -> None:
-        if len(self.text) < 80:
+        if len(self.text) < self.limit:
             self.text += ch
 
     def done(self) -> None:
@@ -351,14 +362,17 @@ class Keyboard:
 
     def paint(self, p: QPainter) -> None:
         w = self.w
-        s, W, H = w._s(), w.width(), w.height()
+        W, H = w.width(), w.height()
+        nrows = len(self.rows) + 1
+        ws = w._s()
+        s = min(ws, (H - 202 * ws) / (250 + nrows * 96))   # the whole keyboard fits between the bars at any size
         p.fillRect(w.rect(), QColor(0, 0, 0, 165))
         unit = min(96 * s, (W - 160 * s) / 10.6)
         gap = unit * 0.12
         kw = unit - gap
         pw = 10 * unit + 80 * s
-        ph = 5 * unit + 250 * s
-        panel = QRectF((W - pw) / 2, max(110 * s, H - 76 * s - ph - 30 * s), pw, ph)
+        ph = nrows * unit + 250 * s
+        panel = QRectF((W - pw) / 2, max(100 * ws, H - 76 * ws - ph - 20 * s), pw, ph)
         path = QPainterPath()
         path.addRoundedRect(panel, 26 * s, 26 * s)
         p.fillPath(path, QColor(theme.CURRENT.bg2))
@@ -388,27 +402,32 @@ class Keyboard:
         w._schedule_frame(250)
         y += 64 * s + 26 * s
         p.setFont(w._font(kw * 0.36, 700))
-        for r, keys in enumerate(KEY_ROWS):
+        symbols = self.rows is not KEY_ROWS
+        for r, keys in enumerate(self.rows):
             for c, ch in enumerate(keys):
                 kr = QRectF(x0 + c * unit, y + r * unit, kw, kw)
-                self._key(p, kr, ch.upper(), r == self.row and c == self.col, r * 100 + c)
-        r = len(KEY_ROWS)
+                label = ch.upper() if (self.shift or not symbols) else ch
+                self._key(p, kr, label, r == self.row and c == self.col, r * 100 + c)
+        r = len(self.rows)
         x = x0
-        for c, (lbl, wdt) in enumerate(SPECIAL):
+        for c, (lbl, wdt) in enumerate(self.special):
             kr = QRectF(x, y + r * unit, wdt * unit - gap, kw)
             text = self.done_label.upper() if lbl == "DONE" else lbl
-            self._key(p, kr, text, r == self.row and c == self.col, r * 100 + c, primary=lbl == "DONE")
+            self._key(p, kr, text, r == self.row and c == self.col, r * 100 + c, primary=lbl == "DONE",
+                      lit=lbl == "⇧" and self.shift)
             x += wdt * unit
 
-    def _key(self, p: QPainter, r: QRectF, text: str, focused: bool, idx: int, primary: bool = False) -> None:
-        s = self.w._s()
+    def _key(self, p: QPainter, r: QRectF, text: str, focused: bool, idx: int, primary: bool = False,
+             lit: bool = False) -> None:
+        s = r.height() / 84
         path = QPainterPath()
         path.addRoundedRect(r, 12 * s, 12 * s)
         if focused:
             p.fillPath(path, QColor(255, 255, 255, 240) if not primary else QColor(theme.CURRENT.success))
             p.setPen(QColor(11, 13, 19) if not primary else QColor("white"))
         else:
-            p.fillPath(path, QColor(22, 163, 74, 150) if primary else QColor(255, 255, 255, 26))
+            p.fillPath(path, QColor(22, 163, 74, 150) if primary else
+                       QColor(theme.CURRENT.accent) if lit else QColor(255, 255, 255, 26))
             p.setPen(QColor("white"))
         f = self.w._font(min(r.height() * 0.36, 30 * s), 800)
         p.setFont(f)
@@ -751,7 +770,7 @@ class StorePage(Page):
     # ----------------------------------------------------------- geometry
     def _tile_size(self) -> tuple[float, float, float]:
         s = self.s
-        th = min(self.w.height() * 0.25, 270 * s)
+        th = min(self.w.height() * 0.25, 270 * s, max(130 * s, self.w.height() - 470 * s))    # (big interfaces)
         return th * 2 / 3, th, 26 * s
 
     def _grid_cols(self) -> int:
@@ -1147,7 +1166,7 @@ class StorePage(Page):
         m = 12 * s                                       # room for the focus glow around the strip
         clip = rect.adjusted(-10 * s, -10 * s, 10 * s, 10 * s)
         p.save()
-        p.setClipRect(clip)
+        p.setClipRect(clip, Qt.IntersectClip)
         # the whole strip is drawn once and then only copied (text and glows every frame were slow at 4K)
         w.blit(p, rect.left() - off - m, rect.top() - m,
                ("chips", tuple(chips), self.filter, focus, round(s, 3), theme.CURRENT.accent),
@@ -1254,7 +1273,7 @@ class StorePage(Page):
         self._vs_t = max(0.0, target)
         off = self._smooth("_vs", self._vs_t)
         p.save()
-        p.setClipRect(QRectF(0, top - 20 * s, W, bottom - top + 20 * s))
+        p.setClipRect(QRectF(0, top - 20 * s, W, bottom - top + 20 * s), Qt.IntersectClip)
         focused_draw = None
         for k, (title, groups, _key) in enumerate(self.shelves):
             y = top + k * block - off
@@ -1341,7 +1360,7 @@ class StorePage(Page):
         self._gs_t = max(0.0, target)
         off = self._smooth("_gs", self._gs_t)
         p.save()
-        p.setClipRect(QRectF(0, top - 24 * s, W, bottom - top + 24 * s))
+        p.setClipRect(QRectF(0, top - 24 * s, W, bottom - top + 24 * s), Qt.IntersectClip)
         focused_draw = None
         first = max(0, int((off - 40 * s - th) // row_h))           # only the rows on screen (not every game)
         last = min(rows - 1, int((off + view + 24 * s) // row_h) + 1)
@@ -2062,7 +2081,7 @@ class WishlistPage(Page):
         self._ws_t = max(0.0, target)
         off = self._smooth("_ws", self._ws_t)
         p.save()
-        p.setClipRect(rect.adjusted(-20 * s, -10 * s, 20 * s, 10 * s))
+        p.setClipRect(rect.adjusted(-20 * s, -10 * s, 20 * s, 10 * s), Qt.IntersectClip)
         active = w.zone == "main" and w.overlay is None and w.keyboard is None
         for k in range(n):
             r = QRectF(rect.left(), rect.top() + k * (row_h + 12 * s) - off, rect.width(), row_h)
@@ -2157,7 +2176,10 @@ TOGGLES = [
                ("hide_adult_games", "Hide games marked 18+")]),
     ("App", [("couch_intro", "Intro video when couch mode opens"),
              ("couch_intro_sound", "Intro sound"),
-             ("couch_gpu", "Show couch mode through the graphics card (next time it opens)"),
+             ("couch_sounds", "Sounds (moving, pressing, browser clicks)"),
+             ("gpu_acceleration", "GPU acceleration (recommended): couch mode next time it opens, the desktop "
+                                  "after a restart"),
+             ("couch_gpu", "Without GPU acceleration: frames shown through the graphics card"),
              ("reduce_motion", "Reduce animations"),
              ("notifications_enabled", "Desktop notifications when downloads finish"),
              ("start_with_session", "Start with the computer (in the tray)"),
@@ -2230,6 +2252,12 @@ class SettingsPage(Page):
                               str(st.get("download_dir") or "")))
         items.append(Item("Pause all downloads", self._pause_all))
         items.append(Item("Resume all downloads", self._resume_all))
+        items.append(Item("Library", kind="header"))
+        items.append(Item("Check every game for updates", self._check_game_updates, "Reads each game's page again"))
+        items.append(Item("Storage", self._storage, "Free space, and how much each game takes"))
+        items.append(Item("Clean up leftovers", self._cleanup, "Archives of installed games, unused prefixes, "
+                          "half-finished folders"))
+        items.append(Item("Import a game", self._import, "A game folder that is already in your games folder"))
         self._display_rows(items, st)
         for section, keys in TOGGLES:
             if section != "Downloads":
@@ -2238,6 +2266,14 @@ class SettingsPage(Page):
                 on = bool(st.get(key))
                 items.append(Item(text, lambda k=key: self._set(k, not bool(self._get(k))), "", "toggle",
                                   "on" if on else "off"))
+                vol = {"couch_sounds": ("couch_sounds_volume", "Sound volume", 15),
+                       "couch_intro_sound": ("couch_intro_volume", "Intro volume", 17)}.get(key)
+                if vol is not None and on:
+                    vk, vt, vd = vol
+                    v = int(st.get(vk, vd))
+                    items.append(Item(vt, lambda k=vk: self._step_volume(k, 5), "", "choice", f"{v} %",
+                                      left=lambda k=vk: self._step_volume(k, -5),
+                                      right=lambda k=vk: self._step_volume(k, 5)))
         from ezgd import __version__
         latest = self.app.get("latest") or {}
         if self.app.get("staged") and self.app.get("can_install"):
@@ -2322,6 +2358,15 @@ class SettingsPage(Page):
         self._set(key, new)
         self.w.apply_display(revert=before)           # asks "Keep these display settings?" (back in 15 s)
 
+    def _step_volume(self, key: str, d: int) -> None:
+        cur = int(self._get(key) or 0)
+        new = max(0, min(100, (cur + d) // 5 * 5 if d > 0 else -((-(cur + d)) // 5) * 5))
+        if new == cur:
+            return
+        self._set(key, new)
+        if key == "couch_sounds_volume":
+            self.w.sounds.play("select", new / 100)        # how it sounds now
+
     def _cycle_scale(self, sizes: list[int], d: int) -> None:
         cur = int(self._get("couch_ui_scale") or 100)
         i = min(range(len(sizes)), key=lambda k: abs(sizes[k] - cur))
@@ -2372,6 +2417,111 @@ class SettingsPage(Page):
         self.w.close_overlay()
         self._set(key, str(path))
         self.w.toasts.show("Folder changed", str(path), "success")
+
+    # ------------------------------------------------------------ library
+    def _check_game_updates(self) -> None:
+        w = self.w
+        w.busy("Checking every game for updates…", "Each game's page is read again — this can take a minute.")
+
+        def done(res: list) -> None:
+            def show(entries) -> None:
+                ups = [e for e in entries if (e.release or {}).get("status") == "update"]
+                w.set_entries(entries)
+                if ups:
+                    rows = [(f"{e.title}  →  {e.release.get('latest')}", lambda e=e: w.update_game(e), "primary",
+                             f"You have {e.release.get('version') or 'an older version'}") for e in ups]
+                    rows.append(("Close", w.close_overlay, "ghost", ""))
+                    w.menu("Updates are available", rows, text="A downloads the update; saves are backed up first.")
+                else:
+                    errs = [r for r in res or [] if r.get("error")]
+                    w.message("Everything is up to date", f"{len(errs)} site(s) did not answer." if errs else "")
+            w.bridge.call(w.bridge.core.library_entries(), show, owner=w)
+        w.bridge.call(w.bridge.core.check_game_updates(None, True), done,
+                      lambda err: w.message("Could not check", str(err)), owner=w)
+
+    def _storage(self) -> None:
+        w = self.w
+        w.busy("Measuring…", "Every game's files, prefix and saves.")
+
+        def got(r: dict) -> None:
+            rows = []
+            for d in r.get("disks") or []:
+                rows.append((f"{d['label']}: {format_bytes(d['free'])} free of {format_bytes(d['total'])}", None,
+                             "ghost", d["path"]))
+            byid = {e.id: e for e in w.entries}
+            for g in (r.get("games") or [])[:30]:
+                e = byid.get(g["entry_id"])
+                parts = [f"game {format_bytes(g['files'])}"] + ([f"downloads {format_bytes(g['downloads'])}"]
+                                                                  if g["downloads"] else []) + \
+                    ([f"prefix {format_bytes(g['prefix'])}"] if g["prefix"] else [])
+                rows.append((f"{g['title']} — {format_bytes(g['total'])}",
+                             (lambda e=e: w.manage(e)) if e is not None else None, "ghost", " · ".join(parts)))
+            rows.append(("Clean up leftovers", self._cleanup, "primary", ""))
+            rows.append(("Close", w.close_overlay, "ghost", ""))
+            rows = [(t, fn or (lambda: None), k, n) for t, fn, k, n in rows]
+            w.menu("Storage", rows, text="A on a game opens Manage (uninstall, saves, …).")
+        w.bridge.call(w.bridge.core.storage_report(), got, lambda err: w.message("Could not measure", str(err)),
+                      owner=w)
+
+    def _cleanup(self) -> None:
+        w = self.w
+        w.busy("Looking for leftovers…")
+
+        def got_left(left: list) -> None:
+            def got_arch(arch: dict) -> None:
+                size = sum(x.get("size", 0) for x in left) + (arch.get("size") or 0)
+                if not left and not arch.get("items"):
+                    w.message("Nothing to clean up", "No leftovers, unused prefixes or archives of installed games.")
+                    return
+                lines = [("Leftovers", f"{len(left)} — {format_bytes(sum(x.get('size', 0) for x in left))}"),
+                         ("Archives", f"{len(arch.get('items') or [])} of installed games — "
+                                      f"{format_bytes(arch.get('size') or 0)}")]
+
+                def go() -> None:
+                    w.busy("Cleaning up…")
+
+                    def after_left(_r) -> None:
+                        w.bridge.call(w.bridge.core.delete_leftover_archives(),
+                                      lambda _a: (w.close_overlay(), w.toasts.show(
+                                          "Cleaned up", f"{format_bytes(size)} freed.", "success")),
+                                      lambda err: w.message("Could not clean up everything", str(err)), owner=w)
+                    w.bridge.call(w.bridge.core.delete_leftovers([x["path"] for x in left]), after_left,
+                                  lambda err: w.message("Could not clean up everything", str(err)), owner=w)
+                w.show_overlay(f"Free {format_bytes(size)}?", "Only things nothing uses any more: archives of games "
+                               "that are installed, folders of unfinished installs, prefixes of removed games.",
+                               [("Clean up", go, "danger"), ("Cancel", w.close_overlay, "ghost")], lines=lines,
+                               focus=1)
+            w.bridge.call(w.bridge.core.leftover_archives(), got_arch, owner=w)
+        w.bridge.call(w.bridge.core.find_leftovers(), got_left,
+                      lambda err: w.message("Could not look for leftovers", str(err)), owner=w)
+
+    def _import(self) -> None:
+        w = self.w
+        root = Path(str(self._get("install_dir") or Path.home() / "Games"))
+        known = {str(Path(e.install_path)) for e in w.entries if e.install_path}
+        try:
+            folders = sorted((d for d in root.iterdir() if d.is_dir() and not d.name.startswith(".")
+                              and str(d) not in known), key=lambda d: d.name.casefold())
+        except OSError:
+            folders = []
+        if not folders:
+            w.message("No new game folders", f"Every folder in {root} is already in your Library. Copy a game's "
+                                             "folder there, then import it here.")
+            return
+
+        def pick(d: Path) -> None:
+            def done(title: str) -> None:
+                if not title:
+                    return
+                w.bridge.call(w.bridge.core.library_call("import_folder", title, str(d)),
+                              lambda e: (w.toasts.show("Imported", title, "success"), w.open_setup(e)),
+                              lambda err: w.message("Could not import it", str(err)), owner=w)
+            w.close_overlay()
+            w.keyboard = Keyboard(w, "The game's name", done, text=d.name, done_label="Import", symbols=True,
+                                  limit=120)
+        rows = [(d.name, lambda d=d: pick(d), "ghost", str(d)) for d in folders[:40]]
+        rows.append(("Close", w.close_overlay, "ghost", ""))
+        w.menu("Import a game", rows, text=f"Game folders in {root} that are not in your Library yet.")
 
     def _pause_all(self) -> None:
         b = self.w.bridge
@@ -2449,3 +2599,468 @@ class SettingsPage(Page):
         rect = QRectF((W - cw) / 2, y + 6 * s, cw, H - 76 * s - 24 * s - y - 6 * s)
         self._list(p, self.items, self.focus, rect, "_ss", focused=w.zone == "main" and w.overlay is None
                    and w.keyboard is None, row_h=None)
+
+
+# ============================================================== game settings
+FPS_LIMITS = [0, 30, 40, 45, 60, 72, 90, 120, 144, 165, 240]
+RUN_WITH = [("auto", "Automatic"), ("proton", "Proton"), ("wine", "Wine"), ("native", "Native (no Proton)"),
+            ("steam", "Steam shortcut")]
+SHOWN_FIXES = {"mangohud", "gamemode", "no_steam_overlay"}         # (their own rows above)
+FIX_ORDER = ["Recommended", "Graphics", "Audio", "Stability", "Performance & overlays", "Compatibility",
+             "Troubleshooting"]
+
+
+class GameSettingsPage(Page):
+    """One game's start settings from the couch: Proton version, FPS limit, MangoHud, GameMode, the Steam overlay
+    and launch options. The same settings as the desktop's Properties / Fixes; they apply at the next start."""
+
+    def __init__(self, w, entry):
+        super().__init__(w)
+        self.e = entry
+        self.focus = 0
+        self.items: list[Item] = []
+        self.fixes: dict[str, dict] = {}         # fix key → its state (enabled, installed)
+        self.protons: list[str] = []
+        self.loaded = False
+
+    # ------------------------------------------------------------ data
+    def activate(self) -> None:
+        b = self.w.bridge
+        b.call(b.core.library_call("fixes_for", self.e.id), self._got_fixes, lambda _err: self._got_fixes([]),
+               owner=self.w)
+        b.call(b.core.library_call("protons"), self._got_protons, lambda _err: self._got_protons([]), owner=self.w)
+        self._build()
+
+    def _got_fixes(self, states: list) -> None:
+        self.fixes = {st["key"]: st for st in states or []}
+        self.loaded = True
+        self._build()
+        self.w.update()
+
+    def _got_protons(self, protons: list) -> None:
+        self.protons = [p.name for p in protons or []]
+        self._build()
+        self.w.update()
+
+    def _saved(self, e) -> None:
+        if e is not None:
+            self.e = e
+        self._build()
+        self.w.update()
+
+    def _failed(self, err) -> None:
+        self.w.toasts.show("Could not save", str(err), "error")
+        self._build()
+        self.w.update()
+
+    def _update(self, **changes) -> None:
+        b = self.w.bridge
+        b.call(b.core.library_call("update", self.e.id, **changes), self._saved, self._failed, owner=self.w)
+
+    # ------------------------------------------------------------ rows
+    def _build(self) -> None:
+        e, items = self.e, []
+        cfg = e.compat_config
+        windows = "opt:wined3d" in self.fixes or "runtime" in self.fixes      # a Proton game (Fixes says so)
+        items.append(Item("Starts with", kind="header"))
+        if windows or e.proton_version:
+            names = [""] + self.protons
+            cur = e.proton_version or ""
+            label = cur or "Automatic (the app's choice)"
+            items.append(Item("Proton version", lambda: self._cycle_proton(names, 1),
+                              "Which Proton runs the game; Automatic follows Settings", "choice", label,
+                              left=lambda: self._cycle_proton(names, -1), right=lambda: self._cycle_proton(names, 1)))
+        if "no_steam_overlay" in self.fixes:
+            on = not self.fixes["no_steam_overlay"].get("enabled")
+            items.append(Item("Steam overlay (Shift+Tab)", lambda: self._toggle_fix("no_steam_overlay"),
+                              "Friends, chat and the web browser in the game while Steam runs", "toggle",
+                              "on" if on else "off"))
+        method = str(e.launch_method)
+        items.append(Item("Run with", lambda: self._cycle_method(1), "Automatic: Proton for Windows games",
+                          "choice", dict(RUN_WITH).get(method, method),
+                          left=lambda: self._cycle_method(-1), right=lambda: self._cycle_method(1)))
+        args = e.launch_args or ""
+        items.append(Item("Launch options", self._edit_args, args or "None — e.g.  -dx11   or   MANGOHUD=1 %command%",
+                          "row", "Edit"))
+        items.append(Item("Steam App ID", self._edit_app_id, "Steam's number for the game: artwork, protonfixes, "
+                          "ratings", "row", str(e.steam_app_id or "None")))
+        if windows:
+            items.append(Item("DLL overrides (advanced)", self._edit_dlls, cfg.dll_overrides or "None — e.g. "
+                              "winmm=n,b;version=n,b", "row", "Edit"))
+        items.append(Item("Performance", kind="header"))
+        fps = cfg.fps_limit
+        items.append(Item("FPS limit", lambda: self._cycle_fps(1),
+                          "Caps DirectX games (most Windows games) — smoother and cooler on a fast PC", "choice",
+                          f"{fps} FPS" if fps else "No limit",
+                          left=lambda: self._cycle_fps(-1), right=lambda: self._cycle_fps(1)))
+        for key, label, note in (("mangohud", "MangoHud", "FPS, frame times and temperatures on screen"),
+                                 ("gamemode", "GameMode", "Asks the system for full CPU / GPU speed while it runs")):
+            st = self.fixes.get(key)
+            if st is None:
+                continue
+            if not st.get("available", True):
+                items.append(Item(label, None, st.get("unavailable_reason") or "Not installed", "info"))
+                continue
+            items.append(Item(label, lambda k=key: self._toggle_fix(k), note, "toggle",
+                              "on" if st.get("enabled") else "off"))
+        rest = [st for k, st in self.fixes.items() if k not in SHOWN_FIXES]
+        rest.sort(key=lambda st: (FIX_ORDER.index(st.get("category")) if st.get("category") in FIX_ORDER else 99,
+                                  st.get("title", "")))
+        cat = None
+        for st in rest:
+            if st.get("category") != cat:
+                cat = st.get("category")
+                items.append(Item(f"Fixes — {cat}", kind="header"))
+            note = st.get("recommended") or st.get("description") or ""
+            if not st.get("available", True):
+                items.append(Item(st["title"], None, st.get("unavailable_reason") or note, "info"))
+                continue
+            items.append(Item(st["title"], lambda k=st["key"]: self._toggle_fix(k), note, "toggle",
+                              "on" if st.get("enabled") else "off"))
+        if windows:
+            items.append(Item("Proton prefix", kind="header"))
+            items.append(Item("winecfg", lambda: self._tool("winecfg"), "Wine's own settings — opens a window "
+                              "(use the mouse); couch mode comes back when it closes"))
+            items.append(Item("Winetricks", lambda: self._tool("winetricks"), "Install Windows parts into the "
+                              "game's prefix — opens a window"))
+            items.append(Item("Reset the prefix…", self._reset_prefix, "A fresh Windows folder for the game; saves "
+                              "are backed up first", "danger"))
+        items.append(Item("Help", kind="header"))
+        items.append(Item("Fix problems", lambda: self.w.fix_game(self.e),
+                          "Finds out why it does not start and repairs it (may test-start the game)"))
+        items.append(Item("See what's wrong", lambda: self.w.diagnose_list(self.e),
+                          "Every finding of the debugging assistant, each with its fix"))
+        running = self.e.id in self.w.running
+        items.append(Item("Running now — changes apply the next time it starts" if running else
+                          "Changes apply the next time the game starts", kind="info"))
+        old = self.items[self.focus].label if 0 <= self.focus < len(self.items) else None
+        self.items = items
+        same = next((k for k, it in enumerate(items) if it.label == old), None)
+        self.focus = same if same is not None and items[same].focusable else self._first(items)
+
+    def _cycle_proton(self, names: list[str], d: int) -> None:
+        if len(names) < 2:
+            return
+        cur = self.e.proton_version or ""
+        i = names.index(cur) if cur in names else 0
+        new = names[(i + d) % len(names)]
+        self.e.proton_version = new or None
+        self._build()
+        self._update(proton_version=new or None)
+
+    def _cycle_fps(self, d: int) -> None:
+        cfg = self.e.compat_config
+        i = FPS_LIMITS.index(cfg.fps_limit) if cfg.fps_limit in FPS_LIMITS else 0
+        cfg.fps_limit = FPS_LIMITS[(i + d) % len(FPS_LIMITS)]
+        self.e.compat = cfg.to_dict()
+        self._build()
+        self._update(compat=cfg.to_dict())
+
+    def _toggle_fix(self, key: str) -> None:
+        st = self.fixes.get(key)
+        if st is None:
+            return
+        st["enabled"] = not st.get("enabled")
+        if st["enabled"] and st.get("group"):                # only one of a group (e.g. Godot's renderer)
+            for k, other in self.fixes.items():
+                if k != key and other.get("group") == st["group"]:
+                    other["enabled"] = False
+        enabled = sorted(k for k, v in self.fixes.items() if v.get("enabled"))
+        self._build()
+        b = self.w.bridge
+        b.call(b.core.library_call("set_fixes", self.e.id, enabled), self._saved, self._failed, owner=self.w)
+
+    def _cycle_method(self, d: int) -> None:
+        values = [v for v, _t in RUN_WITH]
+        cur = str(self.e.launch_method)
+        new = values[(values.index(cur) + d) % len(values)] if cur in values else values[0]
+        self._update(launch_method=new)
+
+    def _edit_app_id(self) -> None:
+        def done(text: str) -> None:
+            digits = "".join(ch for ch in text if ch.isdigit())
+            self._update(steam_app_id=int(digits) if digits else None)
+        self.w.keyboard = Keyboard(self.w, f"Steam App ID — {self.e.title}", done,
+                                   text=str(self.e.steam_app_id or ""), done_label="Save", limit=12)
+
+    def _edit_dlls(self) -> None:
+        def done(text: str) -> None:
+            cfg = self.e.compat_config
+            cfg.dll_overrides = text.strip()
+            self._update(compat=cfg.to_dict())
+        self.w.keyboard = Keyboard(self.w, f"DLL overrides — {self.e.title}", done,
+                                   text=self.e.compat_config.dll_overrides, done_label="Save", symbols=True, limit=240)
+
+    def _tool(self, tool: str) -> None:
+        """winecfg / Winetricks: their window needs the screen (couch mode steps aside until it has closed)."""
+        w, e = self.w, self.e
+
+        def started(_r) -> None:
+            w.toasts.show(f"{tool} is open", "Couch mode comes back when you close it.")
+            w.step_away("tool")
+            QTimer.singleShot(4000, w, lambda: self._watch_tool(0))
+        w.bridge.call(w.bridge.core.library_call("prefix_tool", e.id, tool), started,
+                      lambda err: w.message(f"Could not open {tool}", str(err)), owner=w)
+
+    def _watch_tool(self, n: int) -> None:
+        w = self.w
+
+        def got(pids: list) -> None:
+            if pids and n < 900:                             # (gives up after an hour)
+                QTimer.singleShot(2000, w, lambda: self._watch_tool(n + 1))
+            else:
+                w.come_back_from("tool")
+                self.activate()
+        w.bridge.call(w.bridge.core.library_call("game_processes", self.e.id), got,
+                      lambda _err: w.come_back_from("tool"), owner=w)
+
+    def _reset_prefix(self) -> None:
+        w, e = self.w, self.e
+
+        def go() -> None:
+            w.busy("Resetting the prefix…", e.title)
+            w.bridge.call(w.bridge.core.library_call("reset_prefix", e.id),
+                          lambda _r: (w._close_overlay(), w.toasts.show("Prefix reset", "It is made fresh at the "
+                                                                                       "next start.", "success")),
+                          lambda err: w.message("Could not reset the prefix", str(err)), owner=w)
+        if e.id in w.running:
+            w.message("Quit the game first", "The prefix is in use while the game runs.")
+            return
+        w.show_overlay("Reset the Proton prefix?", "The game's Windows folder is deleted and made fresh at the next "
+                       "start. Your saves are backed up first; installed extras (winetricks) are gone.",
+                       [("Reset", go, "danger"), ("Cancel", w.close_overlay, "ghost")], focus=1)
+
+    def _edit_args(self) -> None:
+        def done(text: str) -> None:
+            self._update(launch_args=text)
+        self.w.keyboard = Keyboard(self.w, f"Launch options — {self.e.title}", done, text=self.e.launch_args or "",
+                                   done_label="Save", symbols=True, limit=240)
+
+    # ------------------------------------------------------------ page
+    def background(self) -> str | None:
+        return self.w.hero_url(self.e)
+
+    def command(self, name: str) -> str | None:
+        r = self._list_command(self.items, "focus", name)
+        if r == "back":
+            self.w.pop_page()
+            return None
+        return r
+
+    def hit(self, idx: int, click: bool) -> None:
+        if 0 <= idx < len(self.items) and self.items[idx].focusable:
+            self.focus = idx
+            if click and self.items[idx].action:
+                self.items[idx].action()
+
+    def hints(self) -> list[tuple[str, str]]:
+        it = self.items[self.focus] if 0 <= self.focus < len(self.items) else None
+        if it is not None and it.kind == "choice":
+            return [("lr", "Change"), ("b", "Back")]
+        if it is not None and it.kind == "toggle":
+            return [("a", "Switch on/off"), ("b", "Back")]
+        return [("a", "Select"), ("b", "Back")]
+
+    def paint(self, p: QPainter) -> None:
+        w = self.w
+        s, W, H = self.s, w.width(), w.height()
+        y = self._heading(p, "Game settings", self.e.title)
+        cw = min(W - 144 * s, 1300 * s)
+        rect = QRectF((W - cw) / 2, y + 6 * s, cw, H - 76 * s - 24 * s - y - 6 * s)
+        self._list(p, self.items, self.focus, rect, "_gs", focused=w.zone == "main" and w.overlay is None
+                   and w.keyboard is None)
+
+
+# ================================================================= finishing setup
+class GameSetupPage(Page):
+    """A game that is not ready yet: every step to Play as a checklist, ticked off as it happens, and one button
+    that does the next step (unpack, the repack's installer, the base game in Steam, the game's program, Play)."""
+
+    def __init__(self, w, entry):
+        super().__init__(w)
+        self.id = entry.id
+        self.focus = 0
+        self.items: list[Item] = []
+        self._sig = None
+        self.auto_tried = False
+
+    @property
+    def e(self):
+        return next((x for x in self.w.entries if x.id == self.id), None)
+
+    def steps(self) -> tuple[list[tuple[str, str, str]], tuple[str, Callable[[], None]] | None]:
+        """([(step, done | now | working | todo | problem, note)], (next button, action) or None)."""
+        w, e = self.w, self.e
+        if e is None:
+            return [], None
+        st = (e.setup or {}).get("state")
+        status = e.status.value
+        out: list[list[str]] = [["Download", "done", "The game's files are on your computer"]]
+        nxt = None
+        if status == "extracting" or e.id in w.extraction:
+            pct = int(w.extraction.get(e.id, 0) * 100)
+            out.append(["Unpack", "working", f"{pct} % — this takes a few minutes for a big game"])
+        elif status == "downloaded":
+            out.append(["Unpack", "now", "The downloaded archive goes into your games folder"])
+            nxt = ("Unpack the game", lambda: w.extract(e))
+        else:
+            out.append(["Unpack", "done", e.install_path or "In your games folder"])
+        if st in ("pending", "installing", "installed"):
+            if st == "installing":
+                out.append(["Run the game's installer", "working", "The installer is open — finish it there"])
+            elif st == "pending":
+                out.append(["Run the game's installer", "now" if nxt is None else "todo",
+                            "This repack installs itself (you choose the options)"])
+                nxt = nxt or ("Run the installer", lambda: w.install_repack(e))
+            else:
+                out.append(["Run the game's installer", "done", "Installed"])
+        if st == "waiting_steam":
+            out.append(["Install the base game in Steam", "now" if nxt is None else "todo",
+                        f"“{(e.setup or {}).get('base') or 'The base game'}” is free in Steam — the fix goes into it"])
+            nxt = nxt or ("Install it in Steam", lambda: w.install_steam_base(e))
+        if status == "broken":
+            out.append(["The game's files", "problem", "Not found on disk — choose the game's program again, or "
+                                                       "uninstall and download it again"])
+            nxt = nxt or ("Choose the game's program", lambda: w.choose_executable(e))
+        elif e.executable and status == "installed":
+            out.append(["Choose the game's program", "done", Path(e.executable).name])
+        else:
+            busy = any(s[1] in ("working", "now") for s in out)
+            out.append(["Choose the game's program", "todo" if busy else "now",
+                        "Which program Play starts — the app picks it when one clearly stands out"])
+            if not busy:
+                nxt = nxt or ("Choose the game's program", self._auto_program)
+        ready = w.ready(e)
+        out.append(["Play", "now" if ready else "todo", "Ready!" if ready else "After the steps above"])
+        if ready:
+            nxt = ("▶  Play", lambda: w.play(e))
+        return [tuple(s) for s in out], nxt
+
+    def _auto_program(self) -> None:
+        """The game's program: picked by the app when one clearly stands out, else the list to choose from."""
+        e = self.e
+        if e is None:
+            return
+        w = self.w
+
+        def got(name) -> None:
+            if name:
+                w.toasts.show("Ready to play", f"{e.title} starts {name}.", "success")
+            else:
+                w.choose_executable(e)
+        w.busy("Looking for the game's program…", e.title)
+        w.bridge.call(w.bridge.core.library_call("auto_executable", e.id),
+                      lambda name: (w._close_overlay(), got(name)), lambda _err: (w._close_overlay(), got(None)),
+                      owner=w)
+
+    def _build(self) -> None:
+        e = self.e
+        steps, nxt = self.steps()
+        sig = (steps, nxt[0] if nxt else None)
+        if sig == self._sig:
+            return
+        self._sig = sig
+        items: list[Item] = []
+        if nxt is not None:
+            items.append(Item(nxt[0], nxt[1], "The next step" if not nxt[0].startswith("▶") else "", "primary"))
+        elif any(s[1] == "working" for s in steps):
+            items.append(Item("Working on it…", None, "This page moves on by itself", "info"))
+        if e is not None and e.status.value in ("extracted", "installed", "broken"):
+            items.append(Item("Choose the program myself", lambda: self.w.choose_executable(e),
+                              "Pick which file Play starts"))
+        if e is not None:
+            items.append(Item("Game settings", lambda: self.w.open_game_settings(e),
+                              "Proton, FPS limit, MangoHud, launch options"))
+            items.append(Item("Fix problems", lambda: self.w.fix_game(e),
+                              "If it does not start: finds out why and repairs it"))
+            items.append(Item("Manage…", lambda: self.w.manage(e), "Everything else: saves, uninstall, …"))
+        self.items = items
+        self.focus = min(self.focus, max(0, len(items) - 1))
+        if items and not items[self.focus].focusable:
+            self.focus = self._first(items)
+
+    # ------------------------------------------------------------ page
+    def background(self) -> str | None:
+        e = self.e
+        return self.w.hero_url(e) if e is not None else None
+
+    def command(self, name: str) -> str | None:
+        self._build()
+        r = self._list_command(self.items, "focus", name)
+        if r == "back":
+            self.w.pop_page()
+            return None
+        return r
+
+    def hit(self, idx: int, click: bool) -> None:
+        if 0 <= idx < len(self.items) and self.items[idx].focusable:
+            self.focus = idx
+            if click and self.items[idx].action:
+                self.items[idx].action()
+
+    def paint(self, p: QPainter) -> None:
+        w, e = self.w, self.e
+        s, W, H = self.s, w.width(), w.height()
+        if e is None:
+            self.w.pop_page()
+            return
+        self._build()
+        steps, _nxt = self.steps()
+        y = self._heading(p, "Finish setup", e.title)
+        top, bottom = y + 10 * s, H - 76 * s - 24 * s
+        left = 72 * s
+        col = min(760 * s, (W - 3 * left) * 0.5)
+        # the checklist
+        row = min(96 * s, (bottom - top) / max(1, len(steps)))
+        for k, (label_, state, note) in enumerate(steps):
+            cy = top + k * row + row / 2
+            d = min(44 * s, row * 0.55)
+            c = QRectF(left, cy - d / 2, d, d)
+            if k + 1 < len(steps):                              # the line to the next step
+                p.setPen(QPen(QColor(255, 255, 255, 46), 3 * s))
+                p.drawLine(c.center().x(), c.bottom() + 6 * s, c.center().x(), cy + row - d / 2 - 6 * s)
+            color = {"done": theme.CURRENT.success, "now": theme.CURRENT.accent, "working": theme.CURRENT.accent,
+                     "problem": theme.CURRENT.danger}.get(state)
+            path = QPainterPath()
+            path.addEllipse(c)
+            if state == "done":
+                p.fillPath(path, QColor(color))
+                p.setPen(QPen(QColor("white"), 3.5 * s, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                p.drawPolyline([QPointF(c.left() + d * 0.28, c.top() + d * 0.52),
+                                QPointF(c.left() + d * 0.44, c.top() + d * 0.68),
+                                QPointF(c.left() + d * 0.74, c.top() + d * 0.34)])
+            elif state in ("now", "working", "problem"):
+                glow = QColor(color)
+                glow.setAlpha(60)
+                gp = QPainterPath()
+                gp.addEllipse(c.adjusted(-6 * s, -6 * s, 6 * s, 6 * s))
+                p.fillPath(gp, glow)
+                p.setPen(QPen(QColor(color), 4 * s))
+                p.drawEllipse(c.adjusted(2 * s, 2 * s, -2 * s, -2 * s))
+                if state == "working":                          # a turning arc while it works
+                    a = int(time.monotonic() * 360) % 360
+                    p.setPen(QPen(QColor("white"), 4 * s, Qt.SolidLine, Qt.RoundCap))
+                    p.drawArc(c.adjusted(2 * s, 2 * s, -2 * s, -2 * s), -a * 16, 90 * 16)
+                    w._schedule_frame(40)
+                elif state == "problem":
+                    p.setPen(QColor("white"))
+                    p.setFont(w._font(d * 0.55, 900))
+                    p.drawText(c, Qt.AlignCenter, "!")
+            else:
+                p.setPen(QPen(QColor(255, 255, 255, 70), 3 * s))
+                p.drawEllipse(c.adjusted(2 * s, 2 * s, -2 * s, -2 * s))
+            tx = c.right() + 24 * s
+            p.setFont(w._font(24 * s, 800))
+            p.setPen(QColor("white") if state != "todo" else QColor(255, 255, 255, 120))
+            fm = QFontMetrics(p.font())
+            p.drawText(QRectF(tx, cy - 32 * s, col - (tx - left), 32 * s), Qt.AlignLeft | Qt.AlignBottom,
+                       fm.elidedText(label_, Qt.ElideRight, int(col - (tx - left))))
+            p.setFont(w._font(16 * s, 600))
+            p.setPen(QColor(255, 255, 255, 160 if state != "todo" else 90))
+            fm = QFontMetrics(p.font())
+            p.drawText(QRectF(tx, cy + 2 * s, col - (tx - left), 26 * s), Qt.AlignLeft | Qt.AlignTop,
+                       fm.elidedText(note, Qt.ElideMiddle, int(col - (tx - left))))
+        # what to do
+        rect = QRectF(left * 2 + col, top, W - left * 3 - col, bottom - top)
+        self._list(p, self.items, self.focus, rect, "_su", focused=w.zone == "main" and w.overlay is None
+                   and w.keyboard is None)

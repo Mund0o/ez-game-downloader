@@ -113,6 +113,8 @@ def main(argv: list[str] | None = None) -> int:
 def _run(args, paths, log_file, previous_crash) -> int:
     from ezgd.core import crashreport
 
+    from ezgd.ui import gpu
+    gpu_start = gpu.apply_at_startup(paths.data, paths.database)    # (before Qt and Chromium start)
     from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QApplication, QMessageBox
     try:                    # the in-app browser must be loaded before the QApplication exists
@@ -130,8 +132,9 @@ def _run(args, paths, log_file, previous_crash) -> int:
     app.setApplicationDisplayName(APP_DISPLAY_NAME)
     app.setApplicationVersion(__version__)
     app.setDesktopFileName("ezgd")
-    from ezgd.ui import theme
+    from ezgd.ui import displays, theme
     theme.apply_theme(app)
+    displays.watch(app)                   # the monitors' real resolution, from the desktop (in the background)
 
     from ezgd.core.app_core import AppCore
     core = AppCore(paths)
@@ -167,6 +170,12 @@ def _run(args, paths, log_file, previous_crash) -> int:
         win.showMinimized()
     else:
         win.show()
+    if gpu_start == "on":
+        QTimer.singleShot(3000, lambda: gpu.started(paths.data))     # the GPU start worked
+    elif gpu_start == "skipped":
+        QTimer.singleShot(1500, lambda: win.actions.toasts.show(
+            "Started without GPU acceleration", "The last start with it did not finish. It is tried again next "
+            "time; switch it off in Settings → Interface if this repeats.", "warning"))
     from ezgd.core import instance
 
     def bring_to_front() -> None:
@@ -235,6 +244,7 @@ def _run(args, paths, log_file, previous_crash) -> int:
         wake.start(500)
 
     rc = app.exec()
+    gpu.started(paths.data)               # a clean exit is not a failed GPU start
     crashreport.set_callback(None)
     log.info("shutting down")
     try:

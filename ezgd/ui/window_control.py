@@ -34,10 +34,46 @@ KWIN_SCRIPT = """
 """
 
 
+GAME_SCRIPT = """
+(function () {
+    var pids = %(pids)s, best = null;
+    var list = workspace.windowList ? workspace.windowList() : workspace.clientList();
+    for (var i = 0; i < list.length; i++) {
+        var w = list[i];
+        if (pids.indexOf(w.pid) === -1 || !w.normalWindow) continue;
+        if (best === null || w.fullScreen || (w.width * w.height > best.width * best.height && !best.fullScreen))
+            best = w;
+    }
+    if (best !== null) {
+        if (best.minimized) best.minimized = false;
+        if (workspace.activeWindow !== undefined) workspace.activeWindow = best; else workspace.activeClient = best;
+    }
+})();
+"""
+
+
+def bring_game_forward(pids: list[int]) -> bool:
+    """Give the screen back to a game: its biggest (or full-screen) window comes to the front with the focus.
+    Only windows of the game's own processes are touched. False when the compositor cannot do it (then the game is
+    simply what is under the app's windows)."""
+    if not pids or not WindowControl._kwin_available():
+        return False
+    import json
+    return _run_kwin(GAME_SCRIPT % {"pids": json.dumps(sorted(int(p) for p in pids))}, "game")
+
+
 def real_scale(screen, first=None) -> float:
     """How many real pixels one of Qt's pixels is on ``screen``. With fractional scaling (125 %, 150 %) Qt's screen
-    may say 2 while a window on it really gets 1.5 — a window that is on that screen knows the truth."""
+    may say 2 while it really is 1.5: the desktop's own answer comes first (see displays.py), then a window that is
+    on that screen, then Qt's screen."""
     from PySide6.QtWidgets import QApplication
+    from ezgd.ui import displays
+    native = displays.native_size(screen)
+    g = screen.geometry()
+    if native and g.width() > 0 and g.height() > 0:
+        landscape_q, landscape_n = g.width() >= g.height(), native[0] >= native[1]
+        nw = native[0] if landscape_q == landscape_n else native[1]
+        return max(0.5, nw / g.width())
     widgets = ([first] if first is not None else []) + [w for w in QApplication.topLevelWidgets() if w is not first]
     for w in widgets:
         try:
@@ -50,8 +86,36 @@ def real_scale(screen, first=None) -> float:
 
 def real_size(screen) -> tuple[int, int]:
     """The screen's resolution in real pixels (what people know as their resolution)."""
-    g, k = screen.geometry(), real_scale(screen)
+    from ezgd.ui import displays
+    native = displays.native_size(screen)
+    g = screen.geometry()
+    if native:
+        return native if (native[0] >= native[1]) == (g.width() >= g.height()) else (native[1], native[0])
+    k = real_scale(screen)
     return round(g.width() * k), round(g.height() * k)
+
+
+RELEASE_SCRIPT = """
+(function () {
+    var pid = %(pid)d;
+    var list = workspace.windowList ? workspace.windowList() : workspace.clientList();
+    for (var i = 0; i < list.length; i++) if (list[i].pid === pid) list[i].keepAbove = false;
+})();
+"""
+
+
+def release_all() -> None:
+    """Couch mode has closed: none of the app's windows may stay above other windows (the desktop window, the
+    in-app browser, …) — "keep above" is for couch mode only."""
+    from PySide6.QtGui import QGuiApplication
+    for w in QGuiApplication.topLevelWindows():
+        try:
+            if w.flags() & Qt.WindowStaysOnTopHint:
+                w.setFlag(Qt.WindowStaysOnTopHint, False)
+        except RuntimeError:
+            continue
+    if WindowControl._kwin_available():
+        _run_kwin(RELEASE_SCRIPT % {"pid": os.getpid()}, "release keep-above")
 
 
 class WindowControl:
@@ -60,7 +124,6 @@ class WindowControl:
         self.marker = marker                      # a unique part of the window title
         self.kwin = self._kwin_available()
         self._above: bool | None = None
-        self._n = 0
 
     @staticmethod
     def _kwin_available() -> bool:
@@ -110,6 +173,14 @@ class WindowControl:
                        "var a = workspace.clientArea(KWin.FullScreenArea, o); w.noBorder = true; "
                        "w.frameGeometry = {x: a.x, y: a.y, width: a.width, height: a.height};")
 
+    def force_fullscreen(self, screen: str = "") -> None:
+        """Full screen that did not fill the monitor (some setups keep the window's old size): KWin makes it full
+        screen on that monitor and sizes it to the monitor itself."""
+        if self.kwin:
+            self._kwin(self._find_output(screen) +
+                       "var a = workspace.clientArea(KWin.FullScreenArea, o); w.fullScreen = false; "
+                       "w.frameGeometry = {x: a.x, y: a.y, width: a.width, height: a.height}; w.fullScreen = true;")
+
     def place_pixels(self, pw: int, ph: int, screen: str = "") -> None:
         """A borderless window of pw×ph *real* pixels in the monitor's top-left corner (KWin knows the monitor's
         true scale: 1.5 at 150 %, where Qt may say 2)."""
@@ -135,31 +206,42 @@ class WindowControl:
     def _kwin(self, body: str) -> None:
         import json
         script = KWIN_SCRIPT % {"pid": os.getpid(), "marker": json.dumps(self.marker), "body": body}
-        self._n += 1
-        name = f"ezgd-couch-{os.getpid()}-{self._n}"
-        folder = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
-        path = folder / f"{name}.js"
-        try:
-            from PySide6.QtDBus import QDBus, QDBusConnection, QDBusMessage
-            path.write_text(script, "utf-8")
-            bus = QDBusConnection.sessionBus()
+        _run_kwin(script, body)
 
-            def call(obj: str, iface: str, method: str, *args):
-                msg = QDBusMessage.createMethodCall("org.kde.KWin", obj, iface, method)
-                if args:
-                    msg.setArguments(list(args))
-                return bus.call(msg, QDBus.Block, 1500)      # never hang the app on the compositor
-            t = time.monotonic()
-            r = call("/Scripting", "org.kde.kwin.Scripting", "loadScript", str(path), name)
-            sid = r.arguments()[0] if r.arguments() else -1
-            if isinstance(sid, int) and sid >= 0:
-                call(f"/Scripting/Script{sid}", "org.kde.kwin.Script", "run")
-            call("/Scripting", "org.kde.kwin.Scripting", "unloadScript", name)
-            log.debug("kwin: %s (%.0f ms)", body, (time.monotonic() - t) * 1000)
-        except Exception:
-            log.info("KWin did not take the window request", exc_info=True)
-        finally:
-            try:
-                path.unlink()
-            except OSError:
-                pass
+
+_kwin_n = 0
+
+
+def _run_kwin(script: str, what: str) -> bool:
+    """Load, run and unload a one-shot KWin script (over D-Bus, never waiting more than 1.5 s per call)."""
+    global _kwin_n
+    _kwin_n += 1
+    name = f"ezgd-couch-{os.getpid()}-{_kwin_n}"
+    folder = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
+    path = folder / f"{name}.js"
+    try:
+        from PySide6.QtDBus import QDBus, QDBusConnection, QDBusMessage
+        path.write_text(script, "utf-8")
+        bus = QDBusConnection.sessionBus()
+
+        def call(obj: str, iface: str, method: str, *args):
+            msg = QDBusMessage.createMethodCall("org.kde.KWin", obj, iface, method)
+            if args:
+                msg.setArguments(list(args))
+            return bus.call(msg, QDBus.Block, 1500)      # never hang the app on the compositor
+        t = time.monotonic()
+        r = call("/Scripting", "org.kde.kwin.Scripting", "loadScript", str(path), name)
+        sid = r.arguments()[0] if r.arguments() else -1
+        if isinstance(sid, int) and sid >= 0:
+            call(f"/Scripting/Script{sid}", "org.kde.kwin.Script", "run")
+        call("/Scripting", "org.kde.kwin.Scripting", "unloadScript", name)
+        log.debug("kwin: %s (%.0f ms)", what, (time.monotonic() - t) * 1000)
+        return True
+    except Exception:
+        log.info("KWin did not take the window request", exc_info=True)
+        return False
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass

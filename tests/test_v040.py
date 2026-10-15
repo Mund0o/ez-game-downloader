@@ -67,29 +67,6 @@ def test_holding_the_guide_button_asks_once(qtbot):
     g.stop()
 
 
-def test_couch_asks_to_quit_only_a_game_started_there(qtbot):
-    from types import SimpleNamespace
-    from ezgd.ui import couch as C
-    calls = []
-    w = SimpleNamespace(_exiting=False, overlay=None, launched={7}, running={7}, keyboard=None,
-                        entries=[SimpleNamespace(id=7, title="Valor Mortis")],
-                        _come_back=lambda: calls.append("front"), update=lambda: None,
-                        _stop=lambda ids, then_exit: calls.append(("stop", ids, then_exit)),
-                        _step_aside=lambda: calls.append("aside"))
-    w._back_to_game = lambda: C._Couch._back_to_game(w)
-    C._Couch._home_held(w)
-    assert calls == ["front"] and w.overlay.title == "Quit Valor Mortis?" and w.overlay.focus == 1
-    quit_btn, keep = w.overlay.buttons
-    keep[1]()
-    assert w.overlay is None and calls[-1] == "aside"             # back to the game
-    C._Couch._home_held(w)
-    w.overlay.buttons[0][1]()
-    assert calls[-1] == ("stop", [7], False)
-    w.overlay, w.launched = None, set()                           # a game started from the desktop: untouched
-    C._Couch._home_held(w)
-    assert w.overlay is None
-
-
 # ------------------------------------------------------------------- synced save backups
 @linux_only
 async def test_save_backups_go_to_the_synced_folder(core, tmp_path):  # noqa: F811

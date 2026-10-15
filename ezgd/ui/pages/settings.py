@@ -6,7 +6,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
-                               QInputDialog, QLineEdit, QMessageBox, QPushButton, QScrollArea, QSpinBox,
+                               QInputDialog, QLineEdit, QMessageBox, QPushButton, QScrollArea, QSlider, QSpinBox,
                                QVBoxLayout, QWidget)
 
 from ezgd.core.fsutil import format_bytes
@@ -149,6 +149,35 @@ class SettingsPage(QWidget):
         w.editingFinished.connect(lambda: self._save(key, w.text().strip()))
         w.textChanged.connect(lambda t: self._save(key, t.strip()) if not w.hasFocus() else None)
         form.addRow(text, folder_row(w, self, text))
+        self.widgets[key] = w
+        return w
+
+    def _volume(self, form, key: str, text: str, sample: bool) -> QSlider:
+        """A 0–100 % slider; ``sample``: play a couch sound at the new volume when it is let go."""
+        w = QSlider(Qt.Horizontal)
+        w.setRange(0, 100)
+        w.setSingleStep(1)
+        w.setPageStep(5)
+        w.setMaximumWidth(260)
+        value = QLabel()
+        value.setMinimumWidth(48)
+        w.valueChanged.connect(lambda v: value.setText(f"{v} %"))
+
+        def save() -> None:
+            self._save(key, w.value())
+            if sample and not self._loading:
+                from ezgd.ui import couch_sounds
+                couch_sounds.preview(w.value())
+        w.sliderReleased.connect(save)
+        w.valueChanged.connect(lambda _v: None if w.isSliderDown() else save())     # keys / clicks on the track
+        row = QHBoxLayout()
+        row.addWidget(w)
+        row.addWidget(value)
+        row.addStretch(1)
+        box = QWidget()
+        box.setLayout(row)
+        row.setContentsMargins(0, 0, 0, 0)
+        form.addRow(text, box)
         self.widgets[key] = w
         return w
 
@@ -412,6 +441,12 @@ class SettingsPage(QWidget):
         self._combo(f, "theme_contrast", "Background", [("dark", "Dark"), ("midnight", "Midnight (darker)")])
         self._combo(f, "card_size", "Game cards", [("compact", "Compact"), ("comfortable", "Comfortable"),
                                                    ("large", "Large")])
+        self._check(f, "gpu_acceleration", "GPU acceleration (recommended) — couch mode uses it the next time it "
+                                           "opens, the desktop and the in-app browser after a restart",
+                    "Couch mode is drawn by the graphics card (OpenGL) instead of the processor: smoother, especially "
+                    "at 4K. The desktop window is composed on the graphics card and the in-app browser draws pages "
+                    "and decodes video on it. If the graphics driver has a problem with it, the app falls back to "
+                    "the processor by itself.")
         self._check(f, "reduce_motion", "Reduce animations")
         self._check(f, "notifications_enabled", "Show desktop notifications when downloads finish or fail")
         self._check(f, "start_with_session", "Start with the computer (in the tray)",
@@ -438,9 +473,13 @@ class SettingsPage(QWidget):
                                                                                        175, 200)])
         self._check(f, "couch_intro", "Intro video when couch mode opens (2 seconds; any button skips it)")
         self._check(f, "couch_intro_sound", "Intro sound")
+        self._volume(f, "couch_intro_volume", "Intro volume", sample=False)
+        self._check(f, "couch_sounds", "Sounds in couch mode (quiet: moving the selector, pressing into something, "
+                                       "clicking in the browser)")
+        self._volume(f, "couch_sounds_volume", "Sound volume", sample=True)
         self._check(f, "couch_steady_frames", "Steady frame rate (stops flicker on VRR / FreeSync / G-Sync screens)")
-        self._check(f, "couch_gpu", "Show couch mode through the graphics card (smoother at 4K — applies the next "
-                                    "time couch mode opens)")
+        self._check(f, "couch_gpu", "Without GPU acceleration: show couch mode's frames through the graphics card "
+                                    "(applies the next time couch mode opens)")
         self._check(f, "couch_controller_only", "Couch mode's Store: only games that work with a controller "
                                                 "(full or partial controller support on Steam)")
 
@@ -519,14 +558,15 @@ class SettingsPage(QWidget):
                            f"Downloaded executables are never run automatically.", "small", wrap=True))
 
     # ----------------------------------------------------------------- load
-    def load(self, s: dict) -> None:
+    def load(self, s: dict, info: bool = True) -> None:
+        """Show these values (``info``: also refresh the system / cache / backup lines, which ask the core)."""
         self._loading = True
         try:
             for key, w in self.widgets.items():
                 v = s.get(key)
                 if isinstance(w, QCheckBox):
                     w.setChecked(bool(v))
-                elif isinstance(w, QSpinBox):
+                elif isinstance(w, (QSpinBox, QSlider)):
                     w.setValue(int(v or 0))
                 elif isinstance(w, QLineEdit):
                     if not w.hasFocus():
@@ -539,7 +579,8 @@ class SettingsPage(QWidget):
                 b.setChecked(b.property("accent") == s.get("theme_accent"))
         finally:
             self._loading = False
-        self.refresh_info()
+        if info:
+            self.refresh_info()
 
     # ----------------------------------------------------------- app updates
     def _save_repo(self) -> None:

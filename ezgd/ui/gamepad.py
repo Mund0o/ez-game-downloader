@@ -40,7 +40,7 @@ BUTTONS = {BTN_SOUTH: "a", BTN_EAST: "b", BTN_NORTH: "x", BTN_WEST: "x", BTN_C: 
 EVENT = struct.Struct("llHHi")                      # struct input_event (64-bit: timeval, type, code, value)
 ABSINFO = struct.Struct("iiiiii")                   # value, minimum, maximum, fuzz, flat, resolution
 REPEAT_DELAY, REPEAT_EVERY, REPEAT_FAST, FAST_AFTER = 0.36, 0.11, 0.055, 1.4
-HOME_HOLD = 1.6                                     # seconds the guide button is held for "quit the game?"
+HOME_HOLD = 0.8                                     # seconds the guide button is held for the quick menu
 DUPLICATE_WINDOW = 0.25                             # the same press from two devices (Steam's virtual pad + the real):
 #                                                     Steam's copy can come late — even after the real button is up
 STEAM_VIRTUAL = (0x28DE, 0x11FF)                    # Steam Input's virtual pad (mirrors a real controller)
@@ -58,6 +58,16 @@ def family_of(vendor: int, product: int, name: str) -> str:
     if vendor == 0x057E or any(w in n for w in ("nintendo", "pro controller", "joy-con")):
         return "nintendo"
     return "generic"
+
+
+def steam_hardware(base: Path = Path("/sys/bus/hid/devices")) -> bool:
+    """Is a Valve controller connected (Steam Controller, Steam Deck)? While Steam runs it takes the controller over
+    and, outside games, turns it into keyboard and mouse input — couch mode then only sees keys, but the person is
+    holding a Steam controller and should see its buttons. (HID devices are named BUS:VENDOR:PRODUCT.N.)"""
+    try:
+        return any(":28DE:" in d.name.upper() for d in base.iterdir())
+    except OSError:
+        return False
 
 
 def _sys_id(sys_event_dir: Path) -> tuple[int, int]:
@@ -168,6 +178,7 @@ class Gamepads(QObject):
         self._home_timer.setInterval(int(HOME_HOLD * 1000))
         self._home_timer.timeout.connect(self.home_held.emit)
         self.family = ""                                 # "" until a controller is connected
+        self.steam_hw = False                            # a Valve controller is plugged in (see steam_hardware)
         self.pointer_mode = False                        # the left stick moves a pointer: no stick → directions
         self._repeat = QTimer(self)
         self._repeat.setInterval(int(REPEAT_EVERY * 1000))
@@ -223,6 +234,15 @@ class Gamepads(QObject):
 
     # ------------------------------------------------------------- devices
     def rescan(self) -> None:
+        steam_hw = steam_hardware()
+        if steam_hw != self.steam_hw:
+            self.steam_hw = steam_hw
+            log.info("Steam controller %s", "connected (Steam may hand it over as keyboard and mouse)" if steam_hw
+                     else "gone")
+            if steam_hw and not self.devices:
+                self._set_family("steam")
+            elif not steam_hw and self.family == "steam" and not self.devices:
+                self._set_family("")
         info = {path: (name, v, pr, k) for path, name, v, pr, k in gamepad_info()}
         found = {path: i[0] for path, i in info.items()}
         changed = False
@@ -255,7 +275,7 @@ class Gamepads(QObject):
                 real = [d for d in self.devices.values() if not d.virtual]
                 self._set_family(real[0].family if real else "steam")
             elif not self.devices:
-                self._set_family("")
+                self._set_family("steam" if self.steam_hw else "")
             self.devices_changed.emit(self.names())
 
     def _close(self, path: str) -> None:

@@ -127,9 +127,15 @@ class CouchBrowser:
         self.pointer = QPointF(r.center())
         self._last = time.monotonic()
         self._tick.start()
-        QTimer.singleShot(300, self.dlg, lambda: (self.wc.keep_above(True), self.wc.activate()))
+        QTimer.singleShot(300, self.dlg, lambda: (self.wc.keep_above(True), self.wc.activate()) if self.active
+                          else None)                      # (not after it closed again: it is a desktop window too)
         self._follower = _ResizeFollower(self)
         self.dlg.installEventFilter(self._follower)
+        self._clicker = _MouseClicks(self)
+        v = self.dlg.view
+        for w in ((v.focusProxy() or v) if v is not None else None, self.close_button):
+            if w is not None:
+                w.installEventFilter(self._clicker)
 
     def _place_close(self) -> None:
         b = getattr(self, "close_button", None)
@@ -154,6 +160,9 @@ class CouchBrowser:
         self.active = False
         self.held = False
         import shiboken6
+        clicker, self._clicker = getattr(self, "_clicker", None), None
+        if clicker is not None and shiboken6.isValid(clicker):
+            clicker.cb = None                                   # no more clicks heard from this window
         if shiboken6.isValid(self.dlg):                 # the window may already be gone (closed and disposed)
             self._tick.stop()
             self.overlay.hide()
@@ -241,6 +250,7 @@ class CouchBrowser:
             return
         if pressed and not self.held:
             self.held = True
+            self.couch.sounds.play("click")                  # the pointer's mouse button
             self._mouse(QEvent.MouseButtonPress, Qt.LeftButton, Qt.LeftButton)
             self.overlay.update()
         elif not pressed and self.held:
@@ -253,11 +263,21 @@ class CouchBrowser:
     def command(self, name: str) -> None:
         kb = self.overlay.keyboard
         if kb is not None:
+            before = (kb.row, kb.col)
             kb.command(name)
+            if name == "a" or name == "start":
+                self.couch.sounds.play("select")
+            elif (kb.row, kb.col) != before:
+                self.couch.sounds.play("move")
             self.overlay.update()
             return
         if self.menu is not None:
+            before = self.menu_focus
             self._menu_command(name)
+            if name == "a":
+                self.couch.sounds.play("select")
+            elif self.menu is not None and self.menu_focus != before:
+                self.couch.sounds.play("move")
             return
         if name == "a":
             return                                       # handled as press / release (button)
@@ -445,6 +465,20 @@ class CouchBrowser:
             p.setFont(self.couch._font(22 * s, 700))
             p.drawText(rr.adjusted(24 * s, 0, -24 * s, 0), Qt.AlignVCenter | Qt.AlignLeft, label)
             y += rh + 10 * s
+
+
+class _MouseClicks(QObject):
+    """A real mouse's clicks on the page (and the ✕ Close button) sound like the pointer's — in couch mode only."""
+
+    def __init__(self, cb):
+        super().__init__(cb.dlg)
+        self.cb = cb
+
+    def eventFilter(self, obj, ev) -> bool:                     # noqa: N802
+        cb = self.cb
+        if cb is not None and ev.type() == QEvent.MouseButtonPress and ev.spontaneous() and cb.active:
+            cb.couch.sounds.play("click")
+        return False
 
 
 class _ResizeFollower(QObject):

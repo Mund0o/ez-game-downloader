@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import (QBuffer, QByteArray, QEasingCurve, QIODevice, QObject, QPointF, QRect, QRectF, Qt,
@@ -35,7 +37,7 @@ from ezgd.ui import artwork, gcguard, theme
 from ezgd.ui.couch_intro import CouchIntro
 from ezgd.ui.couch_pages import GamePage, Keyboard, Page, SettingsPage, StorePage, WishlistPage
 from ezgd.ui.gamepad import Gamepads
-from ezgd.ui.window_control import WindowControl, real_scale
+from ezgd.ui.window_control import WindowControl, bring_game_forward, real_scale
 from ezgd.ui.widgets.common import ToastHost, relative_time
 
 log = logging.getLogger(__name__)
@@ -53,6 +55,12 @@ ROMAN = {"ii": "2", "iii": "3", "iv": "4", "v": "5", "vi": "6", "vii": "7", "vii
 def _numerals(key: str) -> str:
     """"hades ii" and "hades 2" are the same game."""
     return " ".join(ROMAN.get(w, w) for w in key.split())
+
+
+def clock_text(t: float | None = None) -> str:
+    """The time the way most people read it: 3:07 PM (not 15:07)."""
+    lt = time.localtime(t)
+    return f"{(lt.tm_hour % 12) or 12}:{lt.tm_min:02d} {'AM' if lt.tm_hour < 12 else 'PM'}"
 
 
 def playtime(seconds: int) -> str:
@@ -460,6 +468,9 @@ class _Couch:
         self._ctl_search: OrderedDict = OrderedDict() # the same, for titles that need Steam's search
         self._ctl_busy = self._ctl_searching = False
         self.running: set[int] = set(running)
+        self.suspended: set[int] = set()         # running games frozen from the quick menu (continue where they were)
+        self.quick = None                        # the quick menu (couch_quick.QuickMenu), made when first opened
+        self._last_game: int | None = None       # the game played most recently (what the quick menu is for)
         self.launched: set[int] = set()          # games started from couch mode (the ✕ closes these)
         self._launch_at: dict[int, float] = {}   # when each was started (monotonic)
         self.pending_kill: set[int] = set()      # left while these were still starting: the main window closes them
@@ -502,6 +513,7 @@ class _Couch:
         self._focus_rect: QRectF | None = None          # where the focused tile (and its glow) is drawn
         self._waiting: dict[str, QRectF] = {}           # picture url → the tile waiting for it
         self._move_tries: dict[str, int] = {}           # screen name → attempts to move there (see _fit_screen)
+        self._size_tries = 0                             # attempts to make a too-small "full screen" fill it
         self._bands: OrderedDict = OrderedDict()       # see _copy_tile
         self._shown: dict[tuple, tuple] = {}     # tile → the picture it showed last
         self._tab_fit: dict[tuple, tuple[float, bool]] = {}
@@ -533,6 +545,9 @@ class _Couch:
         self._poll.start()
 
         self.pages = {T_STORE: StorePage(self), T_WISHLIST: WishlistPage(self), T_SETTINGS: SettingsPage(self)}
+        from ezgd.ui.couch_sounds import CouchSounds
+        self.sounds = CouchSounds(self, lambda: bool(self.actions.settings.get("couch_sounds", True)),
+                                  lambda: int(self.actions.settings.get("couch_sounds_volume", 15)) / 100)
         self._known_pads: set[str] = set()
         self._opened = False
         self.intro: CouchIntro | None = None      # the intro video while it plays (couch_intro.py)
@@ -793,6 +808,8 @@ class _Couch:
             (e.setup or {}).get("state") not in ("pending", "installing", "waiting_steam")
 
     def state_text(self, e) -> str:
+        if e.id in self.suspended:
+            return "Suspended"
         if e.id in self.running:
             return "Playing now"
         if e.status.value == "extracting" or e.id in self.extraction:
@@ -813,7 +830,14 @@ class _Couch:
         gid = payload.get("id")
         if gid is None:
             return
+        if "suspended" in payload and payload.get("running"):    # frozen / continued (quick menu): no new start
+            (self.suspended.add if payload["suspended"] else self.suspended.discard)(gid)
+            if not payload["suspended"]:
+                self._last_game = gid
+            self.update()
+            return
         if payload.get("running"):
+            self._last_game = gid
             self.running.add(gid)
             if gid in self.launched:
                 # the splash stays (and stays on top) until the game's window takes the focus — then couch mode
@@ -825,6 +849,7 @@ class _Couch:
                 self._minimize_timer.start(12_000)
         else:
             self.running.discard(gid)
+            self.suspended.discard(gid)
             if gid in self.launched:
                 self._minimize_timer.stop()
                 played = int(payload.get("played") or 0)
@@ -867,7 +892,7 @@ class _Couch:
 
     def _step_aside(self) -> None:
         """A game started from couch mode is running: get out of its way (couch mode comes back when it ends)."""
-        if any(i in self.running for i in self.launched) and not self._exiting and not self.isMinimized():
+        if self._playing_here() and not self._exiting and not self.isMinimized():
             self._minimize_timer.stop()
             if self.overlay is not None and self.overlay.tag == "starting":
                 self.overlay = None
@@ -957,6 +982,7 @@ class _Couch:
     def open(self, screen=None) -> None:
         self._target_screen = screen or QApplication.primaryScreen()
         self._move_tries.clear()
+        self._size_tries = 0
         self.place_window(self, self.wc)
         screen = self.screen() or self._target_screen
         self.raise_()
@@ -969,12 +995,14 @@ class _Couch:
             screen.geometryChanged.connect(lambda _g: self._fit_screen())
         self._set_pace(screen)
         QTimer.singleShot(250, self, self._fit_screen)    # the window manager has placed it: check it fills it
-        QTimer.singleShot(300, self, lambda: (self.wc.keep_above(True), self.wc.activate()))
+        QTimer.singleShot(300, self, lambda: (self.wc.keep_above(True), self.wc.activate()) if not self._exiting
+                          else None)
         first = not self._opened
         self._opened = True
         st = self.actions.settings
         if first and st.get("couch_intro", True):
-            intro = CouchIntro(self, sound=bool(st.get("couch_intro_sound", True)))
+            intro = CouchIntro(self, sound=bool(st.get("couch_intro_sound", True)),
+                               volume=int(st.get("couch_intro_volume", 17)) / 100)
             if intro.start():
                 self.intro = intro
                 intro.finished.connect(self._intro_over)
@@ -1098,10 +1126,25 @@ class _Couch:
             self._move_tries[target.name()] = tries + 1
             moved = tries < 2
         if mode == "fullscreen":
+            g = on.geometry() if on is not None else None
+            short = g is not None and (self.width() < g.width() * 0.92 or self.height() < g.height() * 0.92)
             if moved or not self.isFullScreen():
                 log.info("couch mode: %s; asking for full screen again", "on the wrong screen" if moved else
                          "not full screen")
                 self.place_window(self, self.wc)
+            elif short and self._size_tries < 2:
+                # "full screen", but the window kept its old size (seen on a friend's PC: couch mode came up the
+                # size of the desktop window) — make it fill the monitor
+                self._size_tries += 1
+                log.warning("couch mode: full screen but only %dx%d of %dx%d — making it fill the screen",
+                            self.width(), self.height(), g.width(), g.height())
+                if self.wc.kwin:
+                    self.wc.force_fullscreen(on.name())
+                else:
+                    self.showNormal()
+                    self.setGeometry(g)
+                    self.showFullScreen()
+                QTimer.singleShot(500, self, self._fit_screen)
         elif self.isFullScreen() or moved:
             self.place_window(self, self.wc)
         self._dirty = True
@@ -1113,6 +1156,7 @@ class _Couch:
         screen can never leave anyone stuck."""
         self.reduce_motion = bool(self.actions.settings.get("reduce_motion"))
         self._move_tries.clear()
+        self._size_tries = 0
         self.place_window(self, self.wc)
         self._set_pace(self.screen())
         QTimer.singleShot(400, self, self._fit_screen)
@@ -1239,7 +1283,8 @@ class _Couch:
                  "wait before painting p50 %.1f / p90 %.1f ms; stalls over 50 ms: %d (worst %.0f ms); window %dx%d at "
                  "%.2f; memory peak %d MB",
                  type(self.current_page()).__name__ if self.current_page() else TABS[self.tab],
-                 "GPU" if getattr(self, "gpu", False) else "CPU", len(ps), m["partial"], pick(0.5), pick(0.9), ps[-1],
+                 "GPU-drawn" if self.gpu_paint else "GPU" if getattr(self, "gpu", False) else "CPU", len(ps),
+                 m["partial"], pick(0.5), pick(0.9), ps[-1],
                  dpick(0.5), dpick(0.9), len(m["stalls"]), max(m["stalls"] or [0]), self.width(), self.height(),
                  self.devicePixelRatioF(), rss)
         self._meter = {"paints": [], "partial": 0, "stalls": [], "delays": [], "asked": 0.0, "last_tick": now,
@@ -1259,8 +1304,8 @@ class _Couch:
         self._known_pads = set(names)
         if new and self._opened:
             self.toasts.show("Controller connected", ", ".join(new), "success")
-        elif self.pad_family:
-            self.pad_family = ""
+        elif self.pad_family != self.pads.family:
+            self.pad_family = self.pads.family            # (a Steam controller's keys keep its buttons)
             self.update()
 
     def _family_changed(self, family: str) -> None:
@@ -1282,6 +1327,9 @@ class _Couch:
             self.browser.button(name, pressed)
 
     def _pad(self, name: str) -> None:
+        if self.quick is not None and self.quick.isVisible():
+            self.quick.command(name)                      # the quick menu is over the game
+            return
         if self.browser is not None and self.browser.active:
             try:
                 self.browser.command(name)                # the browser has the screen: the controller drives it
@@ -1326,9 +1374,24 @@ class _Couch:
             self._step_aside()                          # the game has the focus now: make room right away
         elif self.isVisible() and not self.isMinimized():
             self._idle_away.start()                     # tabbed out by the user (or a window they opened)
+            if not self._away and not (self.browser is not None and self.browser.active) and \
+                    not (self.quick is not None and self.quick.isVisible()):
+                QTimer.singleShot(400, self, self._check_big_picture)
+
+    def _check_big_picture(self) -> None:
+        """The Steam button opened Steam's Big Picture over couch mode: close it and come back (see steam_bpm)."""
+        if self._exiting or self.isActiveWindow() or self._launching or self._playing_here() or self._away:
+            return
+        from ezgd.ui import steam_bpm
+        if not steam_bpm.big_picture_in_front():
+            return
+        if steam_bpm.close_big_picture():
+            self._switch_tab(T_HOME, force=True)        # the Steam button means "Home" in couch mode
+            self._idle_away.stop()
+            QTimer.singleShot(700, self, self._come_back)
 
     def _playing_here(self) -> bool:
-        return any(i in self.running for i in self.launched)
+        return any(i in self.running and i not in self.suspended for i in self.launched)
 
     def _take_focus_back(self) -> None:
         if self._launching and not self._exiting and not self.isActiveWindow() and not self._playing_here():
@@ -1360,14 +1423,27 @@ class _Couch:
             nav = {Qt.Key_Up: "up", Qt.Key_Down: "down", Qt.Key_Left: "left", Qt.Key_Right: "right"}.get(k)
             try:
                 if nav:
+                    before = self._focus_key()
                     self.keyboard.command(nav)
+                    self._sound(nav, before)
+                elif k in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Escape) and self._keys_from_a_pad():
+                    # a controller that sends keys (Steam hands its controllers over as keyboard + mouse): Enter is
+                    # its A — press the key in focus — and Esc its B; Enter used to search at once with an empty
+                    # box and Esc to close it, so not one letter could be typed
+                    if k == Qt.Key_Escape:
+                        self.keyboard.command("b")
+                    else:
+                        self.sounds.play("select")
+                        self.keyboard.command("a")
                 elif k in (Qt.Key_Return, Qt.Key_Enter):
+                    self.sounds.play("select")
                     self.keyboard.done()
                 elif k == Qt.Key_Escape:
                     self.keyboard.cancel()
                 elif k == Qt.Key_Backspace:
                     self.keyboard.text = self.keyboard.text[:-1]
                 elif e.text() and e.text().isprintable():
+                    self.keyboard.typed = True                # letters from a real keyboard
                     self.keyboard.type(e.text())
             except Exception:
                 log.exception("couch mode: typing failed")
@@ -1379,8 +1455,10 @@ class _Couch:
                 Qt.Key_PageDown: "rt", Qt.Key_Tab: "rb", Qt.Key_Backtab: "lb", Qt.Key_Home: "home",
                 Qt.Key_Slash: "select"}.get(k)
         if name is not None and k not in (Qt.Key_Escape, Qt.Key_Backspace, Qt.Key_Return, Qt.Key_Enter) and \
-                self.pad_family:
+                self.pad_family and not self.pads.steam_hw:
             self.pad_family = ""                  # typing on the keyboard: show keyboard keys
+        elif name is not None and self.pads.steam_hw and self.pad_family != "steam" and not self.pads.devices:
+            self.pad_family = "steam"             # Steam turns its controller into keys outside games
         if name is None:
             page = self.current_page()
             text = e.text()
@@ -1400,11 +1478,39 @@ class _Couch:
         gcguard.defer()                        # no slow garbage collection in the middle of moving around
         if self._skip_intro():
             return
+        before = self._focus_key()
         try:
             self._command(name)
         except Exception:
             log.exception("couch mode: handling %s failed", name)
+        self._sound(name, before)
         self.update()
+
+    MOVES = ("up", "down", "left", "right", "lb", "rb", "lt", "rt", "start", "home")
+
+    def _keys_from_a_pad(self) -> bool:
+        """Do the keys reaching the on-screen keyboard come from a controller? (A Steam controller is connected, or
+        nothing has been typed on a real keyboard into it.)"""
+        return bool(self.pads.steam_hw) or not getattr(self.keyboard, "typed", False)
+    _FOCUS_ATTRS = ("focus", "row", "col", "chip", "gi", "shelf", "filter")
+
+    def _focus_key(self) -> tuple:
+        """Where the selector is (to hear it move only when it really moved)."""
+        key = [self.tab, self.zone, self.top_index, self.button_index, tuple(self.index.values()), len(self.stack)]
+        for obj in (self.current_page(), self.keyboard, self.overlay):
+            if obj is None:
+                key.append(None)
+                continue
+            d = vars(obj)
+            key.append((id(obj),) + tuple(d.get(a) for a in self._FOCUS_ATTRS if isinstance(d.get(a), (int, str))))
+        return tuple(key)
+
+    def _sound(self, name: str, before: tuple) -> None:
+        """A blip when pressing into something, a tick when the selector moved."""
+        if name == "a":
+            self.sounds.play("select")
+        elif name in self.MOVES and self._focus_key() != before:
+            self.sounds.play("move")
 
     def current_page(self) -> Page | None:
         """The page that has the screen: an opened game page, or the Store / Wishlist / Settings tab."""
@@ -1567,6 +1673,28 @@ class _Couch:
         self.refresh_bg()
         self.update()
 
+    def open_setup(self, e) -> None:
+        """A game that is not ready yet: "Finish setup" — every step to Play, ticked off as it happens."""
+        from ezgd.ui.couch_pages import GameSetupPage
+        if self.stack and isinstance(self.stack[-1], GameSetupPage) and self.stack[-1].id == e.id:
+            return
+        page = GameSetupPage(self, e)
+        self.stack.append(page)
+        self.zone = "main"
+        page.activate()
+        self.refresh_bg()
+        self.update()
+
+    def open_game_settings(self, e) -> None:
+        """A game's start settings (Manage → Game settings, or the quick menu while it runs)."""
+        from ezgd.ui.couch_pages import GameSettingsPage
+        page = GameSettingsPage(self, e)
+        self.stack.append(page)
+        self.zone = "main"
+        page.activate()
+        self.refresh_bg()
+        self.update()
+
     def pop_page(self) -> None:
         if self.stack:
             self.stack.pop()
@@ -1585,6 +1713,14 @@ class _Couch:
     def mouseMoveEvent(self, e) -> None:                      # noqa: N802
         if self.cursor().shape() == Qt.BlankCursor:
             self.setCursor(Qt.ArrowCursor)
+        before = self._focus_key()
+        try:
+            self._hover(e)
+        finally:
+            if self._focus_key() != before:
+                self.sounds.play("move")               # the mouse moved the selector too
+
+    def _hover(self, e) -> None:
         h = self._hit_at(e.position())
         if self.keyboard is not None:
             if h and h[0] == "key":
@@ -1617,6 +1753,8 @@ class _Couch:
         if e.button() != Qt.LeftButton:
             return
         h = self._hit_at(e.position())
+        if h:
+            self.sounds.play("select")                 # a click into something
         if h and h[0] == "x":
             self.keyboard = None
             self.request_exit()
@@ -1838,16 +1976,16 @@ class _Couch:
         e = self._focused_entry()
         if e is None:
             return []
+        if e.id in self.suspended:
+            return [("▶  RESUME", lambda e=e: self.go_to_game(e), "play"), ("■  QUIT", lambda e=e: self.ask_stop(e),
+                                                                            "stop"), ("MANAGE", self._details, "ghost")]
         if e.id in self.running:
-            first = ("■  STOP", lambda e=e: self.ask_stop(e), "stop")
+            return [("▶  BACK TO GAME", lambda e=e: self.go_to_game(e), "play"),
+                    ("■  STOP", lambda e=e: self.ask_stop(e), "stop"), ("MANAGE", self._details, "ghost")]
         elif self.ready(e):
             first = ("▶  PLAY", lambda e=e: self.play(e), "play")
         else:
-            act = self._next_step(e)
-            if act is not None:
-                first = (act[0].upper(), act[1], "primary")
-            else:
-                first = ("ⓘ  " + self.state_text(e).upper(), lambda e=e: self.explain(e), "muted")
+            first = ("FINISH SETUP", lambda e=e: self.open_setup(e), "primary")     # every step, one button
         return [first, ("MANAGE", self._details, "ghost")]
 
     def _next_step(self, e) -> tuple[str, Callable[[], None]] | None:
@@ -1867,15 +2005,11 @@ class _Couch:
 
     def primary(self, e) -> None:
         if e.id in self.running:
-            self.ask_stop(e)
+            self.go_to_game(e)                         # (quit: STOP, Manage, or the quick menu)
         elif self.ready(e):
             self.play(e)
         else:
-            step = self._next_step(e)
-            if step is not None:
-                step[1]()
-            else:
-                self.explain(e)
+            self.open_setup(e)                         # the checklist to Play, one button for the next step
 
     def explain(self, e) -> None:
         st = self.state_text(e)
@@ -1894,7 +2028,7 @@ class _Couch:
 
     def _starting_text(self) -> str:
         guide = PAD_LABELS.get(self.pad_family or "generic", PAD_LABELS["generic"])["home"]
-        hold = f" To quit it, hold {guide} on the controller." if self.pads.names() else ""
+        hold = f" Hold {guide} on the controller for the quick menu." if self.pads.names() else ""
         return "The game opens in a moment." + hold
 
     def play(self, e) -> None:
@@ -1990,9 +2124,9 @@ class _Couch:
             rows.append(("■  Stop the game", lambda e=e: self.ask_stop(e), "danger", ""))
         elif self.ready(e):
             rows.append(("▶  Play", lambda e=e: (self._close_overlay(), self.play(e)), "play", ""))
-        step = self._next_step(e)
-        if step is not None and e.id not in self.running:
-            rows.append((step[0], lambda f=step[1]: (self._close_overlay(), f()), "primary", ""))
+        if not self.ready(e) and e.id not in self.running:
+            rows.append(("Finish setup", lambda e=e: (self._close_overlay(), self.open_setup(e)), "primary",
+                         "Every step to Play, one button at a time"))
         if e.id not in self.running:
             if rel.get("updating"):
                 rows.append(("Continue the update", lambda e=e: self.update_game(e), "primary",
@@ -2006,19 +2140,44 @@ class _Couch:
                              "Which program Play starts"))
             rows.append(("Fix problems", lambda e=e: self.fix_game(e), "ghost",
                          "Finds out why it does not start and repairs it (may test-start the game)"))
+        rows.append(("Game settings", lambda e=e: (self._close_overlay(), self.open_game_settings(e)), "ghost",
+                     "Proton version, FPS limit, MangoHud, GameMode, launch options, every fix"))
+        if e.executable and e.id not in self.running:
+            rows.append(("See what's wrong", lambda e=e: self.diagnose_list(e), "ghost",
+                         "Every finding of the debugging assistant, each with its fix"))
         rows.append(("☆  Remove from favourites" if e.favorite else "★  Add to favourites",
                      lambda e=e: self._organize(e, favorite=not e.favorite), "ghost", "Favourites come first"))
         order = dict(self.LIBRARY_SORTS).get(self.actions.settings.get("couch_library_sort") or "title", "")
         rows.append((f"Library order: {order}", lambda: (self._close_overlay(), self._cycle_library_sort()), "ghost",
                      "A changes it"))
+        rows.append(("Collections…", lambda e=e: self._collections(e), "ghost",
+                     ", ".join(e.collections) if e.collections else "Group games your way"))
+        rows.append(("Rename…", lambda e=e: self._rename(e), "ghost", ""))
         rows.append(("Back up saves now", lambda e=e: self._backup(e), "ghost", ""))
         rows.append(("Restore saves…", lambda e=e: self.restore_saves(e), "ghost", "Put an earlier backup back"))
         if e.game_id:
             rows.append(("Open the game's page", lambda e=e: self._open_entry_page(e), "ghost",
                          "Download options, other sites"))
+        if e.game_id:
+            rows.append(("Check for an update", lambda e=e: self._check_update_of(e), "ghost",
+                         "Reads the game's page again"))
+        if (e.setup or {}).get("state"):
+            rows.append(("Check the repack's files", lambda e=e: self._verify_repack(e), "ghost",
+                         "Compares them with the repack's checksums"))
+        if e.executable:
+            rows.append(("Add to Steam as a non-Steam game", lambda e=e: self._add_to_steam(e), "ghost",
+                         "Shows up in Steam's library (Steam picks it up after a restart)"))
+            if not e.executable.lower().endswith((".exe", ".bat", ".msi")) and not os.access(e.executable, os.X_OK):
+                rows.append(("Allow running this file", lambda e=e: self._allow_exec(e), "ghost",
+                             "A Linux program without permission to run"))
+        if e.status.value in ("downloaded", "extracted"):
+            rows.append(("Mark as installed", lambda e=e: self._mark_installed(e), "ghost",
+                         "The files are already where they belong"))
         if e.id not in self.running:
             rows.append(("Hide from the Library", lambda e=e: self._organize(e, hidden=True), "ghost",
                          "Out of sight here and on the desktop until shown again"))
+            rows.append(("Remove from the Library…", lambda e=e: self._remove_keep_files(e), "ghost",
+                         "Keeps the game's files on disk"))
             rows.append(("Uninstall…", lambda e=e: self.uninstall(e), "danger", ""))
         rows.append(("Close", self._close_overlay, "ghost", ""))
         self.menu(e.title, rows, lines=lines)
@@ -2073,9 +2232,163 @@ class _Couch:
         if e.id in self.running:
             self.message("Quit the game first", "Saves cannot be restored while the game is running.")
             return
+        def delete() -> None:
+            self.bridge.call(self.bridge.core.library_call("delete_save_backup", e.id, b["path"]),
+                             lambda _r: (self._close_overlay(), self.toasts.show("Backup deleted", e.title)),
+                             lambda err: self.message("Could not delete the backup", str(err)), owner=self)
         self.show_overlay("Restore these saves?", f"{b['reason_text']}, {relative_time(b['created'])}: "
                           f"{b['files']} file(s). Your current saves are backed up first.",
-                          [("Restore", go, "primary"), ("Cancel", self._close_overlay, "ghost")])
+                          [("Restore", go, "primary"), ("Delete this backup", delete, "danger"),
+                           ("Cancel", self._close_overlay, "ghost")], focus=0)
+
+    # ------------------------------------------------------- everything the desktop's Library can do
+    def diagnose_list(self, e) -> None:
+        """The debugging assistant's findings (the desktop's Diagnose), strongest first, each with its fix."""
+        self.busy("Looking at the game…", "Its files, setup and logs — a few seconds.")
+
+        def got(d: dict) -> None:
+            fs = sorted(d.get("findings") or [], key=lambda f: -f.get("confidence", 0))
+            if not fs:
+                self.message("Nothing wrong found", d.get("summary") or "The files, the setup and the logs look "
+                                                                        "fine. Fix problems can test-start the game.")
+                return
+            rows = []
+            for f in fs[:14]:
+                c = f.get("confidence", 0)
+                how = "Very likely" if c >= 0.85 else "Likely" if c >= 0.6 else "Possible" if c >= 0.35 else "Unsure"
+                fix = f.get("fix")
+                note = f"{how} · {fix['label']}" if fix else f"{how} · " + ("no setting fixes this" if not
+                                                                             f.get("fixable", True) else "details")
+                rows.append((f["title"], lambda f=f: self._finding(e, f), "primary" if fix and c >= 0.6 else "ghost",
+                             note))
+            rows.append(("Fix problems for me", lambda: (self._close_overlay(), self.fix_game(e)), "ghost",
+                         "Repairs what is certain and test-starts the game"))
+            rows.append(("Close", self._close_overlay, "ghost", ""))
+            self.menu(f"What's wrong with {e.title}", rows, text=d.get("summary") or "")
+        self.bridge.call(self.bridge.core.diagnose_game(e.id), got,
+                         lambda err: self.message("Could not look at the game", str(err)), owner=self)
+
+    def _finding(self, e, f: dict) -> None:
+        fix = f.get("fix")
+        lines = [("Seen", ev) for ev in (f.get("evidence") or [])[:3]]
+        buttons = []
+        if fix and fix.get("kind") != "command":
+            def apply() -> None:
+                self.busy("Applying the fix…", fix["label"])
+                self.bridge.call(self.bridge.core.apply_fix(e.id, fix["kind"], fix["value"]),
+                                 lambda msg: (self._close_overlay(), self.toasts.show("Fix applied", str(msg or
+                                                                                         fix["label"]), "success")),
+                                 lambda err: self.message("Could not apply the fix", str(err)), owner=self)
+            buttons.append((fix["label"], apply, "primary"))
+        buttons.append(("Back", lambda: self.diagnose_list(e), "ghost"))
+        self.show_overlay(f["title"], f.get("explanation") or "", buttons, lines=lines)
+
+    def _collections(self, e) -> None:
+        def got(names: list) -> None:
+            mine = list(e.collections)
+            rows = []
+            for n in sorted(set(names) | set(mine), key=str.casefold):
+                on = n in mine
+                rows.append((("✓  " if on else "     ") + n, lambda n=n, on=on: self._set_collections(
+                    e, [x for x in mine if x != n] if on else mine + [n]), "ghost", "In it" if on else ""))
+            rows.append(("New collection…", lambda: self._new_collection(e), "primary", ""))
+            rows.append(("Close", self._close_overlay, "ghost", ""))
+            self.menu(f"Collections — {e.title}", rows, text="A puts the game in or takes it out.")
+        self.bridge.call(self.bridge.core.library_call("collections"), got,
+                         lambda err: self.message("Could not list the collections", str(err)), owner=self)
+
+    def _set_collections(self, e, names: list[str]) -> None:
+        def done(new) -> None:
+            e.organize = new.organize
+            self._collections(e)
+        self.bridge.call(self.bridge.core.library_call("organize", e.id, collections=names), done,
+                         lambda err: self.message("Could not change that", str(err)), owner=self)
+
+    def _new_collection(self, e) -> None:
+        self._close_overlay()
+        self.keyboard = Keyboard(self, "New collection", lambda name: self._set_collections(e, e.collections + [name])
+                                 if name else None, done_label="Add", limit=40)
+
+    def _rename(self, e) -> None:
+        def done(name: str) -> None:
+            if name and name != e.title:
+                self.bridge.call(self.bridge.core.library_call("update", e.id, title=name),
+                                 lambda _r: self.toasts.show("Renamed", name, "success"),
+                                 lambda err: self.message("Could not rename", str(err)), owner=self)
+        self._close_overlay()
+        self.keyboard = Keyboard(self, f"Rename {e.title}", done, text=e.title, done_label="Save", symbols=True,
+                                 limit=120)
+
+    def _check_update_of(self, e) -> None:
+        self.busy("Checking for an update…", e.title)
+
+        def show(e2, res: list) -> None:
+            rel = e2.release or {}
+            err = next((r.get("error") for r in res or [] if r.get("error")), None)
+            if rel.get("status") == "update" and rel.get("latest"):
+                self.message("An update is available", f"{e.title}: {rel['latest']} (you have "
+                             f"{rel.get('version') or 'an older version'}). Manage → Update installs it — saves are "
+                             "backed up first.")
+            elif err:
+                self.message("Could not check", err)
+            else:
+                self.message("No update", f"{e.title} is the newest version the site has.")
+        self.bridge.call(self.bridge.core.check_game_updates(e.id, True),
+                         lambda res: self.bridge.call(self.bridge.core.library_call("get", e.id),
+                                                      lambda e2: show(e2, res), owner=self),
+                         lambda err: self.message("Could not check", str(err)), owner=self)
+
+    def _verify_repack(self, e) -> None:
+        self.busy("Checking the repack's files…", "This reads every file — a minute for a big game.")
+
+        def got(r: dict) -> None:
+            if not r.get("available"):
+                self.message("Nothing to check against", "This repack has no checksum list (MD5) to compare with.")
+                return
+            bad = (r.get("bad") or []) + (r.get("missing") or [])
+            if not bad:
+                self.message("The repack's files are fine", f"All {r.get('checked', 0)} files match.")
+            else:
+                self.message("Some files are damaged or missing", f"{len(bad)} file(s), e.g. {bad[0]} — download "
+                                                                     "the game again (or just those parts).")
+        self.bridge.call(self.bridge.core.library_call("verify_repack", e.id), got,
+                         lambda err: self.message("Could not check the files", str(err)), owner=self)
+
+    def _add_to_steam(self, e) -> None:
+        def go() -> None:
+            self.busy("Adding it to Steam…", e.title)
+            self.bridge.call(self.bridge.core.library_call("add_to_steam", e.id),
+                             lambda _r: self.message("Added to Steam", f"{e.title} shows up in Steam's library after "
+                                                                       "Steam restarts."),
+                             lambda err: self.message("Could not add it to Steam", str(err)), owner=self)
+        self.show_overlay(f"Add {e.title} to Steam?", "It becomes a non-Steam game in your Steam library, started "
+                          "through this app.", [("Add to Steam", go, "primary"), ("Cancel", self._close_overlay,
+                                                                                   "ghost")])
+
+    def _allow_exec(self, e) -> None:
+        def go() -> None:
+            self.bridge.call(self.bridge.core.library_call("allow_execute", e.id),
+                             lambda _r: (self._close_overlay(), self.toasts.show("The file may run now", e.title,
+                                                                                 "success")),
+                             lambda err: self.message("Could not change that", str(err)), owner=self)
+        self.show_overlay("Allow this file to run?", f"{Path(e.executable).name} has no permission to run. Only "
+                          "allow it for games you trust.", [("Allow", go, "primary"),
+                                                            ("Cancel", self._close_overlay, "ghost")])
+
+    def _mark_installed(self, e) -> None:
+        self.bridge.call(self.bridge.core.library_call("mark_installed", e.id),
+                         lambda _r: (self._close_overlay(), self.open_setup(e)),
+                         lambda err: self.message("Could not change that", str(err)), owner=self)
+
+    def _remove_keep_files(self, e) -> None:
+        def go() -> None:
+            self.bridge.call(self.bridge.core.library_call("remove", e.id, False),
+                             lambda _r: (self._close_overlay(), self.toasts.show("Removed from the Library",
+                                                                                 "Its files are still on disk.")),
+                             lambda err: self.message("Could not remove it", str(err)), owner=self)
+        self.show_overlay(f"Remove {e.title} from the Library?", "Only the Library entry goes — the game's files, "
+                          "its prefix and saves stay on disk.", [("Remove", go, "danger"),
+                                                                 ("Cancel", self._close_overlay, "ghost")], focus=1)
 
     def choose_executable(self, e) -> None:
         self.busy("Looking for the game's programs…", e.title)
@@ -2222,14 +2535,27 @@ class _Couch:
             return
 
         def go() -> None:
+            stop = lambda: self._stop_fix(e)                                              # noqa: E731
             self.overlay = Overlay(f"Fixing {e.title}…", "Looking at the files, the setup and the logs.", busy=True,
-                                   tag=f"fixing:{e.id}", progress=0.0)
+                                   tag=f"fixing:{e.id}", progress=0.0, cancel=stop,
+                                   buttons=[("■  Stop testing", stop, "ghost")])
             self.update()
             self.bridge.call(self.bridge.core.fix_my_game(e.id, "", True), lambda v: self._fixed(e, v),
                              lambda err: self.message("Could not check the game", str(err)), owner=self)
         self.show_overlay(f"Fix {e.title}?", "The app checks the game and repairs what it is sure about. It may start "
                           "the game for a short test.", [("Fix problems", go, "primary"),
                                                          ("Cancel", self._close_overlay, "ghost")])
+
+    def _stop_fix(self, e) -> None:
+        """B / "Stop testing" while Fix my game runs: the test start is ended (the game closed) and the answer so far
+        comes back — the same as Cancel in the desktop's Diagnose."""
+        o = self.overlay
+        if o is None or o.tag != f"fixing:{e.id}" or not o.buttons:
+            return
+        o.text = "Stopping the test — the game is closed…"
+        o.buttons = []
+        self.bridge.call(self.bridge.core.cancel_trials(), lambda _r: None, lambda _err: None, owner=self)
+        self.update()
 
     def _fixed(self, e, v: dict) -> None:
         applied = v.get("applied") or []
@@ -2410,6 +2736,8 @@ class _Couch:
         if o.busy:
             if name == "b" and o.cancel is not None and o.tag == "starting":
                 o.cancel()
+            elif name in ("a", "b") and o.cancel is not None and o.tag.startswith("fixing:") and o.buttons:
+                o.cancel()                               # ends the test start
             return
         n = len(o.buttons)
         if o.menu:
@@ -2460,29 +2788,56 @@ class _Couch:
             self.update()
 
     def _home_held(self) -> None:
-        """The PS / Xbox / Steam button held while playing a game started here: couch mode comes to the front and
-        asks to quit it (the same complete stop as the ✕). Games started from the desktop are never touched, and
-        without a game this does nothing — couch mode is never steered while you play otherwise."""
+        """The PS / Xbox / Steam button held: the quick menu over the game (back to it, switch games with the
+        current one suspended, couch mode, volume, settings, quit). Only for games this app runs — directly or
+        through Steam for its overlay; a game started in Steam itself is not in ``running`` and gets nothing."""
         if self._exiting or (self.overlay is not None and self.overlay.tag in ("closing", "quit-game")):
             return
-        ids = sorted(i for i in self.launched if i in self.running)
-        if not ids:
+        if self.quick is not None and self.quick.isVisible():
+            self.quick.command("b")                   # held again: back to the game
             return
-        names = ", ".join(e.title for e in self.entries if e.id in ids) or "the game"
-        log.info("couch mode: guide button held — asking to quit %s", names)
+        playing = [i for i in self.running if i not in self.suspended]
+        if not playing and not self.suspended:
+            return                                    # no game of ours: couch mode is never steered otherwise
+        if not playing and self.isActiveWindow():
+            return                                    # in couch mode with only suspended games: they are right here
+        current = self._last_game if self._last_game in playing else (playing[-1] if playing else None)
+        game = next((e for e in self.entries if e.id == current), None)
         self.keyboard = None
-        self._come_back()
-        self.overlay = Overlay(f"Quit {names}?", "Progress the game has not saved is lost.",
-                               [("Quit game", lambda ids=ids: self._stop(ids, then_exit=False), "danger"),
-                                ("Keep playing", self._back_to_game, "ghost")],
-                               focus=1, cancel=self._back_to_game, tag="quit-game")
-        self.update()
+        if current is not None and game is None:          # started a moment ago: not in couch mode's list yet
+            self.bridge.call(self.bridge.core.library_call("get", current), self.open_quick, lambda _err: None,
+                             owner=self)
+            return
+        self.open_quick(game)
 
-    def _back_to_game(self) -> None:
-        self.overlay = None
-        self.update()
-        if any(i in self.running for i in self.launched):
-            self._step_aside()                         # the game gets the screen back
+    def open_quick(self, game) -> None:
+        if self._exiting:
+            return
+        log.info("couch mode: guide button held — quick menu for %s", game.title if game else "suspended games")
+        from ezgd.ui.couch_quick import QuickMenu
+        if self.quick is None:
+            self.quick = QuickMenu(self)
+        self.quick.open_for(game)
+
+    def go_to_game(self, e) -> None:
+        """Give the screen to a running game (continuing it first when it is suspended): couch mode steps aside and
+        the game's window comes to the front."""
+        self._last_game = e.id
+
+        def front(_r=None) -> None:
+            self.suspended.discard(e.id)
+            if not self._exiting:
+                self.overlay = None
+                self._minimize_timer.stop()
+                self.wc.keep_above(False)
+                self.showMinimized()
+            self.bridge.call(self.bridge.core.library_call("game_processes", e.id),
+                             lambda pids: bring_game_forward(pids), lambda _err: None, owner=self)
+        if e.id in self.suspended:
+            self.bridge.call(self.bridge.core.library_call("resume", e.id), front,
+                             lambda err: self.message("Could not continue the game", str(err)), owner=self)
+        else:
+            front()
 
     def _starting_ids(self) -> set[int]:
         """Games started from couch mode a moment ago that are not running yet (Steam can take a while)."""
@@ -2571,6 +2926,13 @@ class _Couch:
         self.close()
 
     def _shutdown(self) -> None:
+        self.sounds.stop()
+        if self.quick is not None:
+            self.quick.hide()
+            self.quick.deleteLater()
+            self.quick = None
+        if self.suspended:                               # leaving couch mode: nothing may stay frozen unseen
+            self.bridge.call(self.bridge.core.library_call("resume_all"), lambda _r: None, lambda _e: None)
         if self.browser is not None and self.browser.active:
             browser, self.browser = self.browser, None
             browser.active = False                       # leaving couch mode closes its browser too
@@ -2662,9 +3024,14 @@ class _Couch:
             self._tick.stop()
 
     # ============================================================== painting
+    MIN_DESIGN_H = 600                    # the layouts need at least this many design units of height (1080 = 100 %)
+
     def _s(self) -> float:
+        """Couch mode's scale: 1.0 draws the 1080-unit design on a 1080-pixel-high window. The interface size
+        setting multiplies it — up to what still fits the screen (200 % on a 1440-high window: about 180 %)."""
         scale = int(self.actions.settings.get("couch_ui_scale") or 100) / 100
-        return max(0.4, min(3.0, max(0.55, min(2.2, self.height() / 1080)) * scale))
+        s = max(0.55, min(2.2, self.height() / 1080)) * scale
+        return max(0.4, min(3.0, s, max(1.0, self.height() / self.MIN_DESIGN_H)))
 
     def _font(self, px: float, weight: int = 400) -> QFont:
         key = (max(9, int(px)), weight)
@@ -2683,13 +3050,16 @@ class _Couch:
         else:
             QWidget.update(self, area)
 
-    def _render(self, rect: QRect) -> None:
-        """One frame (``rect``: the part that changed; everything else on screen stays as it is)."""
+    def _render(self, rect: QRect, device=None) -> None:
+        """One frame (``rect``: the part that changed; everything else on screen stays as it is). ``device``: where
+        to draw (this window when None)."""
         if rect.width() <= 1 and rect.height() <= 1 and not self._dirty:
             return                                      # the frame pump's keep-alive: the picture stays as it is
         t0 = time.perf_counter()
-        p = QPainter(self)
+        p = QPainter(device if device is not None else self)
         try:
+            if self.gpu_paint and rect != self.rect():
+                p.setClipRect(rect)                     # (Qt clips a widget's paint event itself; OpenGL does not)
             p.setRenderHint(QPainter.Antialiasing)
             p.setRenderHint(QPainter.SmoothPixmapTransform)
             p.setRenderHint(QPainter.TextAntialiasing)
@@ -2798,7 +3168,7 @@ class _Couch:
         hot = (self.zone == "top" and self.top_index == X_INDEX and idle) or \
             r.contains(QPointF(self.mapFromGlobal(self.cursor().pos())))
         key = ("top", W, round(s, 3), self.tab, self.top_index if self.zone == "top" and idle else -1,
-               time.strftime("%H:%M"), self._top_status(), hot, theme.CURRENT.accent, theme.CURRENT.danger)
+               clock_text(), self._top_status(), hot, theme.CURRENT.accent, theme.CURRENT.danger)
         self.blit(p, 0, 0, key, W, 124 * s, lambda q: self._draw_top(q, hot))
 
     def _draw_top(self, p: QPainter, hot: bool) -> None:
@@ -2817,7 +3187,7 @@ class _Couch:
         p.drawText(QRectF(x, 0, 400 * s, h), Qt.AlignVCenter | Qt.AlignLeft, "GAMES")
         x += QFontMetrics(p.font()).horizontalAdvance("GAMES") + 56 * s
         right = W - 120 * s
-        clock = time.strftime("%H:%M")
+        clock = clock_text()
         p.setFont(self._font(22 * s, 600))
         cw = QFontMetrics(p.font()).horizontalAdvance(clock)
         status = self._top_status()
@@ -3009,9 +3379,10 @@ class _Couch:
         elif page is not None:
             out = list(page.hints())
         elif self.tab in (T_HOME, T_LIBRARY) and e is not None:
-            step = self._next_step(e)
-            act = "Stop" if e.id in self.running else "Play" if self.ready(e) else \
-                (step[0].split("  ", 1)[-1] if step else "Why not?")
+            if e.id in self.running:
+                act = "Resume" if e.id in self.suspended else "Back to game"
+            else:
+                act = "Play" if self.ready(e) else "Finish setup"
             out = [("a", act if self.zone == "main" else "Select"), ("x", "Manage"), ("b", "Exit…")]
         elif self.tab == T_DOWNLOADS:
             out = ([("a", "Options")] if self._download_rows() else []) + [("x", "Pause / resume all"),
@@ -3054,8 +3425,10 @@ class _Couch:
         if not items:
             return
         s, W, H = self._s(), self.width(), self.height()
+        bar = 76 * s
+        s = min(s, H / 800)                              # messages stay a sensible size on a big interface
         tw = min(620 * s, W * 0.45)
-        y = H - 76 * s - 22 * s
+        y = H - bar - 22 * s
         now = time.monotonic()
         for k in range(len(items) - 1, -1, -1):
             t = items[k]
@@ -3268,7 +3641,7 @@ class _Couch:
         opaque and goes out as a plain copy (blending ~30 big tiles per frame was most of a 4K frame)."""
         W, H = pm.width(), pm.height()
         rp = math.ceil(radius_px) + 1
-        if H <= 2 * rp + 2:
+        if self.gpu_paint or H <= 2 * rp + 2:          # (the GPU blends a whole texture faster than three pieces)
             p.drawImage(pos, pm)
             return
         ck = (pm.cacheKey(), rp)
@@ -3350,7 +3723,9 @@ class _Couch:
     def _tile(self, p: QPainter, e, r: QRectF, focused: bool, idx: int) -> None:
         ready = self.ready(e)
         badge = None
-        if e.id in self.running:
+        if e.id in self.suspended:
+            badge = ("❚❚ SUSPENDED", theme.CURRENT.warning)
+        elif e.id in self.running:
             badge = ("● PLAYING", theme.CURRENT.success)
         elif (e.release or {}).get("status") == "update":
             badge = ("UPDATE", theme.CURRENT.warning)
@@ -3374,57 +3749,77 @@ class _Couch:
                        "Find one in the Store tab (press A) — it shows up here, ready to play.")
             return
         e = self._focused_entry()
-        tile_h = min(H * 0.30, 330 * s)
+        # a big interface on a short screen (200 % at 1440p leaves 540 of the 1080 design units): everything in the
+        # hero shrinks a step and the shelf gets shorter, so the hero never runs into the shelf
+        room = (H - top_h - bot_h) / s                      # design units between the bars
+        f = 1.0 if room >= 800 else max(0.62, 0.62 + (room - 360) / (800 - 360) * 0.38)
+        tile_h = min(H * 0.30, 330 * s) if f >= 1.0 else min(H * 0.30, 330 * s, (room * 0.40) * s)
         tile_w = tile_h * 2 / 3
         gap = 28 * s
-        shelf_y = H - bot_h - 44 * s - tile_h
+        label_gap = 56 * s * (1.0 if f >= 1.0 else 0.75)
+        shelf_y = H - bot_h - 44 * s * f - tile_h
+        rel = (e.release or {}) if e is not None else {}
+        update = rel.get("status") == "update" and rel.get("latest")
+        title_px = min(76 * s * f, W * 0.05)
+        hero_h = (30 + 14 + 40 + (34 if update else 0) + 10 + 68) * s * f + title_px * 1.3
+        free = shelf_y - label_gap - top_h - hero_h
         # hero text
         left = 72 * s
-        y = top_h + max(40 * s, (shelf_y - top_h) * 0.18)
+        y = top_h + max(40 * s, (shelf_y - top_h) * 0.18) if f >= 1.0 else top_h + max(8 * s, free * 0.4)
         if e is not None:
-            p.setFont(self._font(15 * s, 800))
+            p.setFont(self._font(15 * s * max(0.8, f), 800))
             p.setPen(QColor(theme.CURRENT.accent).lighter(130))
-            label_ = "PLAYING NOW" if e.id in self.running else ("CONTINUE PLAYING" if e.last_played_at else
-                                                                  "IN YOUR LIBRARY")
-            p.drawText(QRectF(left, y, W * 0.6, 24 * s), Qt.AlignLeft | Qt.AlignVCenter, label_)
-            y += 30 * s
-            title_font = self._font(min(76 * s, W * 0.05), 900)
+            if e.id in self.running:
+                label_ = "SUSPENDED" if e.id in self.suspended else "PLAYING NOW"
+            else:
+                label_ = "CONTINUE PLAYING" if e.last_played_at else "IN YOUR LIBRARY"
+            p.drawText(QRectF(left, y, W * 0.6, 24 * s * f), Qt.AlignLeft | Qt.AlignVCenter, label_)
+            y += 30 * s * f
+            title_font = self._font(title_px, 900)
             p.setFont(title_font)
             p.setPen(QColor("white"))
-            tr = QRectF(left, y, W * 0.62, (shelf_y - y) * 0.45)
-            bound = p.boundingRect(tr, Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, e.title)
-            p.drawText(tr, Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, e.title)
-            y += min(bound.height(), tr.height()) + 14 * s
+            lines = 2 if f >= 1.0 else 1                     # short screen: one line, cut with "…"
+            tr = QRectF(left, y, W * 0.62, title_px * 1.3 * lines)
+            if lines == 1:
+                fm = QFontMetrics(title_font)
+                p.drawText(tr, Qt.AlignLeft | Qt.AlignVCenter, fm.elidedText(e.title, Qt.ElideRight, int(tr.width())))
+                y += tr.height() + 14 * s * f
+            else:
+                bound = p.boundingRect(tr, Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, e.title)
+                p.drawText(tr, Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, e.title)
+                y += min(bound.height(), tr.height()) + 14 * s
             meta = [self.state_text(e), playtime(e.playtime_seconds)]
             if e.last_played_at:
                 meta.append("last played " + relative_time(e.last_played_at))
             if e.source:
                 meta.append(theme.source_name(e.source))
-            p.setFont(self._font(21 * s, 500))
+            p.setFont(self._font(21 * s * f, 500))
             p.setPen(QColor(255, 255, 255, 200))
-            p.drawText(QRectF(left, y, W * 0.7, 30 * s), Qt.AlignLeft | Qt.AlignVCenter, "  ·  ".join(meta))
-            y += 40 * s
-            rel = e.release or {}
-            if rel.get("status") == "update" and rel.get("latest"):
-                p.setFont(self._font(17 * s, 700))
+            mw = W * 0.7
+            p.drawText(QRectF(left, y, mw, 30 * s * f), Qt.AlignLeft | Qt.AlignVCenter,
+                       QFontMetrics(p.font()).elidedText("  ·  ".join(meta), Qt.ElideRight, int(mw)))
+            y += 40 * s * f
+            if update:
+                p.setFont(self._font(17 * s * f, 700))
                 p.setPen(QColor(theme.CURRENT.warning))
-                p.drawText(QRectF(left, y, W * 0.7, 26 * s), Qt.AlignLeft | Qt.AlignVCenter,
+                p.drawText(QRectF(left, y, W * 0.7, 26 * s * f), Qt.AlignLeft | Qt.AlignVCenter,
                            f"Update available: {rel['latest']} (you have {rel.get('version')}) — Manage → Update")
-                y += 34 * s
-            y += 10 * s
+                y += 34 * s * f
+            y += 10 * s * f
             bx = left
+            bh = 68 * s * f
             for i, (text, _fn, kind) in enumerate(self._hero_buttons()):
-                p.setFont(self._font(68 * s * 0.36, 800))
-                bw = max((260 if i == 0 else 200) * s, QFontMetrics(p.font()).horizontalAdvance(text) + 70 * s)
-                r = QRectF(bx, y, bw, 68 * s)
+                p.setFont(self._font(bh * 0.36, 800))
+                bw = max((260 if i == 0 else 200) * s * f, QFontMetrics(p.font()).horizontalAdvance(text) + 70 * s * f)
+                r = QRectF(bx, y, bw, bh)
                 self._pill(p, r, text, kind, self.zone == "buttons" and self.button_index == i and
                            self.overlay is None)
                 self._hit.append((r, "button", i))
                 bx += bw + 22 * s
         # shelf
-        p.setFont(self._font(17 * s, 800))
+        p.setFont(self._font(17 * s * max(0.8, f), 800))
         p.setPen(QColor(255, 255, 255, 190))
-        p.drawText(QRectF(left, shelf_y - 56 * s, 600 * s, 28 * s), Qt.AlignLeft | Qt.AlignVCenter,
+        p.drawText(QRectF(left, shelf_y - label_gap, 600 * s, 28 * s * f), Qt.AlignLeft | Qt.AlignVCenter,
                    f"YOUR GAMES  ·  {len(items)}")
         i = self.index[T_HOME]
         # keep the focused tile in view: scroll so it sits at the left third when possible
@@ -3507,7 +3902,7 @@ class _Couch:
             self._tick.start()
         off = self._scroll[1]
         p.save()
-        p.setClipRect(QRectF(0, top - 40 * s, W, bottom - top + 40 * s))
+        p.setClipRect(QRectF(0, top - 40 * s, W, bottom - top + 40 * s), Qt.IntersectClip)
         focused_draw = None
         for k, e in enumerate(items):
             rr, cc = divmod(k, cols)
@@ -3562,7 +3957,7 @@ class _Couch:
             self._schedule_frame()
         self._dl = cur
         p.save()
-        p.setClipRect(QRectF(0, y - 10 * s, W, bottom - y + 10 * s))
+        p.setClipRect(QRectF(0, y - 10 * s, W, bottom - y + 10 * s), Qt.IntersectClip)
         for k, (kind, d) in enumerate(rows):
             ry = y + k * row_h - cur
             if ry + row_h < y - 20 * s or ry > bottom:
@@ -3754,6 +4149,12 @@ class _Couch:
             p.setPen(QColor(255, 255, 255, 200))
             p.drawText(QRectF(x, r.bottom() - 46 * s, inner, 30 * s), Qt.AlignRight | Qt.AlignVCenter,
                        f"{int(round(min(1.0, o.shown_progress) * 100))} %")
+            if o.buttons:                                # "Stop testing" (A or B)
+                p.setFont(self._font(44 * s * 0.4, 800))
+                text = o.buttons[0][0]
+                br = QRectF(x, r.bottom() - 48 * s, QFontMetrics(p.font()).horizontalAdvance(text) + 56 * s, 36 * s)
+                self._pill(p, br, text, o.buttons[0][2], True)
+                self._hit.append((br, "overlay", 0))
             return
         if o.busy:
             # a simple spinner: three dots that pulse
@@ -3799,7 +4200,7 @@ class _Couch:
                 o.scroll = fb - rect.height()
         o.scroll = max(0.0, min(o.scroll, max(0.0, total - rect.height())))
         p.save()
-        p.setClipRect(rect.adjusted(-12 * s, -6 * s, 12 * s, 6 * s))
+        p.setClipRect(rect.adjusted(-12 * s, -6 * s, 12 * s, 6 * s), Qt.IntersectClip)
         for k, (text, _fn, kind) in enumerate(o.buttons):
             r = QRectF(rect.left(), rect.top() + tops[k] - o.scroll, rect.width(), row_h[k])
             if r.bottom() < rect.top() - 10 * s or r.top() > rect.bottom() + 10 * s:
@@ -3848,9 +4249,105 @@ class CouchWindow(_Couch, QWidget):
     """Couch mode (drawn with QPainter; see make_couch for how its frames reach the screen)."""
     closed = Signal()
     gpu = False
+    gpu_paint = False
 
     def paintEvent(self, e) -> None:                          # noqa: N802
         self._render(e.rect())
+
+
+class CouchGLWindow(_Couch, QOpenGLWidget):
+    """Couch mode drawn by the graphics card (Settings → GPU acceleration): the same QPainter code, but on Qt's
+    OpenGL paint engine — pictures become textures that stay on the GPU (tiles, backgrounds, cached layers are
+    uploaded once), shapes and text are drawn by OpenGL with 4× multisampling. The CPU only describes the frame.
+
+    Frames keep their contents (PartialUpdate): the pump's keep-alive frames draw nothing, and a moving focus redraws
+    only its tile, as on the CPU.
+
+    ``gpu_failed`` is sent when OpenGL does not start (no context, nothing drawn after GL_CHECK_MS): the main
+    window then opens couch mode drawn by the CPU instead."""
+    closed = Signal()
+    gpu_failed = Signal(str)
+    gpu = True
+    gpu_paint = True
+    GL_CHECK_MS = 4000
+
+    def __init__(self, actions, entries: list, running: set[int]):
+        from PySide6.QtGui import QSurfaceFormat
+        self._gl_full = True                      # the next frame redraws everything
+        self._gl_region = QRegion()               # … else what changed since the last frame
+        super().__init__(actions, entries, running)
+        fmt = QSurfaceFormat.defaultFormat()
+        fmt.setSamples(4)                         # smooth edges for rounded tiles, pills and text
+        fmt.setDepthBufferSize(24)
+        fmt.setStencilBufferSize(8)               # clip paths
+        self.setFormat(fmt)
+        self.setUpdateBehavior(QOpenGLWidget.PartialUpdate)
+        self.setTextureFormat(0x8058)             # GL_RGBA8
+        self._gl_started = False
+        self._gl_frames = 0
+        self._gl_checks = 0
+
+    def open(self, screen=None) -> None:
+        super().open(screen)
+        QTimer.singleShot(self.GL_CHECK_MS, self, self._gl_check)
+
+    def _gl_check(self) -> None:
+        """Has OpenGL drawn a frame since couch mode opened? (Checked while it is on screen.)"""
+        if self._exiting or (self._gl_started and self._gl_frames and self.isValid()):
+            return
+        if not self.isVisible() or self.isMinimized():
+            self._gl_checks += 1
+            if self._gl_checks < 30:                          # not on screen yet: look again later
+                QTimer.singleShot(self.GL_CHECK_MS, self, self._gl_check)
+            return
+        why = ("no OpenGL context" if not self._gl_started or not self.isValid() else "no frame drawn")
+        log.warning("couch mode: GPU drawing failed (%s)", why)
+        self.gpu_failed.emit(why)
+
+    def _request(self, area=None) -> None:
+        if area is None:
+            self._gl_full = True
+        else:
+            self._gl_region = self._gl_region | QRegion(area)
+        QOpenGLWidget.update(self)
+
+    def grab(self, rect=None):
+        """A picture of the window (smoke tests, --screenshot): a whole new frame, read back from the graphics card
+        (QWidget.grab does not read an OpenGL window's frames everywhere)."""
+        self._gl_full = True
+        img = self.grabFramebuffer()
+        if img.isNull():
+            return QOpenGLWidget.grab(self) if rect is None else QOpenGLWidget.grab(self, rect)
+        pm = QPixmap.fromImage(img)
+        pm.setDevicePixelRatio(self.devicePixelRatioF())
+        if rect is not None and rect.isValid():
+            r = self.devicePixelRatioF()
+            pm = pm.copy(QRect(round(rect.x() * r), round(rect.y() * r), round(rect.width() * r),
+                               round(rect.height() * r)))
+        return pm
+
+    def initializeGL(self) -> None:                           # noqa: N802
+        self._gl_started = True
+        try:
+            from PySide6.QtGui import QOpenGLContext
+            f = QOpenGLContext.currentContext().functions()
+            log.info("couch mode: drawn by the GPU (%s, OpenGL %s)", f.glGetString(0x1F01), f.glGetString(0x1F02))
+        except Exception:
+            log.info("couch mode: drawn by the GPU (OpenGL)")
+
+    def resizeGL(self, w: int, h: int) -> None:               # noqa: N802
+        self._gl_full = True                                  # a new framebuffer: draw all of it
+
+    def paintGL(self) -> None:                                # noqa: N802
+        if self._gl_full:
+            rect = self.rect()
+        elif self._gl_region.isEmpty():
+            rect = QRect(0, 0, 1, 1)                          # nothing changed: the frame stays as it is
+        else:
+            rect = self._gl_region.boundingRect().intersected(self.rect())
+        self._gl_full, self._gl_region = False, QRegion()
+        self._render(rect)
+        self._gl_frames += 1
 
 
 def gpu_available() -> bool:
@@ -3882,8 +4379,17 @@ class _Presenter(QOpenGLWidget):
             f.glClear(0x00004000)                             # GL_COLOR_BUFFER_BIT
 
 
-def make_couch(actions, entries: list, running: set[int]):
-    """Couch mode's window, its frames shown through the GPU unless switched off (Settings) or unavailable."""
+def make_couch(actions, entries: list, running: set[int], gpu_drawing: bool = True):
+    """Couch mode's window: drawn by the GPU with GPU acceleration on (Settings; falls back to the CPU when OpenGL
+    is not available, or ``gpu_drawing`` is False after it failed), else drawn by the CPU and shown through the GPU
+    unless switched off."""
+    if gpu_drawing and actions.settings.get("gpu_acceleration", False) and gpu_available():
+        try:
+            w = CouchGLWindow(actions, entries, running)
+            log.info("couch mode: GPU acceleration on")
+            return w
+        except Exception:
+            log.exception("couch mode: GPU drawing unavailable; drawing with the CPU")
     w = CouchWindow(actions, entries, running)
     if actions.settings.get("couch_gpu", True) and gpu_available():
         try:

@@ -19,6 +19,7 @@ import pytest
 os.environ["EZGD_STEAM_ROOT"] = "/nonexistent/ezgd-test-steam"
 os.environ["EZGD_NO_GAMEPADS"] = "1"       # never the real controllers (a game played meanwhile pressed buttons in tests)
 os.environ["EZGD_NO_INTRO"] = "1"          # couch mode opens straight away (tests of the intro switch it back on)
+os.environ["EZGD_NO_SOUNDS"] = "1"         # couch mode's sounds are only counted, never played through the speakers
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:                    # Qt WebEngine (in-app browser) must be loaded before the QApplication exists

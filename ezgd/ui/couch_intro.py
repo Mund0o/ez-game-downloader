@@ -25,7 +25,7 @@ FIRST_FRAME_WAIT = 1.5          # seconds: no picture by then → skip it
 LONGEST = 4.0                   # seconds: whatever happens, couch mode is shown by then
 FADE = 0.35                     # the fade into couch mode
 SKIP_FADE = 0.2
-VOLUME = 0.7
+VOLUME = 0.17                   # (Settings → Intro volume overrides it)
 BG = QColor("#07080d")          # the video's own background
 
 
@@ -38,11 +38,12 @@ class CouchIntro(QObject):
 
     finished = Signal()
 
-    def __init__(self, owner, sound: bool = True):
+    def __init__(self, owner, sound: bool = True, volume: float = VOLUME):
         super().__init__(owner)
         self.owner = owner
         self.state = "done"
-        self.sound = sound
+        self.sound = sound and volume > 0
+        self.volume = max(0.0, min(1.0, volume))
         self._player = self._sink = self._audio = None
         self._frame = None                  # the newest QVideoFrame
         self._image: QImage | None = None   # … converted, when it was drawn
@@ -69,7 +70,7 @@ class CouchIntro(QObject):
             self._player.setVideoSink(self._sink)
             if self.sound:
                 self._audio = QAudioOutput(self)
-                self._audio.setVolume(VOLUME)
+                self._audio.setVolume(self.volume)
                 self._player.setAudioOutput(self._audio)
             self._sink.videoFrameChanged.connect(self._new_frame)
             self._player.mediaStatusChanged.connect(self._status)
@@ -200,7 +201,7 @@ class CouchIntro(QObject):
                 self._finish()
                 return False
             if self._audio is not None:
-                self._audio.setVolume(VOLUME * (1.0 - t))
+                self._audio.setVolume(self.volume * (1.0 - t))
             if self._image is not None:
                 p.save()
                 p.setOpacity(1.0 - t * t * (3 - 2 * t))

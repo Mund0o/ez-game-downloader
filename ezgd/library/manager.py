@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -212,6 +213,9 @@ class LibraryManager:
         self._installers: dict[int, dict] = {}       # entry id → running installer (repack setup.exe)
         self._steam_seen: dict[int, dict] = {}       # games running through Steam (play mode), last seen
         self._launch_info: dict[int, dict] = {}      # Proton used / overlay loaded, per running game
+        self._suspended: dict[int, dict] = {}        # frozen games: {"at": monotonic, "pids": [...]}
+        self._frozen_seconds: dict[int, float] = {}  # time a running game spent frozen (not playtime)
+        self.thaw_leftovers()
 
     # ----------------------------------------------------------- environment
     def steam_root(self) -> Path | None:
@@ -664,6 +668,9 @@ class LibraryManager:
                 self.emit("game_state", {"id": eid, "running": True, "steam": True})
         ended = [eid for eid in self._steam_seen if eid not in now]
         for eid in ended:
+            self._suspended.pop(eid, None)
+            self._frozen_seconds.pop(eid, None)
+            self._forget_suspension(eid)
             info = self._steam_seen.pop(eid)
             played = int(time.time() - float(info.get("started") or time.time()))
             if self.on_game_exit is not None:
@@ -722,7 +729,9 @@ class LibraryManager:
             if plan.post:
                 threading.Thread(target=launcher.run_post_exit, args=(plan, code, log_path),
                                  name=f"post-exit-{entry_id}", daemon=True).start()
-            played = int(time.monotonic() - started)
+            self._suspended.pop(entry_id, None)
+            self._forget_suspension(entry_id)
+            played = int(time.monotonic() - started - self._frozen_seconds.pop(entry_id, 0.0))
             try:                                       # the debugging assistant reads this back
                 with open(log_path, "a", encoding="utf-8") as fh:
                     fh.write(f"\n=== exited with code {code} after {played}s\n")
@@ -762,6 +771,8 @@ class LibraryManager:
         return finished
 
     def stop(self, entry_id: int) -> None:
+        if entry_id in self._suspended:
+            self.resume(entry_id)                    # a frozen game cannot react to being asked to quit
         item = self._processes.get(entry_id)
         if (item is None or item[0].poll() is not None) and steamrun.stop(self.running_dir, entry_id):
             return                                   # started through Steam: play mode stops it
@@ -817,6 +828,8 @@ class LibraryManager:
             steamrun.stop(self.running_dir, entry_id)
             self.reap()
             return {"stopped": not self.is_running(entry_id), "left": []}
+        if entry_id in self._suspended:
+            self.resume(entry_id)                    # frozen processes only see SIGTERM once they run again
         groups, pids = self._game_pids(entry_id)
         if not groups and not pids and not self.is_running(entry_id):
             return {"stopped": True, "left": []}
@@ -869,6 +882,182 @@ class LibraryManager:
         if not stopped:
             log.error("game %s: processes left after stopping: %s", entry_id, left)
         return {"stopped": stopped, "left": left}
+
+    # ------------------------------------------------- suspend / resume (quick menu)
+    def game_processes(self, entry_id: int) -> list[int]:
+        """Every process of this running game: the members of its process groups (the app's or play mode's) and
+        whatever works on its own Proton prefix. Nothing else (never Steam itself, never other games)."""
+        groups, pids = self._game_pids(entry_id)
+        found = set(pids)
+        want = {g for g in groups if g > 1 and g != os.getpgrp()}      # never the app's own group
+        if want and IS_LINUX:
+            for d in Path("/proc").iterdir():
+                if not d.name.isdigit():
+                    continue
+                try:
+                    stat = (d / "stat").read_text()
+                    pgrp = int(stat.rsplit(")", 1)[1].split()[2])
+                except (OSError, ValueError, IndexError):
+                    continue
+                if pgrp in want:
+                    found.add(int(d.name))
+        found.discard(os.getpid())
+        return sorted(found)
+
+    def session_seconds(self, entry_id: int) -> int | None:
+        """How long the game has been played this session (frozen time left out); None when not running."""
+        item = self._processes.get(entry_id)
+        if item is not None and item[0].poll() is None:
+            secs = time.monotonic() - item[1]
+        else:
+            info = steamrun.read_marker(self.running_dir, entry_id)
+            if not info:
+                return None
+            secs = time.time() - float(info.get("started") or time.time())
+        frozen = self._frozen_seconds.get(entry_id, 0.0)
+        if entry_id in self._suspended:
+            frozen += time.monotonic() - self._suspended[entry_id]["at"]
+        return max(0, int(secs - frozen))
+
+    def suspended_ids(self) -> list[int]:
+        return sorted(i for i in self._suspended if self.is_running(i))
+
+    def is_suspended(self, entry_id: int) -> bool:
+        return entry_id in self._suspended
+
+    def suspend(self, entry_id: int) -> dict:
+        """Freeze a running game (SIGSTOP): it uses no processor or graphics time until resumed, and continues
+        exactly where it was. Its memory stays in use. Only games the app started (directly or through Steam)."""
+        import signal as _signal
+        if os.name == "nt":
+            raise LibraryError("Suspending games is not available on Windows yet.")
+        if not self.is_running(entry_id):
+            raise LibraryError("The game is not running.")
+        if entry_id in self._suspended:
+            return {"suspended": True, "pids": self._suspended[entry_id]["pids"]}
+        pids = self.game_processes(entry_id)
+        if not pids:
+            raise LibraryError("The game's processes were not found.")
+        stopped = []
+        for pid in pids:
+            try:
+                os.kill(pid, _signal.SIGSTOP)
+                stopped.append(pid)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        self._suspended[entry_id] = {"at": time.monotonic(), "pids": stopped}
+        try:
+            self.running_dir.mkdir(parents=True, exist_ok=True)
+            (self.running_dir / f"suspended-{entry_id}.json").write_text(
+                json.dumps({"pids": stopped, "since": time.time()}))
+        except OSError:
+            log.warning("could not note that game %s is suspended", entry_id)
+        log.info("game %s suspended (%d processes frozen)", entry_id, len(stopped))
+        self.emit("game_state", {"id": entry_id, "running": True, "suspended": True})
+        return {"suspended": True, "pids": stopped}
+
+    def resume(self, entry_id: int) -> dict:
+        """Unfreeze a suspended game (SIGCONT): it carries on from the exact moment it was frozen."""
+        info = self._suspended.pop(entry_id, None)
+        pids = set(info["pids"]) if info else set()
+        if self.is_running(entry_id):
+            pids |= set(self.game_processes(entry_id))
+        self._thaw(pids)
+        if info:
+            self._frozen_seconds[entry_id] = self._frozen_seconds.get(entry_id, 0.0) + \
+                time.monotonic() - info["at"]
+            log.info("game %s resumed after %.0f s", entry_id, time.monotonic() - info["at"])
+        self._forget_suspension(entry_id)
+        self.emit("game_state", {"id": entry_id, "running": self.is_running(entry_id), "suspended": False})
+        return {"resumed": bool(info), "pids": sorted(pids)}
+
+    def resume_all(self) -> None:
+        """The app quits (or couch mode closes): no game may stay frozen without a way to resume it."""
+        for entry_id in list(self._suspended):
+            try:
+                self.resume(entry_id)
+            except Exception:
+                log.exception("could not resume game %s", entry_id)
+
+    @staticmethod
+    def _thaw(pids) -> None:
+        import signal as _signal
+        for pid in pids:
+            try:
+                os.kill(int(pid), _signal.SIGCONT)
+            except (ProcessLookupError, PermissionError, OSError, ValueError):
+                pass
+
+    def _forget_suspension(self, entry_id: int) -> None:
+        try:
+            (self.running_dir / f"suspended-{entry_id}.json").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def thaw_leftovers(self) -> None:
+        """Games frozen by an app that then crashed: let them run again (they would hang forever otherwise)."""
+        try:
+            notes = list(self.running_dir.glob("suspended-*.json"))
+        except OSError:
+            return
+        for note in notes:
+            try:
+                pids = json.loads(note.read_text()).get("pids") or []
+                self._thaw(pids)
+                log.info("resumed a game left frozen by the last session (%s)", note.name)
+            except (OSError, ValueError):
+                pass
+            try:
+                note.unlink()
+            except OSError:
+                pass
+
+    # ------------------------------------------------------------ game volume
+    def _streams(self, entry_id: int) -> list[dict]:
+        """The game's sound streams (PipeWire / PulseAudio), found by its processes."""
+        import shutil
+        import subprocess
+        if not shutil.which("pactl"):
+            return []
+        pids = {str(p) for p in self.game_processes(entry_id)}
+        if not pids:
+            return []
+        try:
+            from ezgd.platform.hostenv import host_env
+            out = subprocess.run(["pactl", "-f", "json", "list", "sink-inputs"], capture_output=True, text=True,
+                                 timeout=3, env=host_env()).stdout
+            streams = json.loads(out or "[]")
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return []
+        return [st for st in streams if str((st.get("properties") or {}).get("application.process.id")) in pids]
+
+    def game_volume(self, entry_id: int) -> int | None:
+        """The game's own volume in percent (None when it has no sound playing that can be found)."""
+        streams = self._streams(entry_id)
+        if not streams:
+            return None
+        vals = []
+        for st in streams:
+            for ch in (st.get("volume") or {}).values():
+                try:
+                    vals.append(int(str(ch.get("value_percent", "")).rstrip("%")))
+                except ValueError:
+                    pass
+        return round(sum(vals) / len(vals)) if vals else 100
+
+    def set_game_volume(self, entry_id: int, percent: int) -> int | None:
+        """Set the game's own volume (0–150 %): only its sound changes, nothing else on the computer."""
+        import subprocess
+        percent = max(0, min(150, int(percent)))
+        streams = self._streams(entry_id)
+        for st in streams:
+            try:
+                from ezgd.platform.hostenv import host_env
+                subprocess.run(["pactl", "set-sink-input-volume", str(st["index"]), f"{percent}%"],
+                               capture_output=True, timeout=3, env=host_env())
+            except (OSError, subprocess.SubprocessError, KeyError):
+                pass
+        return percent if streams else None
 
     def stop_all(self) -> None:
         for entry_id in self.running_ids():

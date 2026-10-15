@@ -130,6 +130,7 @@ class CompatConfig:
     protonfixes: bool = True           # let GE/CachyOS protonfixes apply per-game fixes
     report_app_id: bool = False        # also export SteamAppId/SteamGameId (Valve Proton per-app hacks)
     fixes: list[str] = field(default_factory=list)      # keys of ezgd.library.fixes (Fixes screen)
+    fps_limit: int = 0                 # frames per second cap for DirectX games (DXVK / VKD3D); 0 = none
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "CompatConfig":
@@ -139,8 +140,10 @@ class CompatConfig:
                    use_runtime=bool(d.get("use_runtime", True)),
                    protonfixes=bool(d.get("protonfixes", True)),
                    report_app_id=bool(d.get("report_app_id", False)),
-                   fixes=[str(x) for x in d.get("fixes", []) if isinstance(x, str)])
+                   fixes=[str(x) for x in d.get("fixes", []) if isinstance(x, str)],
+                   fps_limit=max(0, min(1000, int(d.get("fps_limit") or 0))))
 
     def to_dict(self) -> dict:
         return {"options": self.options, "dll_overrides": self.dll_overrides, "use_runtime": self.use_runtime,
-                "protonfixes": self.protonfixes, "report_app_id": self.report_app_id, "fixes": self.fixes}
+                "protonfixes": self.protonfixes, "report_app_id": self.report_app_id, "fixes": self.fixes,
+                "fps_limit": self.fps_limit}

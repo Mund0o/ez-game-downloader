@@ -93,7 +93,11 @@ class Settings:
     couch_window: str = "fullscreen"             # fullscreen | borderless | custom
     couch_resolution: str = ""                   # custom size in screen pixels, "2560x1440"
     couch_ui_scale: int = 100                    # interface size in percent (100 = fitted to the screen)
+    couch_sounds: bool = True                    # couch mode's quiet sounds (selector moves, presses, browser clicks)
+    couch_sounds_volume: int = 15                # … how loud, in percent
+    couch_intro_volume: int = 17                 # the intro video's sound, in percent
     couch_steady_frames: bool = True             # one steady frame rate (no flicker on VRR screens)
+    gpu_acceleration: bool = False               # couch mode drawn by the GPU; GPU help for the in-app browser
     couch_gpu: bool = True                       # couch mode's frames shown through OpenGL (off: as before)
     couch_controller_only: bool = True           # couch Store: only games with (full or partial) controller support
     couch_library_sort: str = "title"            # couch Library order: title | recent | added | playtime
@@ -105,6 +109,8 @@ class Settings:
 
     _LIMITS = {
         "max_concurrent_downloads": (1, 16),
+        "couch_sounds_volume": (0, 100),
+        "couch_intro_volume": (0, 100),
         "http_speed_limit_kbps": (0, 10_000_000),
         "play_speed_limit_kbps": (0, 10_000_000),
         "http_max_retries": (0, 20),

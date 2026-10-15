@@ -64,6 +64,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence(Qt.Key_F5), self, self.refresh_page)
         QShortcut(QKeySequence(Qt.Key_F1), self, self.show_shortcuts)
         self.couch = None
+        self._couch_gpu_failed = False            # couch mode's GPU drawing failed this run: draw it with the CPU
         self._clip_seen: set[str] = set()                # clipboard links already offered
         self._tray_hint_shown = False
         self.setAcceptDrops(True)
@@ -500,6 +501,7 @@ class MainWindow(QMainWindow):
             self.navigate(next(k for k, b in self.nav_buttons.items() if b.isChecked()))
             self.toasts.show("Theme updated", "Some colours update fully after a restart.")
         self._apply_settings_to_pages()
+        self.pages["settings"].load(s, info=False)        # a change made in couch mode shows here too
         if changed_key in ("sources_enabled", "hide_withdrawn_games", "hide_adult_games"):
             self.pages["games"].reload()
             self.pages["home"].load_sources()
@@ -575,13 +577,15 @@ class MainWindow(QMainWindow):
         screen = self.screen()
         try:
             couch = make_couch(self.actions, list(self.pages["library"].entries.values()),
-                                set(self.pages["library"].running))
+                                set(self.pages["library"].running), gpu_drawing=not self._couch_gpu_failed)
         except Exception:
             log.exception("couch mode could not start")
             self.toasts.show("Couch mode could not start", "The error is in the log.", "error")
             return
         self.couch = couch
         couch.closed.connect(self._couch_closed)
+        if hasattr(couch, "gpu_failed"):
+            couch.gpu_failed.connect(self._couch_gpu_failure)
         self._main_toasts = self.toasts
         self.actions.toasts = couch.toasts                 # messages from game actions show in couch mode
         QApplication.instance().setQuitOnLastWindowClosed(False)
@@ -592,6 +596,21 @@ class MainWindow(QMainWindow):
             log.exception("couch mode could not be shown")
             self._couch_closed()
 
+    def _couch_gpu_failure(self, why: str) -> None:
+        """Couch mode's OpenGL drawing did not start: open it again drawn by the CPU (for the rest of this run)."""
+        couch = self.couch
+        self._couch_gpu_failed = True
+        if couch is None or couch.launched or couch.pending_kill:
+            return                                # games it started (the ✕ closes them): the CPU next time it opens
+        couch.closed.disconnect(self._couch_closed)
+        couch.force_close()
+        couch.deleteLater()
+        self.couch = None
+        self.actions.toasts = getattr(self, "_main_toasts", self.toasts)
+        self.open_couch()
+        if self.couch is not None:
+            self.couch.toasts.show("Drawn by the CPU this time", f"GPU acceleration did not start ({why}).", "warning")
+
     def _couch_closed(self) -> None:
         couch = self.couch
         if couch is not None and couch.pending_kill:
@@ -601,6 +620,9 @@ class MainWindow(QMainWindow):
             log.info("couch mode closed while %s were starting: they are closed when they appear", couch.pending_kill)
         self.couch = None
         self.actions.toasts = getattr(self, "_main_toasts", self.toasts)
+        from ezgd.ui.window_control import release_all
+        release_all()                                    # "keep above" was for couch mode only
+        QTimer.singleShot(600, self, release_all)        # (and once more, after anything still on its way)
         if not self._quitting:
             self.showNormal()
             self.raise_()

@@ -225,7 +225,8 @@ class PropertiesDialog(QDialog):
                                          fixes=list(self.entry.compat_config.fixes),
                                          dll_overrides=self.dlls.text().strip(), use_runtime=self.runtime.isChecked(),
                                          protonfixes=self.protonfixes.isChecked(),
-                                         report_app_id=self.report.isChecked()).to_dict())
+                                         report_app_id=self.report.isChecked(),
+                                         fps_limit=self.entry.compat_config.fps_limit).to_dict())
         return o
 
     def _open_fixes(self) -> None:
