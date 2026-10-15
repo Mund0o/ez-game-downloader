@@ -294,6 +294,56 @@ def _lines(text: str, rx: str, limit: int = 4) -> list[str]:
     return out
 
 
+def r_error_box(c: Context) -> list[Finding]:
+    """What the game said in an error pop-up (Wine logs every message box's text: ezgd.library.errorbox) — the
+    game's own words beat any guess."""
+    from ezgd.library import errorbox
+    msgs = errorbox.messages(c.wine)
+    if not msgs:
+        return []
+    out: list[Finding] = []
+    for msg in msgs[-3:]:
+        key, what, fix = errorbox.explain(msg)
+        quote = f"“{msg[:400]}”"
+        if fix is None:                               # a DLL named in the message: what provides it
+            dll = re.search(r"([\w.\-]+\.dll)", msg, re.I)
+            if dll:
+                name = dll.group(1).lower()
+                lacks = _proton_lacks(c, name, c.exe.name, 32 if c.is32 else 64, [quote], predicted=False)
+                if lacks is not None:
+                    out.append(lacks)
+                    continue
+                rt = _runtime_for(name)
+                if rt and rt[0]:
+                    fix, what = ("winetricks", rt[0], f"Install {rt[1]}"), f"the {rt[1]} is missing"
+        if fix is not None and fix[0] == "add_args" and c.engine == "Unity":
+            fix = ("add_args", "-force-d3d11", fix[2])
+        out.append(Finding(f"error-box:{key}", "The game showed an error" + (f": {what}" if what else ""),
+                           f"The game stopped with this message: {quote}."
+                           + (f" That means {what}." if what else " It names the problem in the game's own words — "
+                              "the details below and the other findings show what can be done about it."),
+                           0.95 if fix else 0.85, [quote], Fix(*fix) if fix else None))
+    return out
+
+
+def r_screen_text(c: Context) -> list[Finding]:
+    """What the game's screen said while it was tested (read from screenshots: ezgd.library.screenread) — for
+    errors a game draws itself, which Wine knows nothing about."""
+    from ezgd.library import errorbox, screenread
+    lines = screenread.from_log(c.wine)
+    strong = [ln for ln in lines if screenread.STRONG.search(ln)] or lines
+    if not strong or errorbox.messages(c.wine):
+        return []                                     # (an error box says it more exactly)
+    key, what, fix = errorbox.explain(" ".join(strong))
+    if fix is not None and fix[0] == "add_args" and c.engine == "Unity":
+        fix = ("add_args", "-force-d3d11", fix[2])
+    quote = " / ".join(f"“{ln}”" for ln in strong[:3])
+    return [Finding(f"screen-error:{key}", "The game's screen showed an error" + (f": {what}" if what else ""),
+                    f"While the game was tested, its window said: {quote} (read from a screenshot)."
+                    + (f" That means {what}." if what else ""), 0.88 if fix else 0.7, strong[:3],
+                    Fix(*fix) if fix else None)]
+
+
 def r_missing_dll(c: Context) -> list[Finding]:
     out: list[Finding] = []
     pat = re.compile(r"Library ([\w.\-]+\.dll) \(which is needed by L?\"?([^\")]+)\"?\) not found", re.I)
@@ -306,7 +356,10 @@ def r_missing_dll(c: Context) -> list[Finding]:
         line = _lines(c.wine, re.escape(m.group(0)[:60]), 1)
         need = Path(m.group(2).replace("\\", "/")).name
         rt = _runtime_for(dll)
-        if rt and rt[0]:
+        lacks = _proton_lacks(c, dll, need, 32 if c.is32 else 64, line, predicted=False)
+        if lacks is not None:
+            out.append(lacks)
+        elif rt and rt[0]:
             verb, what = rt
             out.append(Finding(
                 f"missing-dll:{dll}", f"Missing {what}",
@@ -495,8 +548,12 @@ def r_dotnet(c: Context) -> list[Finding]:
         return [Finding("xna", "Missing XNA Framework", "The game is built on Microsoft XNA, which is not in the "
                         "prefix. Installing XNA 4.0 (winetricks xna40) fixes this.", 0.9, xna,
                         Fix("winetricks", "xna40", "Install XNA Framework 4.0"))]
-    ev = _lines(c.everything, r"(wine-mono|mscoree.*(not|fail)|CLR error|System\.(IO\.FileNotFoundException|"
-                              r"TypeLoadException)|Could not load file or assembly)")
+    # (Proton's own accessibility helper, xalia, runs on Wine Mono, and diagnostic runs log Mono probing its files
+    # — loader warnings / traces, not failures of the game)
+    ev = _lines("\n".join(ln for ln in c.everything.splitlines() if "xalia" not in ln.lower()
+                          and not re.search(r":(warn|trace):(module|loaddll)", ln)),
+                r"(wine-mono|mscoree.*(not|fail)|CLR error|System\.(IO\.FileNotFoundException|"
+                r"TypeLoadException)|Could not load file or assembly)")
     if not ev:
         return []
     own = _bundled_runtime(c)
@@ -621,6 +678,40 @@ def proton_dlls(proton_dir: Path | None, bits: int) -> frozenset[str]:
     return _BUILTINS[key]
 
 
+def _proton_with(c: Context, dll: str, bits: int):
+    """Wine's own DLLs are not all in every Proton build (Proton-CachyOS 11.0-20260703 has no
+    uiautomationcore.dll, which every Unreal Engine 5 game imports): another installed Proton that has it."""
+    if c.proton_dir is None or dll in proton_dlls(c.proton_dir, bits):
+        return None
+    if not proton_dlls(c.proton_dir, bits):
+        return None                                  # the selected build could not be read: no claim
+    for p in c.protons:
+        path = getattr(p, "path", None)
+        if path is not None and Path(path) != Path(c.proton_dir) and dll in proton_dlls(Path(path), bits):
+            return p
+    return None
+
+
+def _proton_lacks(c: Context, dll: str, needer: str, bits: int, evidence: list[str], predicted: bool):
+    other = _proton_with(c, dll, bits)
+    if other is None:
+        return None
+    when = "will not start" if predicted else "cannot start"
+    return Finding(f"proton-lacks:{dll}", f"Your Proton has no {dll}",
+                   f"{needer} needs {dll}, a part of Windows that Wine provides — but {c.proton_name or 'this Proton'} "
+                   f"does not include it, so the game {when}. {other.name} has it: switching Proton fixes this "
+                   "(installing .NET or re-extracting the game would not).", 0.93, evidence,
+                   Fix("proton", other.name, f"Use {other.name}"))
+
+
+def _ue_shipping(exe: Path) -> list[Path]:
+    """Unreal Engine: the small exe in the game's folder only starts <Project>/Binaries/Win64/*-Shipping.exe."""
+    root = exe.parent
+    if not (root / "Engine").is_dir():
+        return []
+    return sorted(p for p in root.glob("*/Binaries/Win64/*-Shipping.exe") if p.is_file())[:2]
+
+
 def r_imports(c: Context) -> list[Finding]:
     """Predict "DLL not found" from the import tables of the game's exe and the DLLs it loads from its folder."""
     from ezgd.platform.pe import read_pe
@@ -639,6 +730,11 @@ def r_imports(c: Context) -> list[Finding]:
     missing: dict[str, str] = {}
     mismatch: list[str] = []
     todo, done = [(c.exe, main)], set()
+    for ship in _ue_shipping(c.exe):                   # the real game behind Unreal's launcher
+        info = read_pe(ship)
+        if info is not None and info.bits == main.bits:
+            todo.append((ship, info))
+            local.update({p.name.lower(): p for p in ship.parent.glob("*.dll")})
     while todo and len(done) < 60:
         path, info = todo.pop()
         done.add(path.name.lower())
@@ -658,6 +754,10 @@ def r_imports(c: Context) -> list[Finding]:
     out: list[Finding] = []
     for dll, needer in missing.items():
         if f"missing-dll:{dll}" in c.wine.lower():
+            continue
+        lacks = _proton_lacks(c, dll, needer, main.bits, [f"{needer} imports {dll}"], predicted=True)
+        if lacks is not None:
+            out.append(lacks)
             continue
         rt = _runtime_for(dll)
         if rt and rt[0]:
@@ -1262,6 +1362,10 @@ def r_redist(c: Context) -> list[Finding]:
     root = Path(c.entry.install_path or c.exe.parent)
     have = installed_verbs(c.prefix_dir)
     found = [(v, w, f) for v, w, f in steamref.shipped_redists(root) if not set(v.split()) <= have]
+    if c.engine == "Unreal Engine":
+        # Unreal ships .NET for its own tools (crash reporter, prerequisites setup) — the game does not use it, and
+        # it rarely installs under Proton (Valor Mortis was offered dotnet48, which failed — 2026-10-14)
+        found = [(v, w, f) for v, w, f in found if not v.startswith("dotnet")]
     if not found:
         return []
     failing = _failing(c)
@@ -1630,7 +1734,7 @@ def _reason(c: Context, findings: list[Finding]) -> list[dict]:
     return out
 
 
-RULES = [r_integrity, r_emulator, r_fix_archive, r_missing_dll, r_unimplemented, r_imports, r_dotnet, r_steam, r_anticheat, r_vulkan, r_dx12, r_media,
+RULES = [r_error_box, r_screen_text, r_integrity, r_emulator, r_fix_archive, r_missing_dll, r_unimplemented, r_imports, r_dotnet, r_steam, r_anticheat, r_vulkan, r_dx12, r_media,
          r_crash, r_minidump, r_prefix, r_quick_exit, r_native, r_system, r_protondb, r_old_prefix, r_advisor,
          r_overlay, r_fonts, r_display, r_disk, r_writable, r_onlinefix_missing, r_regression, r_exit_code, r_override_files,
          r_steam_reference, r_redist, r_engine_crash, r_mixed_prefix, r_heap, r_filesystem]
@@ -1690,6 +1794,13 @@ def diagnose(entry: LibraryEntry, prefix_dir: Path, log_path: Path, *, protons: 
     # components already installed into this prefix are not offered again ("Install" kept coming back)
     have = installed_verbs(prefix_dir)
     for f in findings:
+        if f.fix and f.fix.kind == "winetricks" and f.fix.value and set(f.fix.value.split()) <= have and \
+                f.key.startswith(("error-box:", "screen-error:", "missing-dll:")):
+            # the game itself says it is missing, whatever winetricks' list says: installed again (forced) —
+            # "already installed" stopped Valor Mortis' Visual C++ fix (2026-10-14)
+            f.title += " (listed as installed, but the game still reports it missing)"
+            f.fix = Fix("winetricks", "--force " + f.fix.value, "Reinstall " + f.fix.label.removeprefix("Install "))
+            continue
         if f.fix and f.fix.kind == "winetricks" and f.fix.value and set(f.fix.value.split()) <= have:
             f.explanation += (f" — {f.fix.value} is already installed in this game's prefix. If the game still "
                               "fails, the cause is elsewhere (see the other findings or Try fixes for me).")

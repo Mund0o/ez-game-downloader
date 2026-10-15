@@ -89,3 +89,19 @@ def test_winetricks_failure_is_explained(library, app_paths):
         "\n=== 2026-10-13 01:00:00 winetricks dotnet48\nExecuting w_do_call dotnet48\n"
         "curl: (6) Could not resolve host: download.microsoft.com\n")
     assert "internet" in library._winetricks_failure(e.id, "dotnet48")
+
+
+def test_a_failed_dotnet_install_says_what_failed(library, app_paths):
+    """It used to show winetricks' "------" separator line as the error."""
+    e = library.repo.insert(LibraryEntry(title="V", status=LibraryStatus.INSTALLED))
+    sep = "-" * 54
+    (app_paths.logs / f"game-{e.id}.log").write_text(
+        f"\n=== 2026-10-14 03:40:38 winetricks dotnet48\nExecuting w_do_call dotnet40\n{sep}\n"
+        "0160:err:msi:execute_script Execution of script 0 halted; action L\"InstallFiles\" returned 1603\n"
+        f"{sep}\nwarning: Note: command wine dotNetFx40_Full_x86_x64.exe /q returned status 67. Aborting.\n{sep}\n")
+    why = library._winetricks_failure(e.id, "dotnet48")
+    assert "1603" in why and "---" not in why
+    (app_paths.logs / f"game-{e.id}.log").write_text(
+        f"\n=== 2026-10-14 03:40:38 winetricks vcrun2022\n{sep}\nwarning: Note: command wine vc_redist.x64.exe /q "
+        f"returned status 5. Aborting.\n{sep}\n")
+    assert library._winetricks_failure(e.id, "vcrun2022") == "the installer vc_redist.x64.exe stopped with error 5."

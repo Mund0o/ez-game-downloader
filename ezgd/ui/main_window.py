@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import QSettings, QSize, Qt, QTimer
+from PySide6.QtCore import QEvent, QSettings, QSize, Qt, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QHBoxLayout, QMainWindow, QMessageBox, QPushButton,
-                               QStackedWidget, QSystemTrayIcon, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QHBoxLayout, QLineEdit, QMainWindow, QMessageBox,
+                               QPushButton, QStackedWidget, QSystemTrayIcon, QVBoxLayout, QWidget)
 
 from ezgd import APP_DISPLAY_NAME
 from ezgd.core.fsutil import format_speed
@@ -24,6 +24,7 @@ from ezgd.ui.pages.wishlist import WishlistPage
 from ezgd.ui.widgets.common import ToastHost, label
 from ezgd.ui.widgets.covers import CoverCache
 from ezgd.ui.dialogs import browser as _browser    # loaded up front: quitting must not import
+from ezgd.ui import dropin, taskbar
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +32,12 @@ NAV = [("home", "Home", "home"), ("games", "All Games", "grid"), ("picks", "Onli
        ("wishlist", "Wishlist", "heart"), ("downloads", "Downloads", "download"), ("library", "Library", "library"),
        ("settings", "Settings", "settings")]
 THEME_KEYS = {"theme_accent", "theme_contrast"}
+SHORTCUTS = [("Ctrl+F", "Search (the page's own search, else All Games)"), ("Ctrl+1 … Ctrl+7", "Go to a page"),
+             ("Ctrl+N", "Add a download (magnet link, .torrent, file link)"), ("Ctrl+,", "Settings"),
+             ("F5", "Refresh the page"), ("F11", "Couch mode"), ("Esc", "Clear the search box you are typing in"),
+             ("Enter (Library list)", "Play the selected game"), ("F1", "This list"),
+             ("Drag and drop", "A .torrent, a magnet / download link, a game folder or an archive onto the window")]
+REMEMBERED_PAGES = ("home", "games", "picks", "wishlist", "downloads", "library")
 
 
 class MainWindow(QMainWindow):
@@ -52,7 +59,14 @@ class MainWindow(QMainWindow):
         for n, (key, _t, _i) in enumerate(NAV, 1):                               # Ctrl+1 … Ctrl+7
             QShortcut(QKeySequence(f"Ctrl+{n}"), self, lambda k=key: self.navigate(k))
         QShortcut(QKeySequence(Qt.Key_F11), self, self.open_couch)               # couch mode
+        QShortcut(QKeySequence("Ctrl+N"), self, lambda: self.actions.add_download_dialog(self))
+        QShortcut(QKeySequence("Ctrl+,"), self, lambda: self.navigate("settings"))
+        QShortcut(QKeySequence(Qt.Key_F5), self, self.refresh_page)
+        QShortcut(QKeySequence(Qt.Key_F1), self, self.show_shortcuts)
         self.couch = None
+        self._clip_seen: set[str] = set()                # clipboard links already offered
+        self._tray_hint_shown = False
+        self.setAcceptDrops(True)
 
         self.toasts = ToastHost(self)
         ToastHost.history_changed = lambda: QTimer.singleShot(0, self._notifications_changed)
@@ -74,6 +88,7 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         rl.addWidget(self.stack, 1)
         self.setCentralWidget(root)
+        self._drop_hint = dropin.DropHint(self)
 
         try:                                      # user-added sites need names/colours before pages exist
             theme.register_sources(bridge.run_sync(bridge.core.get_sources(), 10))
@@ -92,8 +107,10 @@ class MainWindow(QMainWindow):
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.tray = QSystemTrayIcon(app_icon(), self)
             self.tray.setToolTip(APP_DISPLAY_NAME)
-            self.tray.activated.connect(lambda _r: (self.showNormal(), self.raise_(), self.activateWindow()))
+            self.tray.activated.connect(self._tray_activated)
+            self.tray.setContextMenu(taskbar.tray_menu(self))
             self.tray.show()
+        self.launcher = taskbar.LauncherEntry()            # progress on the taskbar icon
 
         bridge.event.connect(self._on_event)
         self._library_timer = QTimer(self)
@@ -114,8 +131,12 @@ class MainWindow(QMainWindow):
         self.pages["library"].load_environment()
         self._reload_library()
         self.pages["home"].load()
+        self.pages["wishlist"].available_changed.connect(self._wishlist_badge)
         self.pages["wishlist"].load()
-        self.navigate("home")
+        for box in (self.pages["home"].search, self.pages["games"].search, self.pages["library"].filter,
+                    self.pages["settings"].find):
+            box.installEventFilter(self)                   # Esc clears it
+        self._restore_view()
 
     # -------------------------------------------------------------- layout
     def _sidebar(self) -> QWidget:
@@ -179,7 +200,149 @@ class MainWindow(QMainWindow):
                 self.pages["home"].check_system()
             except (KeyError, RuntimeError, AttributeError):
                 pass
+        if e.type() == QEvent.ActivationChange and self.isActiveWindow():
+            QTimer.singleShot(150, self, self._offer_clipboard)     # (the clipboard is readable once active)
         super().changeEvent(e)
+
+    # ------------------------------------------------------- getting things in
+    def _offer_clipboard(self) -> None:
+        """A magnet / .torrent link copied in the browser: offer to add it (once per link)."""
+        if self._quitting or self.couch is not None or QApplication.activeModalWidget() is not None:
+            return
+        try:
+            link = dropin.clipboard_link()
+        except RuntimeError:
+            return
+        if not link:
+            return
+        key = dropin.link_key(link)
+        if key in self._clip_seen:
+            return
+        self._clip_seen.add(key)
+        what = "A magnet link" if link.startswith("magnet:") else "A link to a .torrent file"
+        self.toasts.show(f"{what} is on your clipboard", "Add it as a download?", "info",
+                         action=("Add download", lambda: self.actions.add_download_dialog(self, link)))
+
+    def dragEnterEvent(self, e) -> None:                    # noqa: N802
+        items = dropin.classify(e.mimeData())
+        if items and self.couch is None:
+            e.acceptProposedAction()
+            self._drop_hint.show_for(items)
+        else:
+            e.ignore()
+
+    def dragMoveEvent(self, e) -> None:                     # noqa: N802
+        e.acceptProposedAction() if self._drop_hint.isVisible() else e.ignore()
+
+    def dragLeaveEvent(self, e) -> None:                    # noqa: N802
+        self._drop_hint.hide()
+        super().dragLeaveEvent(e)
+
+    def dropEvent(self, e) -> None:                         # noqa: N802
+        self._drop_hint.hide()
+        items = dropin.classify(e.mimeData())
+        if not items:
+            e.ignore()
+            return
+        e.acceptProposedAction()
+        # one after the other, after the drop has finished (dialogs inside a drop handler block the source app)
+        QTimer.singleShot(0, self, lambda: self._take_dropped(items))
+
+    def _take_dropped(self, items: list[tuple[str, str]]) -> None:
+        self.raise_()
+        self.activateWindow()
+        for kind, value in items:
+            if kind == "link":
+                self._clip_seen.add(dropin.link_key(value))
+                self.actions.add_download_dialog(self, value)
+            elif kind == "torrent":
+                self.actions.add_download_dialog(self, torrent=value)
+            elif kind == "import":
+                self.navigate("library")
+                self.pages["library"].import_path(value)
+
+    def eventFilter(self, obj, e) -> bool:                  # noqa: N802
+        if e.type() == QEvent.KeyPress and e.key() == Qt.Key_Escape and isinstance(obj, QLineEdit) and obj.text():
+            obj.clear()                                     # Esc clears a search box
+            return True
+        return super().eventFilter(obj, e)
+
+    def refresh_page(self) -> None:
+        key = next((k for k, p in self.pages.items() if p is self.stack.currentWidget()), "")
+        page = self.pages.get(key)
+        if key == "home":
+            page.load()
+        elif key == "games":
+            page.reload()
+        elif key == "picks":
+            page.load(force=True)
+        elif key == "wishlist":
+            page.load()
+        elif key == "downloads":
+            page.load_all()
+        elif key == "library":
+            self._reload_library()
+        elif key == "settings":
+            self.navigate("settings")
+
+    def show_shortcuts(self) -> None:
+        rows = "".join(f"<tr><td style='padding:3px 18px 3px 0'><b>{k}</b></td><td>{v}</td></tr>" for k, v in SHORTCUTS)
+        box = QMessageBox(self)
+        box.setWindowTitle("Keyboard shortcuts")
+        box.setTextFormat(Qt.RichText)
+        box.setText(f"<table>{rows}</table>")
+        box.exec()
+
+    def _wishlist_badge(self, n: int) -> None:
+        try:
+            self.nav_buttons["wishlist"].setText(f"  Wishlist ({n} available)" if n else "  Wishlist")
+        except RuntimeError:
+            pass
+
+    # ------------------------------------------------------- remembered view
+    def _restore_view(self) -> None:
+        import json
+        page = self._ui_state.value("page", "home")
+        try:
+            games = json.loads(self._ui_state.value("games_view", "{}") or "{}")
+            if isinstance(games, dict):
+                self.pages["games"].restore_view(games)
+        except (ValueError, TypeError):
+            pass
+        try:
+            sel = int(self._ui_state.value("library_selected", 0) or 0)
+        except (ValueError, TypeError):
+            sel = 0
+        if sel and self.pages["library"].current_id is None:
+            self.pages["library"].current_id = sel
+        self.navigate(page if page in REMEMBERED_PAGES else "home")
+
+    def _save_view(self) -> None:
+        import json
+        key = next((k for k, p in self.pages.items() if p is self.stack.currentWidget()), "home")
+        self._ui_state.setValue("page", key)
+        self._ui_state.setValue("games_view", json.dumps(self.pages["games"].view_state()))
+        self._ui_state.setValue("library_selected", self.pages["library"].current_id or 0)
+
+    # ------------------------------------------------------------- the tray
+    def _tray_activated(self, reason) -> None:
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            if self.isVisible() and not self.isMinimized() and self.isActiveWindow():
+                self.hide()
+            else:
+                self.show_from_tray()
+
+    def show_from_tray(self) -> None:
+        if self.couch is not None:
+            self.couch.open(self.couch.screen())
+            return
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def quit_from_tray(self) -> None:
+        self.show_from_tray()
+        self.close()
 
     def _notifications_changed(self) -> None:
         from ezgd.ui.widgets.common import ToastHost
@@ -254,6 +417,9 @@ class MainWindow(QMainWindow):
             pages["games"].hide_ids(ids)
             pages["picks"].hide_ids(ids)
             pages["home"].hide_ids(ids)
+        elif name == "fixmygame":
+            if self.couch is not None:
+                self.couch.fix_progress(payload)
         elif name == "game_state":
             pages["library"].game_state(payload)
             self._close_if_pending(payload)
@@ -359,6 +525,9 @@ class MainWindow(QMainWindow):
             self.pages["downloads"].set_summary(s)
             n = s["active"] + s["queued"]
             self.nav_buttons["downloads"].setText(f"  Downloads ({n})" if n else "  Downloads")
+            self.launcher.update(s.get("progress"), n)
+            if self.tray:
+                self.tray.setToolTip(taskbar.tray_tooltip(APP_DISPLAY_NAME, s))
         self.bridge.call(self.bridge.core.summary(), show, owner=self)
 
     # --------------------------------------------------------------- window
@@ -368,7 +537,12 @@ class MainWindow(QMainWindow):
 
     def force_quit(self) -> None:
         self._quitting = True
+        visible = self.isVisible()
         self.close()
+        if not visible:
+            # in the tray (or never shown, --minimized): closing a hidden window does not end Qt's loop, so a
+            # logout / SIGTERM / update left the app running without a window
+            QApplication.instance().quit()
 
     def _open_diagnose(self, entry_id: int) -> None:
         from ezgd.ui.dialogs.diagnose import open_diagnose
@@ -388,10 +562,10 @@ class MainWindow(QMainWindow):
         if self.couch is not None:
             self.couch.open(self.couch.screen())
             return
-        from ezgd.ui.couch import CouchWindow
+        from ezgd.ui.couch import make_couch
         screen = self.screen()
         try:
-            couch = CouchWindow(self.actions, list(self.pages["library"].entries.values()),
+            couch = make_couch(self.actions, list(self.pages["library"].entries.values()),
                                 set(self.pages["library"].running))
         except Exception:
             log.exception("couch mode could not start")
@@ -424,6 +598,8 @@ class MainWindow(QMainWindow):
             self.activateWindow()
             self._reload_library()
         QApplication.instance().setQuitOnLastWindowClosed(True)
+        from ezgd.ui import gcguard                        # couch mode's pictures (hundreds of MB) go back now
+        QTimer.singleShot(1500, self, gcguard.release)
 
     def _close_if_pending(self, payload: dict) -> None:
         """A game started from couch mode appeared after couch mode was left with "Quit game": close it now."""
@@ -448,7 +624,7 @@ class MainWindow(QMainWindow):
 
     def _focus_search(self) -> None:
         page = self.stack.currentWidget()
-        box = getattr(page, "filter", None) or getattr(page, "search", None)
+        box = getattr(page, "filter", None) or getattr(page, "search", None) or getattr(page, "find", None)
         if box is None:                                # pages without a search box: search everything
             self.navigate("games")
             box = getattr(self.pages["games"], "search", None)
@@ -458,7 +634,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e) -> None:
         try:
-            self._ui_state.setValue("geometry", self.saveGeometry())
+            if self.isVisible():
+                self._ui_state.setValue("geometry", self.saveGeometry())
+            self._save_view()
             self._ui_state.sync()
         except Exception:
             pass
@@ -481,8 +659,27 @@ class MainWindow(QMainWindow):
                 if in_browser:
                     msg.append(f"{in_browser} in-app browser download(s) are running. These cannot resume — they "
                                "will be cancelled and have to be started again.")
-                r = QMessageBox.question(self, "Quit", " ".join(msg) + " Quit?")
-                if r != QMessageBox.Yes:
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Question)
+                box.setWindowTitle("Quit")
+                box.setText(" ".join(msg))
+                tray = None
+                if self.tray and (active or extracting):
+                    tray = box.addButton("Keep downloading in the tray", QMessageBox.AcceptRole)
+                    box.setDefaultButton(tray)
+                quit_btn = box.addButton("Quit", QMessageBox.DestructiveRole)
+                box.addButton(QMessageBox.Cancel)
+                box.exec()
+                if tray is not None and box.clickedButton() is tray:
+                    e.ignore()
+                    self.hide()
+                    if not self._tray_hint_shown:
+                        self._tray_hint_shown = True
+                        self.tray.showMessage(APP_DISPLAY_NAME, "Still downloading. Click the tray icon to open the "
+                                              "app again; right-click it to quit.", QSystemTrayIcon.Information,
+                                              8000)
+                    return
+                if box.clickedButton() is not quit_btn:
                     e.ignore()
                     return
         self._quitting = True
@@ -501,4 +698,5 @@ class MainWindow(QMainWindow):
             pass
         if self.tray:
             self.tray.hide()
+        self.launcher.clear()
         e.accept()

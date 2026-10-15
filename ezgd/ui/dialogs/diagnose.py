@@ -3,13 +3,17 @@ fix — or an honest "no fix under Proton" / "nothing found"."""
 
 from __future__ import annotations
 
+import logging
+
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QComboBox, QDialog, QHBoxLayout, QLabel, QMessageBox, QScrollArea, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QComboBox, QDialog, QHBoxLayout, QLabel, QMessageBox, QProgressBar, QScrollArea,
+                               QVBoxLayout, QWidget)
 
 from ezgd.ui import theme
 from ezgd.ui.dialogs.misc import open_folder
 from ezgd.ui.widgets.common import button, card, chip, clear_layout, label
+
+log = logging.getLogger(__name__)
 
 
 def _describe_change(g: dict) -> str:
@@ -23,11 +27,15 @@ def _describe_change(g: dict) -> str:
         parts.append("DLL overrides: " + ";".join(f"{k}={v}" for k, v in g["dll_overrides"].items()))
     if g.get("options"):
         parts.append("Proton options: " + ", ".join(g["options"]))
+    files: dict[str, list[str]] = {}
     for e in g.get("edits") or []:
         if e.get("kind") == "move_aside":
             parts.append(f"move {e['path']} aside (kept as a backup)")
         else:
-            parts.append(f"edit {e['path']}: {e.get('key')}={e.get('value')} (backup kept)")
+            sec = f"[{e['section']}] " if e.get("section") else ""
+            files.setdefault(e["path"], []).append(f"{sec}{e.get('key')}={e.get('value')}")
+    for path, changes in files.items():                # one entry per file (Unreal fixes set several keys)
+        parts.append(f"edit {path}: {', '.join(changes)} (backup kept)")
     return " · ".join(parts)
 
 
@@ -164,6 +172,10 @@ class DiagnoseDialog(QDialog):
         c, self._fm_box = card(margins=(16, 12, 16, 12), spacing=6)
         self._fm_head = label("Fixing…", "h2")
         self._fm_box.addWidget(self._fm_head)
+        self._fm_bar = QProgressBar()                 # how far it is (the steps report it)
+        self._fm_bar.setRange(0, 100)
+        self._fm_bar.setValue(0)
+        self._fm_box.addWidget(self._fm_bar)
         self.body.addWidget(c)
         self._trial_rows.clear()
         c2, self._trial_box = card(margins=(16, 12, 16, 12), spacing=6)
@@ -181,6 +193,9 @@ class DiagnoseDialog(QDialog):
                                     self.summary.setText(f"Could not finish: {e}")), owner=self)
 
     def _fm_event(self, p: dict) -> None:
+        bar = getattr(self, "_fm_bar", None)
+        if bar is not None and p.get("progress") is not None:
+            bar.setValue(max(bar.value(), int(round(float(p["progress"]) * 100))))
         row = self._fm_rows.get(p["step"])
         if row is None:
             row = label("", wrap=True)
@@ -190,6 +205,11 @@ class DiagnoseDialog(QDialog):
         row.setText(f"{mark} {p['step']}" + (f" — {p['detail']}" if p["detail"] else ""))
 
     def _fix_done(self, v: dict) -> None:
+        try:
+            if getattr(self, "_fm_bar", None) is not None:
+                self._fm_bar.setValue(100)
+        except RuntimeError:                          # (the view was rebuilt meanwhile)
+            pass
         self._trials_finished()
         self.fix_btn.setEnabled(True)
         self._fm_head.setText("What the assistant did")
@@ -637,8 +657,14 @@ class DiagnoseDialog(QDialog):
         self.stop_btn.setEnabled(False)
 
     def _trial_event(self, p: dict) -> None:
+        from shiboken6 import isValid
         row = self._trial_rows.get(p["index"])
+        if row is not None and not isValid(row):           # the results were cleared for a new round of tests
+            row = None
         if row is None:
+            box = getattr(self, "_trial_box", None)
+            if box is None or not isValid(box):
+                return
             row = label("", wrap=True)
             self._trial_rows[p["index"]] = row
             self._trial_box.addWidget(row)
@@ -710,6 +736,12 @@ class DiagnoseDialog(QDialog):
                                     self.actions.fail("Could not start the diagnostic launch", e)), owner=self)
 
     def _on_event(self, name: str, payload) -> None:
+        try:
+            self._handle_event(name, payload)
+        except RuntimeError as exc:                        # a part of this window was already rebuilt or closed
+            log.debug("diagnose window: event %s after its widget went: %s", name, exc)
+
+    def _handle_event(self, name: str, payload) -> None:
         if name == "trial" and isinstance(payload, dict) and payload.get("id") == self.entry.id:
             self._trial_event(payload)
             return

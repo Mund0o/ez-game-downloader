@@ -16,6 +16,7 @@ SEARCH = "https://store.steampowered.com/api/storesearch/?term={term}&l=english&
 ITEMS = "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json={payload}"
 ASSET_BASE = "https://shared.akamai.steamstatic.com/store_item_assets/"
 STORE_PAGE = "https://store.steampowered.com/app/{appid}/"
+FULL_CONTROLLER, PARTIAL_CONTROLLER = 28, 18     # Steam's store categories "Full / Partial Controller Support"
 
 
 def store_url(appid: int) -> str:
@@ -57,12 +58,13 @@ def _asset(fmt: str | None, name: str | None) -> str | None:
 
 
 async def items(client, appids: list[int]) -> dict[int, dict]:
-    """{appid: {name, capsule, hero, header, released, coming_soon, early_access}} for up to 50 App IDs."""
+    """{appid: {name, capsule, hero, header, released, coming_soon, early_access, controller}} for up to 50 App
+    IDs. ``controller`` is "full", "partial" or "none" (Steam's controller support categories)."""
     ids = [int(a) for a in appids if a][:50]
     if not ids:
         return {}
     payload = {"ids": [{"appid": a} for a in ids], "context": {"language": "english", "country_code": "US"},
-               "data_request": {"include_assets": True, "include_release": True}}
+               "data_request": {"include_assets": True, "include_release": True, "include_categories": True}}
     url = ITEMS.format(payload=quote(json.dumps(payload, separators=(",", ":"))))
     res = await client.fetch(url, max_bytes=2 * 1024 * 1024, headers={"Accept": "application/json"})
     if res.status != 200:
@@ -88,5 +90,14 @@ async def items(client, appids: list[int]) -> dict[int, dict]:
             "coming_soon": bool(rel.get("is_coming_soon") or it.get("is_coming_soon")),
             "release_text": rel.get("custom_release_date_message") or rel.get("coming_soon_display"),
             "early_access": bool(rel.get("is_early_access")),
+            "controller": controller_support(it.get("categories")),
         }
     return out
+
+
+def controller_support(categories) -> str:
+    """"full" / "partial" / "none" from a store item's categories."""
+    ids = (categories or {}).get("controller_categoryids") or [] if isinstance(categories, dict) else []
+    if FULL_CONTROLLER in ids:
+        return "full"
+    return "partial" if PARTIAL_CONTROLLER in ids else "none"

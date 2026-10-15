@@ -169,9 +169,11 @@ async def test_fix_my_game_end_to_end(core, tmp_path, monkeypatch):
     r = await core.import_downloaded_file("steamrip:2", str(arc))
     game = tmp_path / "games" / "G" / "G"
     for _ in range(200):          # files appear one by one: wait until the extraction is recorded as finished
-        if any(x.get("status") == "completed" for x in core.extraction_repo.for_library(r["entry_id"])):
-            break
-        await asyncio.sleep(0.05)
+        if any(x.get("status") == "completed" for x in core.extraction_repo.for_library(r["entry_id"])) and \
+                core.library.get(r["entry_id"]).executable:
+            break                 # (and the import has chosen the exe: it wrote the entry last — it used to
+        await asyncio.sleep(0.05)  # overwrite the exe set below now and then, a flaky test)
+    await asyncio.sleep(0.2)
     e = core.library.get(r["entry_id"])
     core.library.set_executable(e.id, game / "Game.exe")
     core.library.update(e.id, steam_app_id=7777)
@@ -190,10 +192,13 @@ async def test_fix_my_game_end_to_end(core, tmp_path, monkeypatch):
 
     def second_check(entry_id, cand, n, cancel=None):         # the winner must pass twice
         checks.append(cand["label"])
-        return {"label": cand["label"], "overrides": cand["overrides"], "outcome": "ran", "detail": "ok"}
+        ok = bool(cand["overrides"])                         # the game as it is still crashes after the repairs
+        return {"label": cand["label"], "overrides": cand["overrides"], "outcome": "ran" if ok else "crashed",
+                "detail": "ok" if ok else "x"}
     monkeypatch.setattr(core.library, "run_trial", second_check)
     v = await core.fix_my_game(e.id)
-    assert checks == ["Start with DirectX 11 (second check)"]
+    # the repaired game is tested once as it is (root cause first), then the setups; the winner passes twice
+    assert checks == ["Current setup", "Start with DirectX 11 (second check)"]
     assert v["status"] == "fixed" and v["kept"] == "Start with DirectX 11"
     assert (game / "data.pak").read_bytes() == b"P" * 4000                          # repaired
     assert "AppId=7777" in (game / "steam_emu.ini").read_text()                      # emulator fixed
@@ -284,3 +289,32 @@ async def test_fix_my_game_investigates_first_when_the_logs_say_little(core, tmp
     steps = [p["step"] for n, p in events if n == "fixmygame"]
     assert "Investigating" in steps and started[0] == "Current setup"
     assert tricks and tricks[0] == ["vcrun2022"]             # the investigation found the cause; it was repaired
+
+
+async def test_fix_my_game_fixes_the_root_cause_instead_of_cycling_setups(core, tmp_path, monkeypatch):
+    """The test run showed the game's own error ("Visual C++ 2015-2022 is required"): that is installed and the
+    game tested again — no list of Protons and other setups (the user waited through all of them, 2026-10-14)."""
+    e, root = install(core, tmp_path, {}, log="\n=== 2026-10-10 10:00:00 Proton\ncrash\n=== exited with code 41 after 2s\n")
+    box = ('0204:trace:msgbox:MSGBOX_OnInit L"The following component(s) are required to run this program:\\n'
+           'Microsoft Visual C++ 2015-2022 Redistributable (x64)"\n')
+    installed: list = []
+    tests: list = []
+
+    def trial(entry_id, cand, n, cancel=None):
+        tests.append(cand["label"])
+        ok = bool(installed)
+        if not ok:
+            core.library.trial_evidence.setdefault(entry_id, {})[n] = {
+                "text": box, "exit_code": 41, "seconds": 2, "label": cand["label"], "overrides": cand["overrides"]}
+        return {"label": cand["label"], "overrides": cand["overrides"], "outcome": "ran" if ok else "crashed",
+                "detail": "kept running" if ok else "the game showed an error"}
+
+    async def no_broad_tests(*_a, **_kw):
+        raise AssertionError("the setups list must not be needed")
+    monkeypatch.setattr(core.library, "run_trial", trial)
+    monkeypatch.setattr(core.library, "run_winetricks", lambda eid, verbs, wait=False: installed.extend(verbs) or 0)
+    monkeypatch.setattr(core, "run_trials", no_broad_tests)
+    v = await core.fix_my_game(e.id)
+    assert installed == ["vcrun2022"]
+    assert v["status"] == "fixed" and "Visual C++" in v["kept"]
+    assert len(tests) == 3                                     # what does it do? → fixed → checked once more

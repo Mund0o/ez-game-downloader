@@ -231,3 +231,39 @@ def test_try_everything_tests_more_setups(tmp_path):
     deep = LibraryManager.trial_candidates(lib, 1, [], gen, deep=True)
     assert len(quick) == LibraryManager.MAX_TRIALS + 2 and len(deep) == LibraryManager.MAX_DEEP_TRIALS
     assert any("wined3d" in str(c["overrides"]) for c in LibraryManager.trial_candidates(lib, 1, [], [], deep=True))
+
+
+def test_imports_far_into_a_huge_exe_are_read(tmp_path):
+    """Valor Mortis' 191 MB Unreal exe keeps its import table 178 MB in: it used to read as "imports nothing"."""
+    import struct
+    exe = tmp_path / "Big.exe"
+    pe = bytearray(build_pe(["kernel32.dll", "UIAutomationCore.dll"], 64))
+    far = 100 * 1024 * 1024
+    struct.pack_into("<I", pe, 0x40 + 4 + 20 + 240 + 20, far)      # the section's data starts 100 MB in
+    with open(exe, "wb") as fh:
+        fh.write(pe[:0x400])
+        fh.seek(far)                                   # (sparse: nothing written in between)
+        fh.write(pe[0x400:])
+    assert read_pe(exe).imports == ["kernel32.dll", "uiautomationcore.dll"]
+
+
+def test_a_dll_this_proton_lacks_suggests_another_proton(tmp_path):
+    """Proton-CachyOS 11.0-20260703 ships no uiautomationcore.dll (every Unreal Engine 5 game imports it): the
+    assistant used to call it a missing game file and offered .NET; the answer is another Proton."""
+    cachy = fake_proton(tmp_path)
+    cachy.name = "Proton-CachyOS Latest"
+    ge_root = tmp_path / "GE"
+    d = ge_root / "files" / "lib" / "wine" / "x86_64-windows"
+    d.mkdir(parents=True)
+    for n in WINE_BASE + ["uiautomationcore.dll"]:
+        (d / n).write_bytes(b"MZ")
+    ge = FakeProton(ge_root, "Proton-GE Latest")
+    e, log = game(tmp_path, ["kernel32.dll", "UIAutomationCore.dll"])
+    r = dg.diagnose(e, tmp_path / "pfx", log, protons=[cachy, ge], proton_name=cachy.name).to_dict()
+    f = next(f for f in r["findings"] if f["key"] == "proton-lacks:uiautomationcore.dll")
+    assert f["fix"]["kind"] == "proton" and f["fix"]["value"] == "Proton-GE Latest"
+    log.write_text('013c:err:module:import_dll Library UIAutomationCore.DLL (which is needed by L"X:\\\\Game\\\\'
+                   'Game.exe") not found\n')
+    r = dg.diagnose(e, tmp_path / "pfx", log, protons=[cachy, ge], proton_name=cachy.name).to_dict()
+    keys = [f["key"] for f in r["findings"]]
+    assert "proton-lacks:uiautomationcore.dll" in keys and "missing-file:uiautomationcore.dll" not in keys

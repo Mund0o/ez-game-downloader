@@ -223,7 +223,8 @@ async def test_update_check_download_over_the_game_keeps_entry_and_saves(core, t
     v1.write_bytes(zip_bytes({"Hollow/Hollow.exe": b"MZ1", "Hollow/data.pak": b"old"}))
     r = await core.import_downloaded_file("fake:1", str(v1))
     eid = r["entry_id"]
-    await wait_for(lambda: any(x["status"] == "completed" for x in core.extraction_repo.for_library(eid)))
+    await wait_for(lambda: any(x["status"] == "completed" for x in core.extraction_repo.for_library(eid))
+                   and (core.library.get(eid).release or {}).get("version"))   # (written just after: was flaky)
     e = core.library.get(eid)
     assert e.release["version"] == "1.0.0" and e.release["from"] == "archive"
     if sys.platform != "win32":
@@ -695,3 +696,31 @@ async def test_stop_completely_kills_stubborn_games_and_their_prefix_processes(c
 @linux_only
 def test_stop_completely_when_nothing_runs(core):
     assert core.library.stop_completely(12345) == {"stopped": True, "left": []}
+
+
+def test_raw_buttons_count_once_when_steam_mirrors_the_controller(qtbot):
+    """A quick tap: the real pad's press and release, then Steam's virtual copy of both. The couch browser turns raw
+    A into mouse clicks — the copy made a second click and file hosts started the download twice."""
+    from ezgd.ui import gamepad as gp
+    g = gp.Gamepads()
+    raw, acts = [], []
+    g.button.connect(lambda n, d: raw.append((n, d)))
+    g.action.connect(acts.append)
+    real, virtual = FakeDev("/dev/input/event90"), FakeDev("/dev/input/event91")
+    g._event(real, gp.EV_KEY, gp.BTN_SOUTH, 1)
+    g._event(real, gp.EV_KEY, gp.BTN_SOUTH, 0)
+    g._event(virtual, gp.EV_KEY, gp.BTN_SOUTH, 1)               # Steam's copy, after the real button is up
+    g._event(virtual, gp.EV_KEY, gp.BTN_SOUTH, 0)
+    assert raw == [("a", True), ("a", False)] and acts == ["a"]
+    raw.clear()
+    g._event(real, gp.EV_KEY, gp.BTN_SOUTH, 1)                  # overlapping copy (the usual case)
+    g._event(virtual, gp.EV_KEY, gp.BTN_SOUTH, 1)
+    g._event(real, gp.EV_KEY, gp.BTN_SOUTH, 0)
+    g._event(virtual, gp.EV_KEY, gp.BTN_SOUTH, 0)
+    assert raw == [("a", True), ("a", False)]
+    raw.clear()
+    g._raw_owner["a"] = ("/dev/input/event90", 0.0, False)       # long after: the other device may press again
+    g._event(virtual, gp.EV_KEY, gp.BTN_SOUTH, 1)
+    g._event(virtual, gp.EV_KEY, gp.BTN_SOUTH, 0)
+    assert raw == [("a", True), ("a", False)]
+    g.stop()

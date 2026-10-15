@@ -29,6 +29,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--browser-check", metavar="URL", help=argparse.SUPPRESS)   # smoke test of the in-app browser
     p.add_argument("--open-dialog", metavar="KIND:ID", help=argparse.SUPPRESS)  # smoke test: diagnose:<library id>
     p.add_argument("--play", type=int, metavar="ID", help=argparse.SUPPRESS)   # play mode, started by Steam
+    p.add_argument("--minimized", action="store_true",
+                   help="start in the tray (or minimized), e.g. when started with the desktop session")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return p.parse_args(argv)
 
@@ -121,6 +123,9 @@ def _run(args, paths, log_file, previous_crash) -> int:
     app = QApplication(sys.argv[:1])
     from ezgd.ui import gcguard
     gcguard.install(app)                  # garbage collection on the main thread only (see gcguard.py)
+    from PySide6.QtCore import Qt as _Qt
+    from ezgd.library import screenread   # the debugging assistant never photographs the app's own windows
+    app.applicationStateChanged.connect(lambda st: screenread.set_app_focused(st == _Qt.ApplicationActive))
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_DISPLAY_NAME)
     app.setApplicationVersion(__version__)
@@ -156,7 +161,12 @@ def _run(args, paths, log_file, previous_crash) -> int:
 
     from ezgd.ui.main_window import MainWindow
     win = MainWindow(bridge, paths, settings)
-    win.show()
+    if args.minimized and win.tray is not None:
+        pass                                  # in the tray: the icon opens it
+    elif args.minimized:
+        win.showMinimized()
+    else:
+        win.show()
     from ezgd.core import instance
 
     def bring_to_front() -> None:
@@ -169,6 +179,9 @@ def _run(args, paths, log_file, previous_crash) -> int:
     crashreport.set_callback(notifier.submit)        # errors nothing handled → a window with a copyable code
     if previous_crash is not None and not (args.screenshot or args.quit_after):
         QTimer.singleShot(1500, lambda: notifier.submit(previous_crash))
+    # everything loaded at start (modules, classes, the window) lives as long as the app: the full garbage
+    # collection skips it from now on (200,000 objects: 33 ms → 2 ms, a dropped frame every 30 s in couch mode)
+    QTimer.singleShot(4000, gcguard.freeze_startup)
     if args.page == "couch":
         QTimer.singleShot(1500, win.open_couch)               # smoke testing couch mode
     elif args.page != "home":
@@ -229,6 +242,8 @@ def _run(args, paths, log_file, previous_crash) -> int:
         browser.shutdown()
     except Exception:
         log.exception("in-app browser did not shut down cleanly")
+    from ezgd.ui import artwork
+    artwork.shutdown()                    # couch mode's artwork helper process
     try:
         bridge.run_sync(core.shutdown(), timeout=30)
     except Exception:

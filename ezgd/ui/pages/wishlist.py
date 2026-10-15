@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (QButtonGroup, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea,
                                QSizePolicy, QVBoxLayout, QWidget)
@@ -62,6 +62,7 @@ def placeholder(title: str, w: int, h: int) -> QPixmap:
 
 
 class WishlistPage(QWidget):
+    available_changed = Signal(int)            # games a site has now (the sidebar's badge)
     def __init__(self, actions, parent=None):
         super().__init__(parent)
         self.actions = actions
@@ -159,6 +160,7 @@ class WishlistPage(QWidget):
     def _loaded(self, items: list[dict]) -> None:
         self.items = items
         n_av = sum(1 for i in items if i["status"] == "available")
+        self.available_changed.emit(n_av)
         if items:
             self.summary.setText(f"{len(items)} game{'s' if len(items) != 1 else ''} · {n_av} available now · "
                                  "checked every few hours on every source that allows it")

@@ -40,7 +40,8 @@ BUTTONS = {BTN_SOUTH: "a", BTN_EAST: "b", BTN_NORTH: "x", BTN_WEST: "x", BTN_C: 
 EVENT = struct.Struct("llHHi")                      # struct input_event (64-bit: timeval, type, code, value)
 ABSINFO = struct.Struct("iiiiii")                   # value, minimum, maximum, fuzz, flat, resolution
 REPEAT_DELAY, REPEAT_EVERY, REPEAT_FAST, FAST_AFTER = 0.36, 0.11, 0.055, 1.4
-DUPLICATE_WINDOW = 0.06                             # the same press from two devices (Steam's virtual pad + the real)
+DUPLICATE_WINDOW = 0.25                             # the same press from two devices (Steam's virtual pad + the real):
+#                                                     Steam's copy can come late — even after the real button is up
 STEAM_VIRTUAL = (0x28DE, 0x11FF)                    # Steam Input's virtual pad (mirrors a real controller)
 
 
@@ -158,6 +159,8 @@ class Gamepads(QObject):
         self._held: str | None = None
         self._held_since = 0.0
         self._last: dict[str, tuple[float, str]] = {}
+        self._raw_owner: dict[str, tuple[str, float, bool]] = {}    # button → (device, pressed at, still down)
+        self._raw_ignored: set[tuple[str, str]] = set()             # (button, device) presses dropped as copies
         self.family = ""                                 # "" until a controller is connected
         self.pointer_mode = False                        # the left stick moves a pointer: no stick → directions
         self._repeat = QTimer(self)
@@ -166,7 +169,8 @@ class Gamepads(QObject):
         self._scan = QTimer(self)
         self._scan.setInterval(2000)
         self._scan.timeout.connect(self.rescan)
-        self.enabled = os.name != "nt" and Path("/sys/class/input").is_dir()
+        self.enabled = os.name != "nt" and Path("/sys/class/input").is_dir() and \
+            os.environ.get("EZGD_NO_GAMEPADS") != "1"          # (the tests: never the computer's real controllers)
 
     def start(self) -> None:
         if not self.enabled:
@@ -294,7 +298,7 @@ class Gamepads(QObject):
                 self._direction(dev, name if value else None, name)
             else:
                 if value in (0, 1):
-                    self.button.emit(name, bool(value))
+                    self._raw(dev, name, bool(value))
                 if value == 1:
                     self._emit(dev, name)
         elif typ == EV_ABS:
@@ -353,6 +357,28 @@ class Gamepads(QObject):
             self.action.emit(self._held)
         if held >= FAST_AFTER and self._repeat.interval() != int(REPEAT_FAST * 1000):
             self._repeat.setInterval(int(REPEAT_FAST * 1000))     # held a while: scroll faster
+
+    def _raw(self, dev: _Device, name: str, down: bool) -> None:
+        """Button down / up, once per press however many devices report it. Steam's virtual pad repeats every press
+        of the real controller, sometimes after the real button was already let go: in the couch browser (A = the
+        mouse button) that was a second click — a file host's download button started the download twice."""
+        now = time.monotonic()
+        owner = self._raw_owner.get(name)
+        if down:
+            if owner is not None and owner[0] != dev.path and (owner[2] or now - owner[1] < DUPLICATE_WINDOW):
+                self._raw_ignored.add((name, dev.path))
+                return
+            self._raw_owner[name] = (dev.path, now, True)
+            self.button.emit(name, True)
+            return
+        if (name, dev.path) in self._raw_ignored:
+            self._raw_ignored.discard((name, dev.path))
+            return
+        if owner is not None:
+            if owner[0] != dev.path:
+                return                            # not the device that pressed it
+            self._raw_owner[name] = (owner[0], owner[1], False)
+        self.button.emit(name, False)
 
     def _emit(self, dev: _Device, name: str) -> None:
         now = time.monotonic()

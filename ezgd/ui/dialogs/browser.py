@@ -301,6 +301,11 @@ class BrowserDownload:
                 "eta": eta, "error": self.error, "library": self.library, "path": str(self.path)}
 
 
+def _plain_name(name: str) -> str:
+    """``Game (1).rar`` → ``game.rar``: the browser renames a file it is already saving."""
+    return re.sub(r"\s*\(\d{1,2}\)(?=\.[^.]+$|$)", "", name or "").casefold()
+
+
 class BrowserDownloads(QObject):
     """Owns every in-app browser transfer for the app's lifetime (pop-ups come and go)."""
 
@@ -343,6 +348,12 @@ class BrowserDownloads(QObject):
         if req.downloadFileName().lower().endswith(BLOCKED_DOWNLOADS):
             req.cancel()                              # a program, not a game archive: almost always an ad
             session.blocked_download(req.downloadFileName())
+            return
+        name, url = _plain_name(req.downloadFileName()), req.url().toString()
+        if any(d.final is None and (d.req.url().toString() == url or _plain_name(d.req.downloadFileName()) == name)
+               for d in self.items.values()):
+            req.cancel()                              # already downloading it (a double click, a page asking twice)
+            log.info("browser download: %s is already downloading — the second request was dropped", name)
             return
         self.dest.mkdir(parents=True, exist_ok=True)
         req.setDownloadDirectory(str(self.dest))

@@ -87,6 +87,10 @@ class Settings:
     couch_resolution: str = ""                   # custom size in screen pixels, "2560x1440"
     couch_ui_scale: int = 100                    # interface size in percent (100 = fitted to the screen)
     couch_steady_frames: bool = True             # one steady frame rate (no flicker on VRR screens)
+    couch_gpu: bool = True                       # couch mode's frames shown through OpenGL (off: as before)
+    couch_controller_only: bool = True           # couch Store: only games with (full or partial) controller support
+    couch_intro: bool = True                     # the 2-second intro video when couch mode opens (any button skips)
+    couch_intro_sound: bool = True               # … with its sound
     notifications_enabled: bool = True
     # diagnostics
     log_level: str = "INFO"

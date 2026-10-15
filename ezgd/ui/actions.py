@@ -33,6 +33,7 @@ class Actions(QObject):
         self.toasts = toasts
         self.settings = settings
         self.installed_keys: set[str] = set()
+        self._told_in_steam: set[int] = set()
 
     # ------------------------------------------------------------ downloads
     def start_download(self, parent: QWidget, game_id: str, method_index: int, on_done=None,
@@ -154,8 +155,8 @@ class Actions(QObject):
                                  lambda e: failed(e, False))
         self.bridge.call(self.core.import_downloaded_file(game.id, path), done, failed)
 
-    def add_download_dialog(self, parent: QWidget, initial: str = "") -> None:
-        dlg = AddDownloadDialog(self.settings, parent, initial)
+    def add_download_dialog(self, parent: QWidget, initial: str = "", torrent: str = "") -> None:
+        dlg = AddDownloadDialog(self.settings, parent, initial, torrent)
         if dlg.exec() != AddDownloadDialog.Accepted:
             return
         v = dlg.values()
@@ -225,7 +226,15 @@ class Actions(QObject):
                                                          "success"), ok_started()),
                              not_started)
 
-        def via_steam(_r=None) -> None:
+        def via_steam(r=None) -> None:
+            skipped = (r or {}).get("skipped") if isinstance(r, dict) else None
+            if skipped:
+                names = ", ".join(f"{x['title']} (as “{x['in_steam_as']}”)" for x in skipped[:4])
+                self.toasts.show("Already in Steam — not added twice", names + (" …" if len(skipped) > 4 else ""),
+                                 "info")
+                mine = next((x for x in skipped if x["title"] == entry.title), None)
+                if mine is not None:                # this game itself: Steam has it under another entry
+                    return direct(f"Steam already has it as “{mine['in_steam_as']}”")
             self.bridge.call(self.core.library_call("launch_via_steam", entry.id),
                              lambda _p: (self.toasts.show("Starting through Steam",
                                                           f"{entry.title} — with the Steam overlay "
@@ -234,6 +243,10 @@ class Actions(QObject):
                                                          "warning"), direct()))
 
         if not st.get("use"):
+            if st.get("in_steam_as") and entry.id not in self._told_in_steam:
+                self._told_in_steam.add(entry.id)       # (once per session)
+                return direct(f"Steam already has it as “{st['in_steam_as']}”, so it was not added a second time "
+                              "(friends-list overlay)")
             return direct()
         if st.get("ready"):
             return via_steam()

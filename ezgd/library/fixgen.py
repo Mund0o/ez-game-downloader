@@ -237,6 +237,80 @@ def _unity_graphics_jobs(ctx, symptom: str, findings: list[dict]) -> list[Genera
                                  "value": "0"}])]
 
 
+# ----------------------------------------------------------- Unreal Engine: the game's own settings files
+def _ue_config_dirs(ctx) -> list[Path]:
+    """Where an Unreal game keeps its settings: <prefix>/…/AppData/Local/<Project>/Saved/Config/Windows (UE5) or
+    …/WindowsNoEditor (UE4). Both when the game has not written either yet."""
+    if ctx.engine != "Unreal Engine" or getattr(ctx, "prefix_dir", None) is None:
+        return []
+    exe = ctx.exe
+    ships = [exe] if exe.name.lower().endswith("-shipping.exe") else \
+        sorted(exe.parent.glob("*/Binaries/Win64/*-Shipping.exe"))
+    if not ships or len(ships[0].parents) < 3:
+        return []
+    project = ships[0].parents[2].name
+    base = ctx.prefix_dir / "pfx" / "drive_c" / "users" / "steamuser" / "AppData" / "Local" / project / "Saved" / \
+        "Config"
+    have = [base / d for d in ("Windows", "WindowsNoEditor") if (base / d).is_dir()]
+    return have or [base / "Windows", base / "WindowsNoEditor"]
+
+
+def _ue_edits(dirs: list[Path], name: str, section: str, values: dict[str, str]) -> list[dict]:
+    return [{"path": str(d / name), "kind": "ini", "section": section, "key": k, "value": v, "create": True}
+            for d in dirs for k, v in values.items()]
+
+
+def _unreal(ctx, symptom, findings, deep) -> list[GeneratedFix]:
+    """Edits to an Unreal game's own settings (backed up; tested on a copy first): DirectX 11 in its config for
+    games that ignore -dx11, windowed mode for black screens, lower settings / no ray tracing for GPU crashes and
+    out-of-memory, and no start-up movies (they need Windows' media components)."""
+    dirs = _ue_config_dirs(ctx)
+    if not dirs:
+        return []
+    keys = " ".join(f["key"] for f in findings)
+    graphics = deep or symptom in ("no_start", "crash_later", "black_screen") or any(
+        k in keys for k in ("dx12", "gpu", "vulkan", "graphics", "shaders", "vram", "crash", "dump"))
+    out: list[GeneratedFix] = []
+    rel = "AppData/Local/…/Saved/Config"
+    if graphics:
+        out.append(GeneratedFix(
+            "ue:config-dx11", "Set DirectX 11 in the game's settings file",
+            "Some Unreal games ignore “-dx11” on the command line; their Engine.ini decides the renderer. This sets "
+            f"DefaultGraphicsRHI to DirectX 11 there ({rel}, a backup is kept).",
+            edits=_ue_edits(dirs, "Engine.ini", "/Script/WindowsTargetPlatform.WindowsTargetSettings",
+                            {"DefaultGraphicsRHI": "DefaultGraphicsRHI_DX11"})))
+    if symptom == "black_screen" or deep:
+        out.append(GeneratedFix(
+            "ue:config-windowed", "Switch the game to windowed mode in its settings",
+            "A black screen in an Unreal game is often its saved fullscreen mode failing; GameUserSettings.ini is set "
+            "to windowed (FullscreenMode=2) — switch back in the game's options once it shows.",
+            edits=_ue_edits(dirs, "GameUserSettings.ini", "/Script/Engine.GameUserSettings",
+                            {"FullscreenMode": "2", "LastConfirmedFullscreenMode": "2",
+                             "PreferredFullscreenMode": "2"})))
+    if symptom in ("crash_later", "slow") or deep or any(k in keys for k in ("vram", "gpu", "memory", "dump")):
+        low = {f"sg.{g}Quality": "1" for g in ("ViewDistance", "AntiAliasing", "Shadow", "GlobalIllumination",
+                                               "Reflection", "PostProcess", "Texture", "Effects", "Foliage",
+                                               "Shading")}
+        out.append(GeneratedFix(
+            "ue:config-low", "Lower the game's graphics settings",
+            "Crashes after a while and graphics-device errors in Unreal games are often the GPU running out of "
+            "memory; this sets the game's quality levels to Low in GameUserSettings.ini (raise them again in the "
+            "game once it is stable).",
+            edits=_ue_edits(dirs, "GameUserSettings.ini", "ScalabilityGroups", low)))
+        out.append(GeneratedFix(
+            "ue:config-no-rt", "Turn off ray tracing in the game's settings",
+            "Ray tracing (and Lumen's hardware ray tracing) is the least stable part of Unreal games under Proton; "
+            "Engine.ini turns it off.",
+            edits=_ue_edits(dirs, "Engine.ini", "SystemSettings",
+                            {"r.RayTracing": "0", "r.Lumen.HardwareRayTracing": "0"})))
+    if symptom in ("no_start", "black_screen") or deep or any(k in keys for k in ("media", "mf", "video")):
+        out.append(GeneratedFix(
+            "ue:nomovie", "Skip the start-up movies",
+            "Unreal games play their intro videos with Windows' media components, which Proton does not always "
+            "have; “-nomovie” skips them (a common cause of crashes, hangs or a black screen right at start).", args="-nomovie"))
+    return out
+
+
 def _audio(ctx, symptom: str) -> list[GeneratedFix]:
     if symptom != "no_sound":
         return []
@@ -540,7 +614,7 @@ def generate(ctx, findings: list[dict], symptom: str = "", learned: list[dict] |
     fixes += _memory(ctx, symptom if not deep else "crash_later", findings)
     fixes += _community(ctx)
     for gen in (_sync, _cpu_cores, _locale, _setup_toggles, _vkd3d, _ntsync, _vkd3d_more, _shader_cache, _heap,
-                _d3d8, _wow64, _game_drive, _controller, _no_d3d11, _windows_version):
+                _d3d8, _wow64, _game_drive, _controller, _no_d3d11, _windows_version, _unreal):
         try:
             fixes += gen(ctx, symptom, findings, deep)
         except Exception:                          # one generator must not stop the others
@@ -587,6 +661,16 @@ def apply_edits(edits: list[dict], path_map: tuple[Path, Path] | None = None) ->
                 p.rename(dst)
                 done.append((p, ("move", dst)))
             continue
+        if e.get("kind") == "ini":                  # "[section]" + key=value (Unreal's config files)
+            existed = p.is_file()
+            if not existed and not e.get("create"):
+                continue
+            original = p.read_bytes() if existed else None
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(set_ini(original.decode("utf-8", "replace") if original else "", e["section"], e["key"],
+                                 str(e["value"])), "utf-8")
+            done.append((p, original if existed else ("created",)))
+            continue
         if e.get("kind") != "keyval" or not p.is_file():
             continue
         original = p.read_bytes()
@@ -600,9 +684,35 @@ def apply_edits(edits: list[dict], path_map: tuple[Path, Path] | None = None) ->
     return done
 
 
+def set_ini(text: str, section: str, key: str, value: str) -> str:
+    """``key=value`` in ``[section]`` of an INI text (the section is added when missing; other lines untouched)."""
+    lines = text.splitlines()
+    head = f"[{section}]"
+    start = next((i for i, ln in enumerate(lines) if ln.strip().lower() == head.lower()), None)
+    if start is None:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines += [head, f"{key}={value}"]
+        return "\n".join(lines) + "\n"
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].strip().startswith("[")), len(lines))
+    for i in range(start + 1, end):
+        if lines[i].split("=", 1)[0].strip().lower() == key.lower():
+            lines[i] = f"{key}={value}"
+            return "\n".join(lines) + "\n"
+    while end > start + 1 and not lines[end - 1].strip():
+        end -= 1
+    lines.insert(end, f"{key}={value}")
+    return "\n".join(lines) + "\n"
+
+
 def revert_edits(done: list[tuple[Path, object]]) -> None:
     for p, original in reversed(done):
-        if isinstance(original, tuple) and original[0] == "move":
+        if isinstance(original, tuple) and original[0] == "created":
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        elif isinstance(original, tuple) and original[0] == "move":
             if p.exists():                              # what the game rebuilt during the test
                 shutil.rmtree(p, ignore_errors=True) if p.is_dir() else p.unlink()
             original[1].rename(p)
@@ -613,6 +723,7 @@ def revert_edits(done: list[tuple[Path, object]]) -> None:
 def backup_and_apply(edits: list[dict]) -> list[str]:
     """Permanent version (when the user keeps a setup): writes ``<file>.ezgd-backup-<time>`` first."""
     backups = []
+    backups_of: set[str] = set()
     for e in edits:
         p = Path(e["path"])
         if e.get("kind") == "move_aside":
@@ -621,10 +732,11 @@ def backup_and_apply(edits: list[dict]) -> list[str]:
                 p.rename(b)
                 backups.append(str(b))
             continue
-        if p.is_file():
+        if p.is_file() and str(p) not in backups_of:
             b = p.with_name(f"{p.name}.ezgd-backup-{time.strftime('%Y%m%d-%H%M%S')}")
             b.write_bytes(p.read_bytes())
             backups.append(str(b))
+            backups_of.add(str(p))
     apply_edits([e for e in edits if e.get("kind") != "move_aside"])
     return backups
 

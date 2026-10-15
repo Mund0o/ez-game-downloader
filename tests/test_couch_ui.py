@@ -247,6 +247,7 @@ def test_couch_store_search_game_page_download_and_downloads_menu(ui, qtbot):
     from ezgd.catalog.models import Game
     from ezgd.ui.couch import T_DOWNLOADS, T_STORE
     couch = _open_couch(win, qtbot)
+    couch.actions.settings["couch_controller_only"] = False    # the fixture games are not on (mocked) Steam
     couch.command("rb")
     couch.command("rb")                                        # Home → Library → Store
     assert couch.tab == T_STORE
@@ -452,14 +453,15 @@ def test_store_tiles_name_every_site(ui, qtbot):
 
 
 def test_couch_fills_the_screen_and_keeps_a_steady_frame_rate(ui, qtbot):
-    """A friend's couch mode left part of the screen uncovered and made his VRR screen flicker (uneven frames
-    move a VRR screen's refresh rate around)."""
+    """A friend's couch mode made his VRR screen flicker (uneven frames move a VRR screen's refresh rate around),
+    and a window that is no longer full screen asks for full screen again."""
     win, core, _ = ui
     couch = _open_couch(win, qtbot)
-    screen = couch.screen()
-    couch.resize(900, 600)                                     # e.g. placed short of the edges
+    couch.showNormal()
+    couch.resize(900, 600)                                     # e.g. taken out of full screen by the desktop
+    assert not couch.isFullScreen()
     couch._fit_screen()
-    assert couch.geometry() == screen.geometry()
+    assert couch.isFullScreen()
     assert couch._pump.isActive() and 8 <= couch._pump.interval() <= 34    # one steady rate (≤ 75 Hz)
     couch._dirty = False
     couch.update()
@@ -631,6 +633,7 @@ def test_store_all_games_from_every_site_with_sorting(ui, qtbot):
                             ("steamrip", "3", "Mid Game"), ("fitgirl", "4", "Zeta Run")):
         core.games.save(Game(src, sid, title, f"https://{src}.example/{sid}"))
     couch = _open_couch(win, qtbot)
+    couch.actions.settings["couch_controller_only"] = False
     couch._switch_tab(T_STORE)
     store = couch.pages[T_STORE]
     store.set_filter("all")
@@ -648,6 +651,112 @@ def test_store_all_games_from_every_site_with_sorting(ui, qtbot):
     assert titles == sorted(titles, key=str.casefold)
     couch.grab()
     assert not couch._paint_failed
+    couch.force_close()
+    qtbot.waitUntil(lambda: win.isVisible(), timeout=5000)
+
+
+def test_couch_never_overrules_the_full_screen_size(ui, qtbot, monkeypatch):
+    """A friend's couch mode filled the screen for a moment, then shrank: it set the size Qt reported for the
+    screen, which can be wrong with fractional scaling. Full screen's size is the window manager's alone."""
+    from PySide6.QtCore import QRect
+    win, core, _ = ui
+    couch = _open_couch(win, qtbot)
+    qtbot.wait(400)                                            # placed (and checked once) after opening
+    assert couch.isFullScreen()
+    given = couch.geometry()                                   # what the window manager gave it
+    screen = couch.screen()
+
+    class Wrong:                                               # Qt's screen, with a wrong size
+        def geometry(self):
+            return QRect(0, 0, 640, 480)
+
+        def name(self):
+            return screen.name()
+    wrong = Wrong()
+    monkeypatch.setattr(couch, "screen", lambda: wrong)
+    monkeypatch.setattr(couch, "display_target", lambda: (wrong, QRect(0, 0, 640, 480), "fullscreen"))
+    couch._fit_screen()                                        # Qt "thinks" the screen is 640×480
+    couch._come_back()
+    qtbot.wait(300)
+    assert couch.isFullScreen() and couch.geometry() == given
+    couch.force_close()
+    qtbot.waitUntil(lambda: win.isVisible(), timeout=5000)
+
+
+def test_couch_custom_size_uses_the_real_scale(ui, qtbot, monkeypatch):
+    """A custom resolution is in real pixels: at 150 % (where Qt's screen may claim 2×) 1200×600 real pixels are
+    800×400 of the window's own pixels."""
+    from ezgd.ui import couch as couch_module
+    win, core, _ = ui
+    couch = _open_couch(win, qtbot)
+    monkeypatch.setattr(couch_module, "real_scale", lambda screen, first=None: 1.5)
+    couch.actions.settings["couch_window"] = "custom"
+    couch.actions.settings["couch_resolution"] = "1200x600"
+    try:
+        _screen, geo, mode = couch.display_target()
+        assert mode == "custom" and (geo.width(), geo.height()) == (800, 400)
+        couch.actions.settings["couch_resolution"] = "7680x4320"
+        _screen, geo, _mode = couch.display_target()        # never bigger than the screen
+        assert (geo.width(), geo.height()) == (couch.screen().geometry().width(), couch.screen().geometry().height())
+    finally:
+        couch.actions.settings["couch_window"] = "fullscreen"
+        couch.actions.settings["couch_resolution"] = ""
+    couch.force_close()
+    qtbot.waitUntil(lambda: win.isVisible(), timeout=5000)
+
+
+def test_store_shows_only_games_that_work_with_a_controller(ui, qtbot, routes):
+    """Couch mode's Store lists only games Steam says have full or partial controller support (the default);
+    the App ID comes from the site, or from Steam's search by the exact title."""
+    import json
+    from urllib.parse import parse_qs, urlparse
+    import httpx
+    from ezgd.catalog.models import Game
+    from ezgd.ui.couch import T_STORE
+    win, core, _ = ui
+    searched = []
+
+    def search(req):
+        term = parse_qs(urlparse(str(req.url)).query)["term"][0]
+        searched.append(term)
+        items = {"Pad Game": [{"type": "app", "id": 100, "name": "Pad Game"}],
+                 "Couch Party": [{"type": "app", "id": 300, "name": "Couch Party"}]}.get(term, [])
+        return httpx.Response(200, json={"items": items})
+
+    def items(req):
+        payload = json.loads(parse_qs(urlparse(str(req.url)).query)["input_json"][0])
+        cats = {100: [28], 200: [], 300: [18]}
+        out = [{"appid": i["appid"], "success": 1, "name": f"app {i['appid']}",
+                "categories": {"controller_categoryids": cats[i["appid"]]}}
+               for i in payload["ids"] if i["appid"] in cats]
+        return httpx.Response(200, json={"response": {"store_items": out}})
+    routes.add_handler("https://store.steampowered.com/api/storesearch/*", search)
+    routes.add_handler("https://api.steampowered.com/IStoreBrowseService/GetItems/v1/*", items)
+    core.rate_limiter.overrides["steampowered.com"] = 0.0     # (the app spaces Steam's search 1 s apart)
+    pad = Game("fitgirl", "1", "Pad Game", "https://fitgirl.example/1")
+    mouse = Game("onlinefix", "2", "Mouse Game", "https://onlinefix.example/2")
+    mouse.steam_app_id = 200                                   # the site names it: no search needed
+    party = Game("steamrip", "3", "Couch Party", "https://steamrip.example/3")
+    nowhere = Game("crackedgames", "4", "Not On Steam", "https://crackedgames.example/4")
+    for g in (pad, mouse, party, nowhere):
+        core.games.save(g)
+    couch = _open_couch(win, qtbot)
+    couch._switch_tab(T_STORE)
+    store = couch.pages[T_STORE]
+    store.set_filter("all")
+    qtbot.waitUntil(lambda: {g.title for g in store._grid_items()} >= {"Pad Game", "Couch Party"}
+                    and not couch.checking_controllers(), timeout=15000)
+    shown = {g.title for g in store._grid_items()}
+    assert shown & {"Pad Game", "Couch Party", "Mouse Game", "Not On Steam"} == {"Pad Game", "Couch Party"}
+    assert "Mouse Game" not in searched                       # its App ID came from the site
+    assert "with controller support" in store._status()
+    couch.grab()
+    assert not couch._paint_failed
+    titles = json.loads((core.paths.cache / "steam-titles.json").read_text())
+    assert titles["pad game"][0] == 100 and titles["not on steam"][0] == 0        # remembered (misses too)
+    couch.actions.settings["couch_controller_only"] = False    # Settings → Store: every game again
+    store._vis.clear()
+    assert {"Pad Game", "Mouse Game", "Couch Party", "Not On Steam"} <= {g.title for g in store._grid_items()}
     couch.force_close()
     qtbot.waitUntil(lambda: win.isVisible(), timeout=5000)
 
@@ -710,3 +819,37 @@ def test_couch_browser_every_way_out_lands_in_couch_mode(ui, qtbot, server, how)
     couch.command("rb")                                        # the controller drives couch mode again
     couch.force_close()
     qtbot.waitUntil(lambda: win.isVisible(), timeout=5000)
+
+
+def test_fix_my_game_shows_a_progress_bar_in_couch_mode(ui, qtbot):
+    from ezgd.ui.couch import Overlay
+    win, core, _ = ui
+    couch = _open_couch(win, qtbot)
+    couch.overlay = Overlay("Fixing G…", "", busy=True, tag="fixing:7", progress=0.0)
+    win._on_event("fixmygame", {"id": 7, "step": "Testing", "status": "running", "detail": "did that fix it?",
+                                "progress": 0.55})               # the core's report reaches couch mode
+    assert couch.overlay.progress == 0.55 and "did that fix it?" in couch.overlay.text
+    couch.fix_progress({"id": 8, "step": "x", "progress": 0.9})          # another game's: ignored
+    assert couch.overlay.progress == 0.55
+    couch.grab()
+    assert not couch._paint_failed
+    couch.force_close()
+    qtbot.waitUntil(lambda: win.isVisible(), timeout=5000)
+
+
+def test_an_error_report_opens_above_a_modal_window(ui, qtbot):
+    """The report opened under the main window while Diagnose (modal) was open: it could not be clicked."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QDialog
+    from ezgd.core.crashreport import CrashReport
+    from ezgd.ui.dialogs.crash import CrashNotifier
+    win, core, _ = ui
+    modal = QDialog(win)
+    modal.setWindowModality(Qt.ApplicationModal)
+    modal.show()
+    qtbot.waitUntil(lambda: QApplication.activeModalWidget() is modal, timeout=3000)
+    n = CrashNotifier(lambda: win)
+    n._show(CrashReport("EZGD-PY-TEST01", "Something failed.", "full text"))
+    assert n._open is not None and n._open.parent() is modal
+    n._open.close()
+    modal.close()

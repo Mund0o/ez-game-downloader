@@ -553,9 +553,16 @@ class DownloadManager:
 
     def summary(self) -> dict:
         active = [t for t in self.tasks.values() if t.status in ACTIVE]
-        return {"active": len(active), "queued": sum(1 for t in self.tasks.values() if t.status is DownloadStatus.QUEUED),
-                "speed": sum(t.speed for t in active), "upload": sum(t.upload_speed for t in self.tasks.values()),
-                "speed_text": format_bytes(sum(t.speed for t in active)) + "/s"}
+        pending = active + [t for t in self.tasks.values() if t.status is DownloadStatus.QUEUED]
+        total = sum(t.total_bytes or 0 for t in pending)
+        done = sum(min(t.downloaded_bytes or 0, t.total_bytes or 0) for t in pending)
+        speed = sum(t.speed for t in active)
+        return {"active": len(active), "queued": len(pending) - len(active),
+                "speed": speed, "upload": sum(t.upload_speed for t in self.tasks.values()),
+                "speed_text": format_bytes(speed) + "/s",
+                # all running and queued downloads together (the taskbar's progress, the tray's tooltip)
+                "progress": done / total if total else None,
+                "eta": (total - done) / speed if total and speed > 0 else None}
 
     def apply_settings(self, key: str, value: Any) -> None:
         s = self.settings.settings

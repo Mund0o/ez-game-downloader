@@ -36,15 +36,18 @@ def test_two_screens_inner(ui, qtbot):
     assert len(screens) == 2
     couch = _open_couch(win, qtbot)
     big = next(s for s in screens if s.name() == "BIG")
-    couch.setScreen(big)                                       # the compositor put it on the bigger monitor
-    couch.setGeometry(big.geometry().x(), 0, 1920, 1080)
+    couch.showNormal()                                         # the compositor put it on the bigger monitor
+    couch.setScreen(big)
+    couch.move(big.geometry().topLeft())
+    couch.showFullScreen()
     qtbot.wait(100)
+    assert couch.geometry() == big.geometry()
     couch._fit_screen()
     qtbot.wait(100)
-    assert couch.geometry() == big.geometry()                  # it fills the monitor it is on
+    assert couch.screen() is big and couch.geometry() == big.geometry()     # the first monitor's size is not forced
     couch.actions.settings["couch_screen"] = "LEFT"            # a screen chosen in Settings: it goes there
     couch._fit_screen()
     qtbot.wait(100)
-    assert couch.screen().name() == "LEFT" and couch.geometry() == couch.screen().geometry()
+    assert couch.screen().name() == "LEFT" and couch.isFullScreen()
     couch.actions.settings["couch_screen"] = ""
     couch.force_close()

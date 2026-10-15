@@ -11,9 +11,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from ezgd.core.fsutil import is_within
+from ezgd.core.fsutil import is_within, safe_dirname
 from ezgd.database.repositories import GameRepository, LibraryRepository
-from ezgd.library import advisor, fixes, fixgen, repack, saves, steamrun
+from ezgd.library import advisor, errorbox, fixes, fixgen, repack, saves, screenread, steamrun
 from ezgd.library.executables import Candidate, find_executables, rank
 from ezgd.library.models import CompatConfig, LaunchMethod, LibraryEntry, LibraryStatus
 from ezgd.platform import IS_LINUX
@@ -138,6 +138,12 @@ def _drew_frames(text: str) -> bool | None:
 def _trial_reason(text: str) -> str:
     """Short reason for a failed trial run, from its Wine log."""
     import re as _re
+    msgs = errorbox.messages(text)
+    if msgs:                                           # the game said it itself
+        return f"the game showed an error: “{msgs[-1][:200]}”"
+    seen = [ln for ln in screenread.from_log(text) if screenread.STRONG.search(ln)]
+    if seen:                                           # … or drew it on its screen
+        return f"the game's screen showed: “{seen[0][:200]}”"
     m = _re.search(r"Library ([\w.\-]+\.dll) \(which is needed by", text, _re.I)
     if m:
         return f"{m.group(1)} not found"
@@ -152,6 +158,33 @@ def _trial_reason(text: str) -> str:
     if m:
         return f"{m.group(1)} anti-cheat"
     return ""
+
+
+class _BoxWatch:
+    """Follows a game's log while it runs: has it opened an error pop-up (see ezgd.library.errorbox)?"""
+
+    def __init__(self, log_path: Path, offset: int):
+        self.path, self.pos, self.tail, self.found = log_path, offset, "", False
+
+    def seen(self) -> bool:
+        if self.found:
+            return True
+        try:
+            with open(self.path, "rb") as fh:
+                fh.seek(self.pos)
+                chunk = fh.read(4 * 1024 * 1024).decode("utf-8", "replace")
+                self.pos = fh.tell()
+        except OSError:
+            return False
+        text = self.tail + chunk
+        self.tail = text[-400:]
+        if errorbox.shown(text):
+            self.found = True
+            self.text = text
+        return self.found
+
+    def messages(self) -> list[str]:
+        return errorbox.messages(getattr(self, "text", ""))
 
 
 _OF_INI_CACHE: dict[str, tuple[float, list]] = {}      # game folder → (when, OnlineFix.ini files found)
@@ -485,7 +518,7 @@ class LibraryManager:
         of_env = self.onlinefix_env(e)
         if of_env:
             fx.env = {**of_env, **(fx.env or {})}
-        return launcher.build_plan(
+        plan = launcher.build_plan(
             Path(exe), method=method, args=o.get("launch_args", e.launch_args), protons=self.protons(),
             proton_name=o.get("proton_version", e.proton_version) or self.settings.settings.proton_version or None,
             steam_root=self.steam_root(), prefix_dir=Path(o["prefix_dir"]) if o.get("prefix_dir") else
@@ -494,6 +527,10 @@ class LibraryManager:
             compat=e.compat_config, game_root=Path(e.install_path) if e.install_path else None,
             log_dir=self.paths.logs, fix_env=fx.env, fix_wrappers=fx.wrappers, fix_args=fx.args,
             fix_notes=fx.notes)
+        if launcher.is_windows_binary(Path(exe)) and "WINEDEBUG" not in plan.env and not plan.env.get("PROTON_LOG"):
+            # error pop-ups' text goes into the game's log (ezgd.library.errorbox) — the assistant reads it
+            plan.env = {**plan.env, "WINEDEBUG": errorbox.PLAY_WINEDEBUG}
+        return plan
 
     # ---------------------------------------------------------------- fixes
     def _context(self, e: LibraryEntry) -> fixes.GameContext:
@@ -530,7 +567,7 @@ class LibraryManager:
 
     # Wine debug channels for a diagnostic launch: errors from every component, DLL loading (module addresses
     # for crash locations) and exceptions — enough to explain a crash without flooding the log
-    DIAGNOSTIC_WINEDEBUG = "err+all,warn+module,+loaddll,+seh,fixme-all"
+    DIAGNOSTIC_WINEDEBUG = "err+all,warn+module,+loaddll,+seh,+msgbox,fixme-all"
 
     def launch(self, entry_id: int, confirmed: bool, diagnostic: bool = False) -> launcher.LaunchPlan:
         """Start the game. ``confirmed`` must be True when the executable is not trusted yet.
@@ -559,8 +596,12 @@ class LibraryManager:
         if plan.pre:
             self.emit("game_state", {"id": e.id, "running": False, "preparing": True})
             launcher.run_pre_launch(plan, log_path)       # raises LaunchError if an `&&` step fails
+        with open(log_path, "rb") as fh:
+            start = fh.seek(0, 2)
         proc = launcher.spawn(plan, log_path)
         self._processes[e.id] = (proc, time.monotonic(), plan, log_path)
+        if diagnostic:
+            self._watch_error_box(e.id, proc, log_path, start)
         e.executable_trusted = True
         e.last_played_at = time.time()
         e.play_count += 1
@@ -568,6 +609,37 @@ class LibraryManager:
         self.emit("game_state", {"id": e.id, "running": True})
         self.emit("library_changed", e.id)
         return plan
+
+    BOX_CLOSE_AFTER = 2.0          # seconds an error pop-up of a diagnostic run stays before the game is closed
+    SCREEN_LOOKS = (8, 24, 40)     # seconds into a test / diagnostic run when the game's screen is read
+
+    def _watch_error_box(self, entry_id: int, proc, log_path: Path, start: int) -> None:
+        """A diagnostic run: when the game opens an error pop-up, its text is in the log — close the game, so the
+        assistant analyses the run right away (instead of the game waiting on the pop-up)."""
+        def close() -> None:
+            time.sleep(self.BOX_CLOSE_AFTER)
+            if proc.poll() is None:
+                try:
+                    self.stop(entry_id)
+                except Exception:
+                    log.exception("closing the game after its error failed")
+
+        def watch() -> None:
+            box = _BoxWatch(log_path, start)
+            began = time.monotonic()
+            looks = list(self.SCREEN_LOOKS) + [70, 110]
+            while proc.poll() is None:
+                if box.seen():
+                    log.info("game %s showed an error box: %s", entry_id, "; ".join(box.messages()))
+                    close()
+                    return
+                if looks and time.monotonic() - began >= looks[0]:
+                    looks.pop(0)                       # errors drawn by the game itself (not Wine's)
+                    if screenread.stopped_on_error(screenread.look(log_path)):
+                        close()
+                        return
+                time.sleep(0.5)
+        threading.Thread(target=watch, daemon=True, name=f"errorbox-{entry_id}").start()
 
     # ------------------------------------------------------- running games
     def is_running(self, entry_id: int) -> bool:
@@ -937,7 +1009,7 @@ class LibraryManager:
     MAX_DEEP_TRIALS = 18
 
     def trial_candidates(self, entry_id: int, findings: list[dict], generated: list[dict] | None = None,
-                         deep: bool = False) -> list[dict]:
+                         deep: bool = False, protons: bool = True) -> list[dict]:
         """What "Try fixes for me" will test: the current setup, the recommended fixes, other Proton versions.
         ``deep`` ("Try everything"): every generic fix too, up to MAX_DEEP_TRIALS setups."""
         e = self.get(entry_id)
@@ -973,7 +1045,7 @@ class LibraryManager:
                 ov = {k: v for k, v in spec.items() if k in ("proton_version", "launch_args", "compat", "executable")}
                 if ov:
                     cands.insert(1, {"label": fx["label"], "overrides": ov})
-        for p in self.protons():
+        for p in (self.protons() if protons else []):     # (not when the evidence says the cause is elsewhere)
             if p.name != current and not any(c["overrides"].get("proton_version") == p.name for c in cands):
                 cands.append({"label": f"Use {p.name}", "overrides": {"proton_version": p.name}})
         graphics = any(k in (f.get("key") or "") for f in findings for k in ("graphics", "vulkan", "dx12", "dump-"))
@@ -1022,13 +1094,73 @@ class LibraryManager:
         dst = self.paths.prefixes / f"trial-{entry_id}-{n}"
         if dst.exists():
             shutil.rmtree(dst, ignore_errors=True)
+        how = "a copy of the game's prefix"
+        if src is None or not prefix_ready(src):
+            # another kind of Proton: a prefix of its own, prepared once with the runtimes the game's real prefix
+            # has (a fresh one lacked e.g. the Visual C++ runtime, and every test of another Proton failed on that
+            # instead of telling anything about Proton — Valor Mortis, 2026-10-14)
+            src = self._trial_base(entry_id, proton_name)
+            how = "a prefix of that Proton's kind (with the game's runtimes)"
         if src is not None and prefix_ready(src):
             r = subprocess.run(["cp", "-a", "--reflink=always", str(src), str(dst)], capture_output=True, timeout=120)
             if r.returncode == 0:
-                return dst, "a copy of the game's prefix"
+                return dst, how
             shutil.rmtree(dst, ignore_errors=True)
         dst.mkdir(parents=True)
         return dst, "a fresh prefix (your drive cannot make instant copies)"
+
+    # runtimes worth carrying into a test prefix of another Proton (quick to install; .NET is not)
+    CARRY_VERBS = ("vcrun", "d3dx", "d3dcompiler", "xact", "xinput", "physx", "msxml", "vb6run", "xna", "faudio")
+
+    def _trial_base(self, entry_id: int, proton_name: str | None) -> Path | None:
+        """A prepared prefix for testing ``proton_name`` (kept and reused: tests copy it in an instant)."""
+        e = self.get(entry_id)
+        proton = self._proton_named(e, proton_name)
+        if proton is None:
+            return None
+        base = self.paths.prefixes / f"testbase-{entry_id}-{safe_dirname(proton.name)}"
+        if prefix_ready(base):
+            return base
+        if not self.init_prefix(entry_id, base, proton.name):
+            return None
+        from ezgd.library.diagnose import installed_verbs
+        carry = sorted(v for v in installed_verbs(self.prefix_dir(entry_id)) if v.startswith(self.CARRY_VERBS))
+        if carry:
+            log_path = self.paths.logs / f"trial-{entry_id}.log"
+            self._winetricks_into(entry_id, carry, base, log_path, proton.name)
+        return base
+
+    def init_prefix(self, entry_id: int, prefix: Path, proton_name: str | None = None) -> bool:
+        """Have Proton create ``prefix`` the way it would for the game — by running Wine's own cmd.exe once (so
+        winetricks can install into a prefix before the game was ever started with that Proton)."""
+        if prefix_ready(prefix):
+            return True
+        e = self.get(entry_id)
+        proton = self._proton_named(e, proton_name)
+        if proton is None:
+            return False
+        cmd = next((p for p in (proton.path / "files" / "lib" / "wine" / "x86_64-windows" / "cmd.exe",
+                                proton.path / "files" / "lib64" / "wine" / "x86_64-windows" / "cmd.exe") if p.is_file()),
+                   None)
+        if cmd is None:
+            return False
+        prefix.mkdir(parents=True, exist_ok=True)
+        try:
+            plan = self.launch_plan(entry_id, {"prefix_dir": str(prefix), "proton_version": proton.name,
+                                               "executable": str(cmd), "launch_args": "/c exit 0"})
+        except (LibraryError, launcher.LaunchError, OSError):
+            return False
+        plan.env = {**plan.env, "WINEDEBUG": "-all"}
+        log_path = self.paths.logs / f"trial-{entry_id}.log"
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} preparing a prefix for {proton.name}\n")
+        proc = launcher.spawn(plan, log_path)
+        try:
+            proc.wait(timeout=240)
+        except subprocess.TimeoutExpired:
+            launcher.terminate(proc)
+        _stop_prefix_processes(prefix)
+        return prefix_ready(prefix)
 
     def run_trial(self, entry_id: int, cand: dict, n: int, cancel: threading.Event | None = None) -> dict:
         """Launch the game once with ``cand`` in a test prefix; report whether it crashed, exited or kept running."""
@@ -1046,6 +1178,8 @@ class LibraryManager:
             verbs = cand["overrides"].get("winetricks") or []
             if verbs:                                  # components / Windows version: into the copy, then test
                 if not prefix_ready(prefix):
+                    self.init_prefix(entry_id, prefix, cand["overrides"].get("proton_version"))
+                if not prefix_ready(prefix):
                     result.update(outcome="error", seconds=0, detail="needs the game's own prefix — start the game "
                                                                      "once first")
                     return result
@@ -1061,16 +1195,26 @@ class LibraryManager:
                 offset = fh.tell()
             proc = launcher.spawn(plan, log_path)
             code = None
+            box = _BoxWatch(log_path, offset)
+            looks = list(self.SCREEN_LOOKS)
+            on_screen = False
             while time.monotonic() - started < self.TRIAL_SECONDS:
                 if cancel is not None and cancel.is_set():
                     break
                 code = proc.poll()
                 if code is not None:
                     break
+                if box.seen():                         # the game stopped on an error pop-up: read, close, done
+                    break
+                if looks and time.monotonic() - started >= looks[0]:
+                    looks.pop(0)                       # errors Wine does not know: read the game's screen
+                    if screenread.stopped_on_error(screenread.look(log_path)):
+                        on_screen = True
+                        break
                 time.sleep(0.5)
             secs = int(time.monotonic() - started)
-            still = proc.poll() is None
-            if still:
+            still = proc.poll() is None and not box.found and not on_screen
+            if proc.poll() is None:
                 launcher.terminate(proc)
             try:
                 with open(log_path, "rb") as fh:
@@ -1477,11 +1621,11 @@ class LibraryManager:
     def run_winetricks(self, entry_id: int, verbs: list[str], wait: bool = False) -> int | None:
         """Install runtimes (e.g. vcrun2022, d3dx9) into the game's prefix — only when a diagnosis asks for them."""
         import re as _re
-        if not verbs or not all(_re.fullmatch(r"[a-z0-9_]+", v) for v in verbs):
+        if not verbs or not all(_re.fullmatch(r"[a-z0-9_]+", v) or v == "--force" for v in verbs):
             raise LibraryError("invalid winetricks verb")
         e = self.get(entry_id)
         prefix = self.prefix_dir(entry_id)
-        if not prefix_ready(prefix):
+        if not prefix_ready(prefix) and not (wait and self.init_prefix(entry_id, prefix)):
             raise LibraryError("The Proton prefix does not exist yet — launch the game once first.")
         proton = self._proton_for(e)
         wt = shutil.which("winetricks")
@@ -1501,6 +1645,10 @@ class LibraryManager:
         return None
 
     _WT_REASONS = [
+        (r"err:msi:.*returned 1603",
+         "Microsoft's installer failed inside this game's prefix (Windows Installer error 1603). The .NET Framework "
+         "rarely installs into a 64-bit Proton prefix, and most games do not need it (Proton has its own: Wine "
+         "Mono). Run Diagnose first — it shows what the game really misses."),
         (r"(sha256sum mismatch|checksum mismatch|Checksum of .* is wrong)",
          "a downloaded installer was damaged or has changed — press it again; if it keeps failing, winetricks needs "
          "an update (it is fixed on its side)."),
@@ -1521,7 +1669,7 @@ class LibraryManager:
                          proton_name: str | None = None) -> int:
         """Install winetricks verbs into a test copy of the prefix (with the Proton the test uses)."""
         import re as _re
-        if not all(_re.fullmatch(r"[a-z0-9_]+", v) for v in verbs):
+        if not all(_re.fullmatch(r"[a-z0-9_]+", v) or v == "--force" for v in verbs):
             return 2
         e = self.get(entry_id)
         proton = self._proton_named(e, proton_name)
@@ -1552,7 +1700,12 @@ class LibraryManager:
         for rx, why in self._WT_REASONS:
             if _re.search(rx, text, _re.I):
                 return why
-        last = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.startswith(("===", "fixme:"))][-1:]
+        m = _re.search(r"command .*?(\w[\w.\-]*\.exe)\b.* returned status (\d+)", text)
+        if m:                                          # winetricks' own summary of what failed
+            return f"the installer {m.group(1)} stopped with error {m.group(2)}."
+        # the last line that says something (not winetricks' "-----" separators)
+        last = [ln.strip() for ln in text.splitlines() if _re.search(r"[A-Za-z]{3}", ln)
+                and not ln.startswith(("===", "fixme:")) and ":fixme:" not in ln][-1:]
         return ("winetricks stopped with an error" + (f": “{last[0][:160]}”" if last else "") + ".")
 
     def reset_prefix(self, entry_id: int) -> None:
@@ -1570,6 +1723,18 @@ class LibraryManager:
         exe, _args = steamrun.runner()
         opts = steamrun.launch_options(e.id)
         return exe, opts, steam.shortcut_appid(f'"{exe}"', e.title)
+
+    def _game_files(self, e: LibraryEntry) -> dict:
+        """What identifies this game in someone else's Steam shortcut (see steam.same_game_shortcut)."""
+        folder = e.install_path or (str(Path(e.executable).parent) if e.executable else None)
+        return {"title": e.title, "game_exe": e.executable, "game_dir": folder, "entry_id": e.id,
+                "live_ids": {x.id for x in self.repo.all()}}
+
+    def _add_runner_shortcut(self, root: Path, user: str, e: LibraryEntry) -> int:
+        exe, opts, _ = self._runner_shortcut(e)
+        files = self._game_files(e)
+        return steam.add_shortcut(root, user, name=e.title, exe=exe, start_dir=exe.parent, launch_options=opts,
+                                  game_exe=files["game_exe"], game_dir=files["game_dir"], live_ids=files["live_ids"])
 
     def talks_to_steam_itself(self, e: LibraryEntry) -> bool:
         """OnlineFix's fix uses the running Steam client itself. Started by Steam (or told a Steam game id) it
@@ -1672,8 +1837,15 @@ class LibraryManager:
             out["reason"] = "no executable chosen"
             return out
         exe, opts, appid = self._runner_shortcut(e)
-        out.update(use=True, ready=steam.has_shortcut(root, appid, exe, opts), steam_running=steam.is_steam_running(),
-                   appid=appid)
+        ready = steam.has_shortcut(root, appid, exe, opts)
+        if not ready:
+            copy = steam.steam_copy_of(root, **self._game_files(e))
+            if copy is not None:                  # never a second entry for the same game in Steam
+                out["reason"] = (f"Steam already has it as “{copy['name']}” "
+                                 + ("for another copy in your Library" if copy["by_app"] else "(added outside the app)"))
+                out["in_steam_as"] = copy["name"]
+                return out
+        out.update(use=True, ready=ready, steam_running=steam.is_steam_running(), appid=appid)
         return out
 
     def start_steam(self, timeout: float = 90.0) -> bool:
@@ -1714,13 +1886,19 @@ class LibraryManager:
         files = {u: root / "userdata" / u / "config" / "shortcuts.vdf" for u in users}
         before = {u: (f.read_bytes() if f.exists() else None) for u, f in files.items()}
         added = 0
+        skipped: list[dict] = []
         try:
             for e in self.repo.all():
                 if not e.executable:
                     continue
-                exe, opts, appid = self._runner_shortcut(e)
-                for user in users:
-                    steam.add_shortcut(root, user, name=e.title, exe=exe, start_dir=exe.parent, launch_options=opts)
+                _exe, _opts, appid = self._runner_shortcut(e)
+                try:
+                    for user in users:
+                        self._add_runner_shortcut(root, user, e)
+                except steam.SteamDuplicateError as dup:  # already in Steam: not a second time
+                    log.info("Steam: %s not added — %s", e.title, dup)
+                    skipped.append({"title": e.title, "in_steam_as": dup.existing, "by_app": dup.by_app})
+                    continue
                 if e.steam_shortcut_appid != appid:
                     e.steam_shortcut_appid = appid
                     self.repo.update(e)
@@ -1731,7 +1909,7 @@ class LibraryManager:
         log.info("Steam shortcuts written for %d game(s) (%d user(s)); Steam %s", added, len(users),
                  "was restarted" if was_running else "was not running")
         threading.Thread(target=self._watch_steam, args=(files, before), name="steam-safety", daemon=True).start()
-        return {"games": added, "users": len(users), "restarted": was_running}
+        return {"games": added, "users": len(users), "restarted": was_running, "skipped": skipped}
 
     @staticmethod
     def _put_back(files: dict, before: dict) -> None:
@@ -1856,10 +2034,9 @@ class LibraryManager:
                                "No Steam user profile found; start Steam once and sign in.")
         # the shortcut starts the game through this app (play mode): the same Proton setup and fixes as Play,
         # and Windows games work without configuring a compatibility tool in Steam
-        exe, opts, _ = self._runner_shortcut(e)
         try:
-            appid = steam.add_shortcut(root, user, name=e.title, exe=exe, start_dir=exe.parent, launch_options=opts)
-        except steam.SteamFileError as exc:
+            appid = self._add_runner_shortcut(root, user, e)
+        except steam.SteamFileError as exc:          # (also: already in Steam — it says under which name)
             raise LibraryError(str(exc)) from exc
         e.steam_shortcut_appid = appid
         self.repo.update(e)

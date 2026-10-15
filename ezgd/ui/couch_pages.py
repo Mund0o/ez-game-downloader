@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QFontMetrics, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen, QTextLayout
 
 from ezgd.core.fsutil import format_bytes, free_space, safe_dirname
 from ezgd.ui import theme
@@ -139,7 +139,7 @@ class Page:
                 p.setPen(QColor(theme.CURRENT.accent).lighter(135))
                 p.drawText(r.adjusted(4 * s, 0, 0, -8 * s), Qt.AlignLeft | Qt.AlignBottom, it.label.upper())
                 continue
-            self._row(p, it, r, focused and k == focus)
+            self._cached_row(p, it, r, focused and k == focus)
             if it.focusable:
                 self.w._hit.append((r, "page", k))
         p.restore()
@@ -150,6 +150,15 @@ class Page:
             bar = QPainterPath()
             bar.addRoundedRect(QRectF(rect.right() + 18 * s, by, 6 * s, bh), 3 * s, 3 * s)
             p.fillPath(bar, QColor(255, 255, 255, 70))
+
+    def _cached_row(self, p: QPainter, it: Item, r: QRectF, focused: bool) -> None:
+        """A row drawn once into a layer (with room for the focus glow) and copied while the list moves."""
+        m = 10 * self.s
+        c = theme.CURRENT
+        key = ("row", it.label, it.note, it.kind, it.value, focused, round(r.width(), 1), round(r.height(), 1),
+               round(self.s, 3), c.success, c.danger)
+        self.w.blit(p, r.left() - m, r.top() - m, key, r.width() + 2 * m, r.height() + 2 * m,
+                    lambda q: self._row(q, it, QRectF(m, m, r.width(), r.height()), focused))
 
     def _row(self, p: QPainter, it: Item, r: QRectF, focused: bool) -> None:
         s = self.s
@@ -520,7 +529,11 @@ class StorePage(Page):
         super().__init__(w)
         self.loaded = False
         self.loading = False
-        self.shelves: list[tuple[str, list, str | None]] = []   # (title, [GameGroup | SeeAll], filter key)
+        self._all_shelves: list[tuple[str, list, str | None]] = []   # (title, [GameGroup | SeeAll], filter key)
+        self._vis: dict = {}                         # see _candidates
+        self._views: dict[str, dict] = {}            # see _stable
+        self._shelf_games: dict = {}
+        self._cands_n = 0
         self.sections: dict[str, tuple[str, list]] = {}         # featured section key → (title, games)
         self.query = ""
         self.genre: str | None = None
@@ -565,6 +578,7 @@ class StorePage(Page):
         if self.feed is not None:
             self.feed.closed = True
             self.feed = None
+        self._views = {k: v for k, v in self._views.items() if not k.startswith("grid|")}   # a fresh grid
         self.filter = key
         self.gi = 0
         self._gs_t = self._gs = 0.0
@@ -633,14 +647,18 @@ class StorePage(Page):
     def _feed_changed(self, feed: Feed) -> None:
         if feed is not self.feed:
             return
-        # keep the focused game focused when new pages re-sort the grid
+        self.items_changed()
+
+    def keep_focus(self) -> None:
+        """New pages (or controller checks) changed the grid: the focused game stays focused."""
         old = getattr(self, "_focus_key", None)
-        if old is not None:
-            pos = next((i for i, g in enumerate(feed.groups) if g.key == old), None)
+        items = self._grid_items()
+        if old is not None and self._grid():
+            pos = next((i for i, g in enumerate(items) if g.key == old), None)
             if pos is not None:
                 self.gi = pos
-        self.gi = max(0, min(self.gi, len(feed.groups) - 1))
-        self._art(feed.groups[max(0, self.gi - 6):self.gi + 30])
+        self.gi = max(0, min(self.gi, len(items) - 1))
+        self._art(items[max(0, self.gi - 6):self.gi + 30])
         self.w.refresh_bg()
         self.w.update()
 
@@ -670,7 +688,7 @@ class StorePage(Page):
                 groups = group_duplicates(games)
                 shelves.append((title, groups + [SeeAll(f"sec:{key}", title, len(groups))], f"sec:{key}"))
             self.sections = sections
-            self.shelves = shelves
+            self._all_shelves = shelves
             self.loaded = True
             self._art(g for _t, gs, _k in shelves for g in gs[:14])
             self.shelf = min(self.shelf, max(0, len(shelves) - 1))
@@ -701,7 +719,8 @@ class StorePage(Page):
     def _art(self, groups) -> None:
         groups = [g for g in groups if not isinstance(g, SeeAll)]
         self.w.load_art([self.w.group_app_id(g) for g in groups])
-        self.w.find_apps_by_title(groups)
+        if not self.controller_only():               # (otherwise the controller check finds their App IDs)
+            self.w.find_apps_by_title(groups)
 
     def search(self, text: str) -> None:
         text = text.strip()
@@ -738,7 +757,86 @@ class StorePage(Page):
         left = 72 * self.s
         return max(1, int((self.w.width() - 2 * left + gap) // (tw + gap)))
 
-    def _grid_items(self) -> list:
+    # ------------------------------------------------- controller games only
+    def controller_only(self) -> bool:
+        return bool(self.w.actions.settings.get("couch_controller_only", True))
+
+    PAGE = 50                                        # games added to a grid at a time
+
+    def _candidates(self, groups: list, need: int) -> list:
+        """The games that may be shown, in the chosen order. With "controller games only" (the default): those
+        Steam lists with full or partial controller support — games that are not on Steam, or need a mouse and
+        keyboard, stay hidden. Only as many games are checked as the screen needs (``need``), plus some ahead."""
+        if not self.controller_only():
+            return groups
+        w = self.w
+        key = id(groups)
+        hit = self._vis.get(key)
+        if hit is not None and hit[0] is groups and hit[1] == (len(groups), w.ctl_version, need):
+            return hit[2]
+        ok = ("full", "partial")
+        out, unknown = [], []
+        for g in groups:
+            if isinstance(g, SeeAll):
+                out.append(g)
+                continue
+            info = w.controller.get(g.key)
+            if info is not None and not info.get("pending"):
+                if info.get("controller") in ok:
+                    out.append(g)
+            elif len(out) + len(unknown) < need + 60:
+                unknown.append(g)
+        w.want_controller(unknown)
+        if len(self._vis) > 12:
+            self._vis.clear()
+        self._vis[key] = (groups, (len(groups), w.ctl_version, need), out)
+        return out
+
+    def _stable(self, view: str, cands: list, cap: int | None = None) -> list:
+        """What a grid or shelf shows: games are only ever added at the end — never moved or taken away while you
+        look around (answers and new pages from the sites used to re-sort the screen all the time). A grid shows
+        ``PAGE`` games; the next ``PAGE`` come when you reach the bottom."""
+        st = self._views.get(view)
+        if st is None:
+            st = self._views[view] = {"keys": [], "limit": self.PAGE, "out": None}
+        keys = st["keys"]
+        limit = cap if cap is not None else st["limit"]
+        if st["out"] is not None and st["out"][0] is cands and st["out"][1] == (len(cands), limit):
+            return st["out"][2]
+        games = [g for g in cands if not isinstance(g, SeeAll)]
+        if len(keys) < limit:
+            seen = set(keys)
+            for g in games:
+                if len(keys) >= limit:
+                    break
+                if g.key not in seen:
+                    keys.append(g.key)
+                    seen.add(g.key)
+        by_key = {g.key: g for g in games}
+        out = [by_key[k] for k in keys if k in by_key]
+        st["out"] = (cands, (len(cands), limit), out)
+        st["more"] = len(games) > len(keys)
+        return out
+
+    def _view(self) -> str:
+        sort = self.feed.sort if self.feed is not None else None
+        return f"grid|{self.filter}|{self.query}|{self.genre}|{sort}|{self.controller_only()}"
+
+    @property
+    def shelves(self) -> list[tuple[str, list, str | None]]:
+        out = []
+        for t, gs, k in self._all_shelves:
+            cached = self._shelf_games.get(k)
+            if cached is None or cached[0] is not gs:
+                cached = self._shelf_games[k] = (gs, [g for g in gs if not isinstance(g, SeeAll)])
+            games = cached[1]
+            shown = self._stable(f"shelf|{k}|{self.controller_only()}", self._candidates(games, len(games)),
+                                 cap=len(games))
+            out.append((t, shown + [g for g in gs if isinstance(g, SeeAll)], k))
+        self.shelf = max(0, min(self.shelf, len(out) - 1))
+        return out
+
+    def _raw_grid(self) -> list:
         if self.filter.startswith("sec:"):
             from ezgd.catalog.search import group_duplicates
             sec = self.sections.get(self.filter[4:])
@@ -749,6 +847,57 @@ class StorePage(Page):
                 self._sec_cache = (self.filter, group_duplicates(sec[1]))
             return self._sec_cache[1]
         return self.feed.groups if self.feed is not None else []
+
+    def _grid_items(self) -> list:
+        view = self._view()
+        st = self._views.get(view) or {}
+        limit = st.get("limit", self.PAGE)
+        cands = self._candidates(self._raw_grid(), limit + self.PAGE)     # the next page is checked ahead
+        self._cands_n = len(cands)
+        return self._stable(view, cands)
+
+    def more_games(self) -> bool:
+        """Is there a next page (already found, or the sites / the controller check may still bring one)?"""
+        st = self._views.get(self._view()) or {}
+        feed = self.feed
+        return bool(st.get("more")) or (feed is not None and (feed.more or feed.busy)) or \
+            (self.controller_only() and self.w.checking_controllers())
+
+    def next_page(self) -> bool:
+        """At the bottom: the next PAGE games. True when there were more to show right away."""
+        st = self._views.get(self._view())
+        if st is None:
+            return False
+        n = len(self._grid_items())
+        if n < st["limit"]:
+            return False                             # this page is not full yet: what comes, comes here
+        st["limit"] += self.PAGE
+        feed = self.feed
+        if feed is not None and not feed.busy and feed.more and self._cands_n < st["limit"] + self.PAGE:
+            feed.load_more()
+        return len(self._grid_items()) > n
+
+    def unload_far(self) -> None:
+        """Only the page of 50 you are on and its neighbours keep their pictures; the others are unloaded (their
+        games stay where they were — just their pictures load again when you come back)."""
+        if not self._grid():
+            return
+        items = self._grid_items()
+        page = self.gi // self.PAGE
+        if getattr(self, "_loaded_page", None) == (self._view(), page):
+            return
+        self._loaded_page = (self._view(), page)
+        self.w.unload_except(items[max(0, (page - 1) * self.PAGE):(page + 2) * self.PAGE])
+
+    def items_changed(self) -> bool:
+        """Answers came in (pages, controller checks): repaint only when what is on screen changed."""
+        items = self._grid_items() if self._grid() else [g for _t, gs, _k in self.shelves for g in gs]
+        sig = tuple(id(g) for g in items)
+        if sig == getattr(self, "_shown_sig", None):
+            return False
+        self._shown_sig = sig
+        self.keep_focus()
+        return True
 
     def _grid(self) -> bool:
         return self.filter != "discover"
@@ -842,6 +991,10 @@ class StorePage(Page):
                     self.gi += cols
                 elif self.gi // cols < (n - 1) // cols:
                     self.gi = n - 1
+                elif self.next_page():                   # at the bottom: the next 50 games
+                    items = self._grid_items()
+                    n = len(items)
+                    self.gi = min(n - 1, self.gi + cols)
             elif name in ("left", "right") and n:
                 self.gi = max(0, min(n - 1, self.gi + (1 if name == "right" else -1)))
             elif name == "a" and n:
@@ -849,6 +1002,7 @@ class StorePage(Page):
             if n:
                 self._focus_key = items[min(self.gi, n - 1)].key
                 self._art(items[max(0, self.gi - 6):self.gi + 24])
+                self.unload_far()
         else:
             if name == "up":
                 if self.shelf > 0:
@@ -946,21 +1100,33 @@ class StorePage(Page):
             if feed is not None and feed.busy and not n:
                 return "Searching every site…" if self.query else "Loading…"
             text = f"{n} game{'s' if n != 1 else ''}" + (f" for “{self.query}”" if self.query else "")
-            if feed is not None and feed.busy:
+            if self.controller_only():
+                text += " with controller support"
+            filling = n < (self._views.get(self._view()) or {}).get("limit", self.PAGE)
+            if filling and self.controller_only() and self.w.checking_controllers():
+                text += " · checking more…"
+            elif filling and feed is not None and feed.busy:
                 text += " · loading more…"
             elif feed is not None and feed.errors and len(feed.errors) == len(feed.sids):
                 text += " · the site did not answer"
             elif feed is not None and feed.errors:
                 text += f" · {len(feed.errors)} site(s) did not answer"
             return text
-        return "Loading what the sites offer…" if self.loading and not self.shelves else ""
+        if self.loading and not self.shelves:
+            return "Loading what the sites offer…"
+        if self.controller_only():
+            return "Games with controller support" + (" · checking more…" if self.w.checking_controllers() else "")
+        return ""
 
     def _paint_chips(self, p: QPainter, rect: QRectF, active: bool) -> None:
         w, s = self.w, self.s
         chips = self.chips()
         f = w._font(18 * s, 700)
-        fm = QFontMetrics(f)
-        widths = [fm.horizontalAdvance(label) + 44 * s for _k, label in chips]
+        wkey = (tuple(chips), round(s, 3))
+        if getattr(self, "_chip_w", (None,))[0] != wkey:
+            fm = QFontMetrics(f)
+            self._chip_w = (wkey, [fm.horizontalAdvance(label) + 44 * s for _k, label in chips])
+        widths = self._chip_w[1]
         xs, x = [], 0.0
         for cw in widths:
             xs.append(x)
@@ -975,15 +1141,26 @@ class StorePage(Page):
             target = cr - rect.width() + 60 * s
         self._cs_t = max(0.0, min(target, max(0.0, total - rect.width())))
         off = self._smooth("_cs", self._cs_t)
+        focus = self.chip if active and self.row == 1 else -1
+        m = 12 * s                                       # room for the focus glow around the strip
+        clip = rect.adjusted(-10 * s, -10 * s, 10 * s, 10 * s)
         p.save()
-        p.setClipRect(rect.adjusted(-10 * s, -10 * s, 10 * s, 10 * s))
+        p.setClipRect(clip)
+        # the whole strip is drawn once and then only copied (text and glows every frame were slow at 4K)
+        w.blit(p, rect.left() - off - m, rect.top() - m,
+               ("chips", tuple(chips), self.filter, focus, round(s, 3), theme.CURRENT.accent),
+               total + 2 * m, rect.height() + 2 * m,
+               lambda q: self._draw_chips(q, chips, xs, widths, QRectF(m, m, total, rect.height()), focus, f),
+               clip=clip)
+        p.restore()
+
+    def _draw_chips(self, p: QPainter, chips, xs, widths, rect: QRectF, focus: int, f) -> None:
+        w, s = self.w, self.s
         p.setFont(f)
         for i, (key, label) in enumerate(chips):
-            r = QRectF(rect.left() + xs[i] - off, rect.top(), widths[i], rect.height())
-            if r.right() < rect.left() - 20 * s or r.left() > rect.right() + 20 * s:
-                continue
+            r = QRectF(rect.left() + xs[i], rect.top(), widths[i], rect.height())
             selected = key == self.filter
-            focused = active and self.row == 1 and i == self.chip
+            focused = i == focus
             path = QPainterPath()
             path.addRoundedRect(r, r.height() / 2, r.height() / 2)
             if focused:
@@ -1011,7 +1188,6 @@ class StorePage(Page):
             else:
                 p.drawText(r, Qt.AlignCenter, label)
             w._hit.append((r, "page", -100 - i))
-        p.restore()
 
     def _group_tile(self, p: QPainter, g, r: QRectF, focused: bool, idx: int) -> None:
         if isinstance(g, SeeAll):
@@ -1025,6 +1201,7 @@ class StorePage(Page):
     def _see_all_tile(self, p: QPainter, g: SeeAll, r: QRectF, focused: bool, idx: int) -> None:
         w, s = self.w, self.s
         if focused:
+            w._focus_rect = r.adjusted(-r.width() * 0.04, -r.height() * 0.04, r.width() * 0.04, r.height() * 0.04)
             grow = 1.0 + 0.06 * w._focus_anim
             c = r.center()
             r = QRectF(c.x() - r.width() * grow / 2, c.y() - r.height() * grow / 2, r.width() * grow,
@@ -1049,8 +1226,11 @@ class StorePage(Page):
         if not self.shelves:
             p.setFont(w._font(22 * s))
             p.setPen(QColor(255, 255, 255, 170))
-            p.drawText(QRectF(left, top + 20 * s, W - 2 * left, 40 * s), Qt.AlignLeft | Qt.AlignVCenter,
-                       "Loading…" if self.loading else "The sites could not be reached. Search still tries them.")
+            text = "Loading…" if self.loading else "The sites could not be reached. Search still tries them."
+            if self._all_shelves and self.controller_only():
+                text = "Checking which games work with a controller…" if self.w.checking_controllers() else \
+                    "No games with controller support here. (Settings → Store shows every game.)"
+            p.drawText(QRectF(left, top + 20 * s, W - 2 * left, 40 * s), Qt.AlignLeft | Qt.AlignVCenter, text)
             return
         view = bottom - top
         target = getattr(self, "_vs_t", 0.0)
@@ -1126,6 +1306,9 @@ class StorePage(Page):
             text = ("Searching every site…" if self.query else "Loading games…") if busy else \
                 ("Nothing found. Try another name (Y), or fewer words." if self.query else
                  "No games here right now — the site may be down.")
+            if self.controller_only() and not busy:
+                text = ("Checking which games work with a controller…" if self.w.checking_controllers() else
+                        "No games with controller support here. (Settings → Store shows every game.)")
             p.drawText(QRectF(72 * s, top + 20 * s, W - 144 * s, 40 * s), Qt.AlignLeft | Qt.AlignVCenter, text)
             return
         n = len(items)
@@ -1133,8 +1316,9 @@ class StorePage(Page):
         rows = (n - 1) // cols + 1
         row_h = th + gap + 64 * s
         view = bottom - top
-        # near the end (or the screen is not full yet): fetch the next page
-        if feed is not None and not feed.busy and feed.more and (i // cols >= rows - 3 or rows * row_h < view):
+        # fetch pages from the sites until the next 50 games are ready (they are shown when you get there)
+        limit = (self._views.get(self._view()) or {}).get("limit", self.PAGE)
+        if feed is not None and not feed.busy and feed.more and self._cands_n < limit + self.PAGE:
             feed.load_more()
         target = getattr(self, "_gs_t", 0.0)
         rt = (i // cols) * row_h
@@ -1147,7 +1331,10 @@ class StorePage(Page):
         p.save()
         p.setClipRect(QRectF(0, top - 24 * s, W, bottom - top + 24 * s))
         focused_draw = None
-        for k, g in enumerate(items):
+        first = max(0, int((off - 40 * s - th) // row_h))           # only the rows on screen (not every game)
+        last = min(rows - 1, int((off + view + 24 * s) // row_h) + 1)
+        for k in range(first * cols, min(n, (last + 1) * cols)):
+            g = items[k]
             rr, cc = divmod(k, cols)
             r = QRectF(left + cc * (tw + hgap), top + rr * row_h - off, tw, th)
             if r.top() > bottom or r.bottom() < top - 40 * s:
@@ -1161,7 +1348,10 @@ class StorePage(Page):
         if fy < bottom:
             p.setFont(w._font(19 * s, 600))
             p.setPen(QColor(255, 255, 255, 150))
-            if feed is not None and feed.busy:
+            st = self._views.get(self._view()) or {}
+            if n >= st.get("limit", self.PAGE) and self.more_games():
+                p.drawText(QRectF(0, fy, W, 40 * s), Qt.AlignCenter, "▼   Down for the next 50 games")
+            elif self.more_games():                      # this page is still filling up
                 t = time.monotonic()
                 for k in range(3):
                     a = 0.35 + 0.65 * max(0.0, math.sin(t * 5 - k * 0.7))
@@ -1169,8 +1359,8 @@ class StorePage(Page):
                     p.setBrush(QColor(255, 255, 255, int(255 * a)))
                     p.drawEllipse(QPointF(W / 2 - 34 * s + k * 34 * s, fy + 20 * s), 8 * s, 8 * s)
                 p.setBrush(Qt.NoBrush)
-                w._schedule_frame(60)
-            elif feed is None or not feed.more:
+                w.update_area(QRectF(0, fy, W, 44 * s), 60)          # only the dots move
+            else:
                 p.drawText(QRectF(0, fy, W, 40 * s), Qt.AlignCenter, f"That's everything — {n} games")
         if focused_draw is not None:
             g, r, idx = focused_draw
@@ -1405,39 +1595,7 @@ class GamePage(Page):
         return h
 
     # ------------------------------------------------------------- paint
-    def paint(self, p: QPainter) -> None:
-        w = self.w
-        g = self.game
-        s, W, H = self.s, w.width(), w.height()
-        if g is None:
-            return
-        left = 72 * s
-        top = 96 * s + 20 * s
-        bottom = H - 76 * s - 20 * s
-        col_w = W * 0.46 - left
-        # left column: what the game is
-        y = top + 10 * s
-        p.setFont(w._font(15 * s, 800))
-        p.setPen(QColor(theme.CURRENT.accent).lighter(130))
-        p.drawText(QRectF(left, y, col_w, 24 * s), Qt.AlignLeft | Qt.AlignVCenter,
-                   ("UPDATE  ·  " if self.update_info else "") + theme.source_name(g.source).upper())
-        y += 32 * s
-        p.setFont(w._font(min(60 * s, W * 0.04), 900))
-        p.setPen(QColor("white"))
-        tr = QRectF(left, y, col_w, 170 * s)
-        bound = p.boundingRect(tr, Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, g.title)
-        p.drawText(tr, Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, g.title)
-        y += min(bound.height(), tr.height()) + 16 * s
-        facts = [x for x in (g.version and f"Version {g.version}", g.size_text, g.release_date,
-                             ", ".join(g.genres[:3])) if x]
-        if g.dedup_key in w.actions.installed_keys:
-            facts.insert(0, "In your library")
-        p.setFont(w._font(19 * s, 600))
-        p.setPen(QColor(255, 255, 255, 205))
-        fr = QRectF(left, y, col_w, 60 * s)
-        fb = p.boundingRect(fr, Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, "  ·  ".join(facts))
-        p.drawText(fr, Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, "  ·  ".join(facts))
-        y += min(fb.height(), fr.height()) + 22 * s
+    def _notes(self, g) -> list[tuple[str, str]]:
         notes = []
         if self.update_info:
             u = self.update_info
@@ -1454,41 +1612,30 @@ class GamePage(Page):
             notes.append((theme.CURRENT.warning, f"🔒 Archive password: {pw} — the app enters it for you."))
         if g.extra.get("installer"):
             notes.append((theme.CURRENT.accent, "A repack: after downloading, “Install game” runs its installer."))
-        for color, text in notes:
-            p.setFont(w._font(17 * s, 600))
-            nr = QRectF(left + 18 * s, y, col_w - 18 * s, 200 * s)
-            nb = p.boundingRect(nr, Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, text)
-            if y + nb.height() > bottom:
-                break
-            p.fillRect(QRectF(left, y + 2 * s, 5 * s, nb.height() - 4 * s), QColor(color))
-            p.setPen(QColor(255, 255, 255, 225))
-            p.drawText(nr, Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, text)
-            y += nb.height() + 14 * s
-        if g.description and not self.loading:
-            p.setFont(w._font(18 * s, 500))
-            p.setPen(QColor(255, 255, 255, 185))
-            dr = QRectF(left, y + 6 * s, col_w, max(0.0, bottom - y - 6 * s))
-            fm = QFontMetrics(p.font())
-            lines = max(0, int(dr.height() // fm.lineSpacing()))
-            text = " ".join(g.description.split())
-            if lines:
-                # cut to whole lines that fit, ending with "…"
-                out, rest = [], text
-                for _ in range(lines):
-                    if not rest:
-                        break
-                    n = len(rest)
-                    while n > 0 and fm.horizontalAdvance(rest[:n]) > dr.width():
-                        n = rest.rfind(" ", 0, n)
-                        if n <= 0:
-                            n = max(1, len(rest[:int(dr.width() / max(1, fm.averageCharWidth()))]))
-                            break
-                    out.append(rest[:n])
-                    rest = rest[n:].lstrip()
-                if rest and out:
-                    last = out[-1]
-                    out[-1] = fm.elidedText(last + " " + rest, Qt.ElideRight, int(dr.width()))
-                p.drawText(dr, Qt.AlignLeft | Qt.AlignTop, "\n".join(out))
+        return notes
+
+    def paint(self, p: QPainter) -> None:
+        w = self.w
+        g = self.game
+        s, W, H = self.s, w.width(), w.height()
+        if g is None:
+            return
+        left = 72 * s
+        top = 96 * s + 20 * s
+        bottom = H - 76 * s - 20 * s
+        col_w = W * 0.46 - left
+        # left column: what the game is — the same until the page loads, so it is drawn once and then copied
+        source = ("UPDATE  ·  " if self.update_info else "") + theme.source_name(g.source).upper()
+        facts = [x for x in (g.version and f"Version {g.version}", g.size_text, g.release_date,
+                             ", ".join(g.genres[:3])) if x]
+        if g.dedup_key in w.actions.installed_keys:
+            facts.insert(0, "In your library")
+        notes = self._notes(g)
+        desc = " ".join(g.description.split()) if g.description and not self.loading else ""
+        key = ("gameinfo", W, H, round(s, 3), theme.CURRENT.accent, source, g.title, "  ·  ".join(facts),
+               tuple(notes), hash(desc))
+        w.blit(p, left, top, key, col_w, bottom - top,
+               lambda q: self._paint_info(q, g.title, source, facts, notes, desc, col_w, bottom - top))
         # right column: what you can do
         rx = W * 0.52
         rect = QRectF(rx, top + 10 * s, W - rx - 90 * s, bottom - top - 10 * s)
@@ -1510,7 +1657,67 @@ class GamePage(Page):
                 p.drawEllipse(QPointF(rx + 14 * s + k * 34 * s, rect.top() + (len(self.items) * 72 + 40) * s),
                               9 * s, 9 * s)
             p.setBrush(Qt.NoBrush)
-            w._schedule_frame(60)
+            w.update_area(QRectF(rx, rect.top() + (len(self.items) * 72 + 25) * s, 120 * s, 30 * s), 60)
+
+    def _paint_info(self, p: QPainter, title: str, source: str, facts: list[str], notes: list[tuple[str, str]],
+                    desc: str, col_w: float, height: float) -> None:
+        """The left column at (0, 0): source, title, facts, notes and as much of the description as fits."""
+        w, s = self.w, self.s
+        y = 10 * s
+        p.setFont(w._font(15 * s, 800))
+        p.setPen(QColor(theme.CURRENT.accent).lighter(130))
+        p.drawText(QRectF(0, y, col_w, 24 * s), Qt.AlignLeft | Qt.AlignVCenter, source)
+        y += 32 * s
+        p.setFont(w._font(min(60 * s, w.width() * 0.04), 900))
+        p.setPen(QColor("white"))
+        tr = QRectF(0, y, col_w, 170 * s)
+        bound = p.boundingRect(tr, Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, title)
+        p.drawText(tr, Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, title)
+        y += min(bound.height(), tr.height()) + 16 * s
+        p.setFont(w._font(19 * s, 600))
+        p.setPen(QColor(255, 255, 255, 205))
+        fr = QRectF(0, y, col_w, 60 * s)
+        fb = p.boundingRect(fr, Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, "  ·  ".join(facts))
+        p.drawText(fr, Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, "  ·  ".join(facts))
+        y += min(fb.height(), fr.height()) + 22 * s
+        for color, text in notes:
+            p.setFont(w._font(17 * s, 600))
+            nr = QRectF(18 * s, y, col_w - 18 * s, 200 * s)
+            nb = p.boundingRect(nr, Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, text)
+            if y + nb.height() > height:
+                break
+            p.fillRect(QRectF(0, y + 2 * s, 5 * s, nb.height() - 4 * s), QColor(color))
+            p.setPen(QColor(255, 255, 255, 225))
+            p.drawText(nr, Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, text)
+            y += nb.height() + 14 * s
+        if desc:
+            font = w._font(18 * s, 500)
+            p.setFont(font)
+            p.setPen(QColor(255, 255, 255, 185))
+            dr = QRectF(0, y + 6 * s, col_w, max(0.0, height - y - 6 * s))
+            lines = int(dr.height() // QFontMetrics(font).lineSpacing())
+            if lines > 0:
+                p.drawText(dr, Qt.AlignLeft | Qt.AlignTop, "\n".join(wrap_lines(desc, font, dr.width(), lines)))
+
+
+def wrap_lines(text: str, font: QFont, width: float, max_lines: int) -> list[str]:
+    """``text`` broken into at most ``max_lines`` lines of ``width``; the last one ends with "…" when text is left
+    over. Only the lines shown are laid out (a long Steam description measured word by word took half a second)."""
+    layout = QTextLayout(text, font)
+    layout.beginLayout()
+    spans = []
+    while len(spans) < max_lines:
+        line = layout.createLine()
+        if not line.isValid():
+            break
+        line.setLineWidth(width)
+        spans.append((line.textStart(), line.textLength()))
+    layout.endLayout()
+    out = [text[a:a + n].rstrip() for a, n in spans]
+    if spans and spans[-1][0] + spans[-1][1] < len(text):
+        out[-1] = QFontMetrics(font).elidedText(text[spans[-1][0]:spans[-1][0] + spans[-1][1] + 200], Qt.ElideRight,
+                                                int(width))
+    return out
 
 
 # ================================================================ downloading
@@ -1829,62 +2036,76 @@ class WishlistPage(Page):
             if r.bottom() < rect.top() - 20 * s or r.top() > rect.bottom() + 20 * s:
                 continue
             focused = active and k == self.focus
-            path = QPainterPath()
-            path.addRoundedRect(r, 18 * s, 18 * s)
-            p.fillPath(path, QColor(255, 255, 255, 44 if focused else 18))
-            if focused:
-                p.setBrush(Qt.NoBrush)
-                p.setPen(QPen(QColor("white"), 3 * s))
-                p.drawPath(path)
             w._hit.append((r, "page", k))
-            if k == 0:
-                p.setFont(w._font(26 * s, 800))
-                p.setPen(QColor("white"))
-                p.drawText(r.adjusted(32 * s, 0, -32 * s, 0), Qt.AlignLeft | Qt.AlignVCenter,
-                           "＋   Find a game to add")
-                p.setFont(w._font(17 * s, 500))
-                p.setPen(QColor(255, 255, 255, 160))
-                p.drawText(r.adjusted(32 * s, 0, -32 * s, 0), Qt.AlignRight | Qt.AlignVCenter,
-                           "Any game on Steam — also ones not released yet")
-                continue
-            it = self.items[k - 1]
-            a = w.art.get(it.get("steam_app_id")) or {}
-            img = a.get("header") or a.get("wide") or it.get("cover_url")
-            tr = QRectF(r.left() + 14 * s, r.top() + 14 * s, (row_h - 28 * s) * 460 / 215, row_h - 28 * s)
-            pm = w.images.fill(img, int(tr.width()), int(tr.height()), radius=10 * s)
-            if pm is not None:
-                p.drawImage(tr, pm, QRectF(pm.rect()))
-            else:
-                tp = QPainterPath()
-                tp.addRoundedRect(tr, 10 * s, 10 * s)
-                p.fillPath(tp, QColor(255, 255, 255, 20))
-            x = tr.right() + 26 * s
-            p.setFont(w._font(24 * s, 800))
-            p.setPen(QColor("white"))
-            p.drawText(QRectF(x, r.top() + 18 * s, r.right() - x - 300 * s, 36 * s), Qt.AlignLeft | Qt.AlignVCenter,
-                       QFontMetrics(p.font()).elidedText(it["title"], Qt.ElideRight, int(r.right() - x - 300 * s)))
-            p.setFont(w._font(18 * s, 600))
-            st = it.get("status")
-            color = {"available": theme.CURRENT.success, "library": theme.CURRENT.accent}.get(st)
-            p.setPen(QColor(color) if color else QColor(255, 255, 255, 165))
-            p.drawText(QRectF(x, r.top() + 58 * s, r.right() - x - 40 * s, 30 * s), Qt.AlignLeft | Qt.AlignVCenter,
-                       QFontMetrics(p.font()).elidedText(self._status(it), Qt.ElideRight, int(r.right() - x - 40 * s)))
-            if st == "available":
-                p.setFont(w._font(14 * s, 800))
-                badge = "AVAILABLE"
-                bw = QFontMetrics(p.font()).horizontalAdvance(badge) + 28 * s
-                br = QRectF(r.right() - bw - 24 * s, r.top() + 20 * s, bw, 30 * s)
-                bp = QPainterPath()
-                bp.addRoundedRect(br, 15 * s, 15 * s)
-                p.fillPath(bp, QColor(theme.CURRENT.success))
-                p.setPen(QColor("white"))
-                p.drawText(br, Qt.AlignCenter, badge)
+            it = self.items[k - 1] if k else None
+            pm, img = None, None
+            if it is not None:
+                a = w.art.get(it.get("steam_app_id")) or {}
+                img = a.get("header") or a.get("wide") or it.get("cover_url")
+                th = row_h - 28 * s
+                pm = w.images.fill(img, int(th * 460 / 215), int(th), radius=10 * s)
+            key = ("wish", k == 0, it and (it["title"], self._status(it), it.get("status")), img if pm else None,
+                   focused, round(r.width(), 1), round(row_h, 1), round(s, 3), theme.CURRENT.success,
+                   theme.CURRENT.accent)
+            m = 4 * s
+            w.blit(p, r.left() - m, r.top() - m, key, r.width() + 2 * m, row_h + 2 * m,
+                   lambda q, it=it, pm=pm, focused=focused: self._wish_row(
+                       q, it, QRectF(m, m, r.width(), row_h), focused, pm))
         p.restore()
         if self.loaded and not self.items:
             p.setFont(w._font(20 * s))
             p.setPen(QColor(255, 255, 255, 160))
             p.drawText(QRectF(left, rect.top() + row_h + 40 * s, W - 2 * left, 40 * s), Qt.AlignLeft | Qt.AlignVCenter,
                        "Nothing here yet. Add a game, or press ♡ on a game's page in the Store.")
+
+
+    def _wish_row(self, p: QPainter, it: dict | None, r: QRectF, focused: bool, pm) -> None:
+        w, s = self.w, self.s
+        row_h = r.height()
+        path = QPainterPath()
+        path.addRoundedRect(r, 18 * s, 18 * s)
+        p.fillPath(path, QColor(255, 255, 255, 44 if focused else 18))
+        if focused:
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor("white"), 3 * s))
+            p.drawPath(path)
+        if it is None:
+            p.setFont(w._font(26 * s, 800))
+            p.setPen(QColor("white"))
+            p.drawText(r.adjusted(32 * s, 0, -32 * s, 0), Qt.AlignLeft | Qt.AlignVCenter, "＋   Find a game to add")
+            p.setFont(w._font(17 * s, 500))
+            p.setPen(QColor(255, 255, 255, 160))
+            p.drawText(r.adjusted(32 * s, 0, -32 * s, 0), Qt.AlignRight | Qt.AlignVCenter,
+                       "Any game on Steam — also ones not released yet")
+            return
+        tr = QRectF(r.left() + 14 * s, r.top() + 14 * s, (row_h - 28 * s) * 460 / 215, row_h - 28 * s)
+        if pm is not None:
+            p.drawImage(tr, pm, QRectF(pm.rect()))
+        else:
+            tp = QPainterPath()
+            tp.addRoundedRect(tr, 10 * s, 10 * s)
+            p.fillPath(tp, QColor(255, 255, 255, 20))
+        x = tr.right() + 26 * s
+        p.setFont(w._font(24 * s, 800))
+        p.setPen(QColor("white"))
+        p.drawText(QRectF(x, r.top() + 18 * s, r.right() - x - 300 * s, 36 * s), Qt.AlignLeft | Qt.AlignVCenter,
+                   QFontMetrics(p.font()).elidedText(it["title"], Qt.ElideRight, int(r.right() - x - 300 * s)))
+        p.setFont(w._font(18 * s, 600))
+        st = it.get("status")
+        color = {"available": theme.CURRENT.success, "library": theme.CURRENT.accent}.get(st)
+        p.setPen(QColor(color) if color else QColor(255, 255, 255, 165))
+        p.drawText(QRectF(x, r.top() + 58 * s, r.right() - x - 40 * s, 30 * s), Qt.AlignLeft | Qt.AlignVCenter,
+                   QFontMetrics(p.font()).elidedText(self._status(it), Qt.ElideRight, int(r.right() - x - 40 * s)))
+        if st == "available":
+            p.setFont(w._font(14 * s, 800))
+            badge = "AVAILABLE"
+            bw = QFontMetrics(p.font()).horizontalAdvance(badge) + 28 * s
+            br = QRectF(r.right() - bw - 24 * s, r.top() + 20 * s, bw, 30 * s)
+            bp = QPainterPath()
+            bp.addRoundedRect(br, 15 * s, 15 * s)
+            p.fillPath(bp, QColor(theme.CURRENT.success))
+            p.setPen(QColor("white"))
+            p.drawText(br, Qt.AlignCenter, badge)
 
 
 # ================================================================== settings
@@ -1896,9 +2117,13 @@ TOGGLES = [
                  ("check_game_updates", "Check installed games for new versions"),
                  ("steam_overlay", "Steam overlay in games (friends list)"),
                  ("launch_through_steam", "Full Steam overlay: start games through Steam")]),
-    ("Store", [("hide_withdrawn_games", "Hide games whose guide was closed"),
+    ("Store", [("couch_controller_only", "Only show games that work with a controller (Steam's data)"),
+               ("hide_withdrawn_games", "Hide games whose guide was closed"),
                ("hide_adult_games", "Hide games marked 18+")]),
-    ("App", [("reduce_motion", "Reduce animations"),
+    ("App", [("couch_intro", "Intro video when couch mode opens"),
+             ("couch_intro_sound", "Intro sound"),
+             ("couch_gpu", "Show couch mode through the graphics card (next time it opens)"),
+             ("reduce_motion", "Reduce animations"),
              ("notifications_enabled", "Desktop notifications when downloads finish"),
              ("check_app_updates", "Look for a new version of the app once a day")]),
 ]
@@ -1998,17 +2223,17 @@ class SettingsPage(Page):
     # ------------------------------------------------------------ display
     def _screens(self) -> list[tuple[str, str]]:
         from PySide6.QtWidgets import QApplication
+        from ezgd.ui.window_control import real_size
         out = [("", "The app's screen")]
         for sc in QApplication.screens():
-            g = sc.geometry()
-            dpr = sc.devicePixelRatio()
-            out.append((sc.name(), f"{sc.name()} · {round(g.width() * dpr)}×{round(g.height() * dpr)}"))
+            pw, ph = real_size(sc)
+            out.append((sc.name(), f"{sc.name()} · {pw}×{ph}"))
         return out
 
     def _resolutions(self) -> list[tuple[str, str]]:
+        from ezgd.ui.window_control import real_size
         screen, _geo, _mode = self.w.display_target()
-        g, dpr = screen.geometry(), screen.devicePixelRatio()
-        own = f"{round(g.width() * dpr)}x{round(g.height() * dpr)}"
+        own = "%dx%d" % real_size(screen)
         common = ["1280x720", "1600x900", "1920x1080", "2560x1080", "2560x1440", "3440x1440", "3840x1600",
                   "3840x2160", "5120x1440"]
         vals = [own] + [c for c in common if c != own]

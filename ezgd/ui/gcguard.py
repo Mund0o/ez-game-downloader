@@ -14,6 +14,7 @@ whole heap now and then, so memory use stays the same in practice.
 from __future__ import annotations
 
 import gc
+import sys
 import time
 
 from PySide6.QtCore import QObject, QTimer
@@ -23,6 +24,24 @@ FULL_EVERY = 60         # every 60th tick (30 s): all generations
 MAX_DEFER = 120.0       # the bigger collections never wait longer than this
 
 _quiet_until = 0.0
+
+
+_libc = None
+
+
+def trim() -> None:
+    """Give memory that was freed back to the system (Linux/glibc keeps freed blocks of a fragmented heap: couch
+    mode's pictures left ~100 MB behind). About 10 ms, so only at quiet moments."""
+    global _libc
+    if _libc is False or not sys.platform.startswith("linux"):
+        return
+    try:
+        if _libc is None:
+            import ctypes
+            _libc = ctypes.CDLL("libc.so.6")
+        _libc.malloc_trim(0)
+    except Exception:
+        _libc = False
 
 
 def defer(seconds: float = 1.5) -> None:
@@ -58,7 +77,11 @@ class MainThreadGC(QObject):
             self._owe(1)
         now = time.monotonic()
         if self._owed and (now >= _quiet_until or now - self._owed_since > MAX_DEFER):
-            gc.collect() if self._owed == 2 else gc.collect(1)
+            if self._owed == 2:
+                gc.collect()
+                trim()
+            else:
+                gc.collect(1)
             self._owed = 0
         else:
             gc.collect(0)
@@ -67,6 +90,25 @@ class MainThreadGC(QObject):
         if not self._owed:
             self._owed_since = time.monotonic()
         self._owed = max(self._owed, level)
+
+
+def release() -> None:
+    """Collect everything and give the freed memory back (after something big closed)."""
+    gc.collect()
+    trim()
+
+
+def freeze_startup() -> None:
+    """Move what is alive after start-up out of the collector's way (``gc.freeze``). Only once: things frozen later
+    (a couch window) would never be collected if they hold reference cycles."""
+    global _frozen
+    if not _frozen:
+        _frozen = True
+        gc.collect()
+        gc.freeze()
+
+
+_frozen = False
 
 
 def install(app) -> MainThreadGC:

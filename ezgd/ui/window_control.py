@@ -34,6 +34,26 @@ KWIN_SCRIPT = """
 """
 
 
+def real_scale(screen, first=None) -> float:
+    """How many real pixels one of Qt's pixels is on ``screen``. With fractional scaling (125 %, 150 %) Qt's screen
+    may say 2 while a window on it really gets 1.5 — a window that is on that screen knows the truth."""
+    from PySide6.QtWidgets import QApplication
+    widgets = ([first] if first is not None else []) + [w for w in QApplication.topLevelWidgets() if w is not first]
+    for w in widgets:
+        try:
+            if w.isVisible() and not w.isMinimized() and w.screen() is screen:
+                return max(1.0, float(w.devicePixelRatioF()))
+        except RuntimeError:
+            continue
+    return max(1.0, float(screen.devicePixelRatio()))
+
+
+def real_size(screen) -> tuple[int, int]:
+    """The screen's resolution in real pixels (what people know as their resolution)."""
+    g, k = screen.geometry(), real_scale(screen)
+    return round(g.width() * k), round(g.height() * k)
+
+
 class WindowControl:
     def __init__(self, widget, marker: str):
         self.widget = widget
@@ -81,6 +101,31 @@ class WindowControl:
         """A borderless window at exactly this spot (Wayland apps cannot position their own windows)."""
         if self.kwin:
             self._kwin(f"w.noBorder = true; w.frameGeometry = {{x: {x}, y: {y}, width: {w}, height: {h}}};")
+
+    def fill_screen(self, screen: str = "") -> None:
+        """A borderless window covering the whole monitor, measured by KWin itself (Qt's idea of a monitor's size
+        can be wrong with fractional scaling)."""
+        if self.kwin:
+            self._kwin(self._find_output(screen) +
+                       "var a = workspace.clientArea(KWin.FullScreenArea, o); w.noBorder = true; "
+                       "w.frameGeometry = {x: a.x, y: a.y, width: a.width, height: a.height};")
+
+    def place_pixels(self, pw: int, ph: int, screen: str = "") -> None:
+        """A borderless window of pw×ph *real* pixels in the monitor's top-left corner (KWin knows the monitor's
+        true scale: 1.5 at 150 %, where Qt may say 2)."""
+        if self.kwin:
+            self._kwin(self._find_output(screen) +
+                       "var g = o.geometry, k = o.devicePixelRatio || 1; "
+                       f"var cw = Math.min(g.width, Math.round({int(pw)} / k)), "
+                       f"ch = Math.min(g.height, Math.round({int(ph)} / k)); "
+                       "w.noBorder = true; w.frameGeometry = {x: g.x, y: g.y, width: cw, height: ch};")
+
+    @staticmethod
+    def _find_output(screen: str) -> str:
+        """JavaScript that sets ``o`` to the monitor named ``screen`` (else the one the window is on)."""
+        import json
+        return ("var o = w.output; var outs = workspace.screens || []; "
+                f"for (var j = 0; j < outs.length; j++) if (outs[j].name === {json.dumps(screen)}) o = outs[j]; ")
 
     def forget(self) -> None:
         """The window closes: nothing to undo (KWin forgets a closed window's state)."""

@@ -5,12 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout,
+from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
                                QInputDialog, QLineEdit, QMessageBox, QPushButton, QScrollArea, QSpinBox,
                                QVBoxLayout, QWidget)
 
 from ezgd.core.fsutil import format_bytes
 from ezgd.core.settings import ACCENTS
+from ezgd.ui import theme
 from ezgd.ui.dialogs.download_options import folder_row
 from ezgd.ui.dialogs.misc import EventsDialog, open_folder
 from ezgd.ui.widgets.common import button, card, label, relative_time
@@ -34,6 +35,20 @@ class SettingsPage(QWidget):
         self.lay.setSpacing(16)
         self.lay.addWidget(label("Settings", "title"))
         self.lay.addWidget(label("Changes are saved immediately.", "muted"))
+        self.find = QLineEdit()
+        self.find.setObjectName("search")
+        self.find.setPlaceholderText("Find a setting… (e.g. proton, speed, couch, password)")
+        self.find.setClearButtonEnabled(True)
+        self.find.textChanged.connect(self._filter)
+        from ezgd.ui.icons import icon
+        find_icon = QLabel(self.find)
+        find_icon.setPixmap(icon("search", theme.CURRENT.muted, 18).pixmap(18, 18))
+        find_icon.move(12, 12)
+        self.lay.addWidget(self.find)
+        self.no_match = label("No setting matches that.", "muted")
+        self.no_match.hide()
+        self.lay.addWidget(self.no_match)
+        self._sections: list[tuple[QWidget, str, QFormLayout]] = []
         self._build()
         self.lay.addStretch(1)
         scroll.setWidget(body)
@@ -51,7 +66,53 @@ class SettingsPage(QWidget):
         form.setLabelAlignment(Qt.AlignRight)
         cl.addLayout(form)
         self.lay.addWidget(c)
+        self._sections.append((c, f"{title} {subtitle}".casefold(), form))
         return form
+
+    @staticmethod
+    def _words(w) -> str:
+        """Everything a row says: labels, check boxes, buttons, choices and tooltips (for Find a setting)."""
+        parts = []
+        for x in [w] + w.findChildren(QWidget):
+            for attr in ("text", "placeholderText", "toolTip"):
+                fn = getattr(x, attr, None)
+                if callable(fn):
+                    try:
+                        parts.append(str(fn()))
+                    except TypeError:
+                        pass
+            if isinstance(x, QComboBox):
+                parts += [x.itemText(i) for i in range(x.count())]
+        return " ".join(parts).casefold()
+
+    def _filter(self, text: str) -> None:
+        words = text.casefold().split()
+        any_shown = False
+        for card_w, head, form in self._sections:
+            whole = all(wd in head for wd in words)
+            shown = 0
+            for row in range(form.rowCount()):
+                if not words or whole:
+                    ok = True
+                else:
+                    said = ""
+                    for role in (QFormLayout.LabelRole, QFormLayout.FieldRole, QFormLayout.SpanningRole):
+                        item = form.itemAt(row, role)
+                        if item is None:
+                            continue
+                        if item.widget() is not None:
+                            said += " " + self._words(item.widget())
+                        elif item.layout() is not None:
+                            lay = item.layout()
+                            for k in range(lay.count()):
+                                if lay.itemAt(k).widget() is not None:
+                                    said += " " + self._words(lay.itemAt(k).widget())
+                    ok = all(wd in said for wd in words)
+                form.setRowVisible(row, ok)
+                shown += ok
+            card_w.setVisible(shown > 0 or whole)
+            any_shown |= shown > 0 or whole
+        self.no_match.setVisible(bool(words) and not any_shown)
 
     def _save(self, key: str, value) -> None:
         if self._loading:
@@ -327,10 +388,11 @@ class SettingsPage(QWidget):
                                                 "fit your setup, choose the screen, a borderless window or the exact "
                                                 "size here (also in couch mode: Settings → Couch mode display).")
         from PySide6.QtGui import QGuiApplication
+        from ezgd.ui.window_control import real_size
         screens = [("", "The app's screen")]
         for sc in QGuiApplication.screens():
-            g, dpr = sc.geometry(), sc.devicePixelRatio()
-            screens.append((sc.name(), f"{sc.name()} · {round(g.width() * dpr)}×{round(g.height() * dpr)}"))
+            pw, ph = real_size(sc)
+            screens.append((sc.name(), f"{sc.name()} · {pw}×{ph}"))
         self._combo(f, "couch_screen", "Screen", screens)
         self._combo(f, "couch_window", "Window", [("fullscreen", "Full screen"), ("borderless", "Borderless window"),
                                                   ("custom", "Custom size")])
@@ -340,7 +402,13 @@ class SettingsPage(QWidget):
         self._combo(f, "couch_resolution", "Custom size", res)
         self._combo(f, "couch_ui_scale", "Interface size", [(v, f"{v} %") for v in (75, 90, 100, 110, 125, 150,
                                                                                        175, 200)])
+        self._check(f, "couch_intro", "Intro video when couch mode opens (2 seconds; any button skips it)")
+        self._check(f, "couch_intro_sound", "Intro sound")
         self._check(f, "couch_steady_frames", "Steady frame rate (stops flicker on VRR / FreeSync / G-Sync screens)")
+        self._check(f, "couch_gpu", "Show couch mode through the graphics card (smoother at 4K — applies the next "
+                                    "time couch mode opens)")
+        self._check(f, "couch_controller_only", "Couch mode's Store: only games that work with a controller "
+                                                "(full or partial controller support on Steam)")
 
         f = self._section("Cache & logs")
         self.cache_label = label("", "small")

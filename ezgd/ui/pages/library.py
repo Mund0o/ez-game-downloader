@@ -5,8 +5,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QGuiApplication, QIcon
+from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtGui import QGuiApplication, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame,
                                QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
                                QMessageBox, QProgressBar, QScrollArea, QSplitter, QToolButton, QVBoxLayout, QWidget)
@@ -97,7 +97,14 @@ class LibraryPage(QWidget):
         self.list.setIconSize(QSize(64, 36))
         self.list.setSpacing(2)
         self.list.currentItemChanged.connect(self._selected)
+        self._pending_id = None
+        self._select_timer = QTimer(self)
+        self._select_timer.setSingleShot(True)
+        self._select_timer.setInterval(120)
+        self._select_timer.timeout.connect(self._render_pending)
         self.list.itemDoubleClicked.connect(self._double_clicked)
+        enter = QShortcut(QKeySequence(Qt.Key_Return), self.list, context=Qt.WidgetShortcut)   # Enter = Play too
+        enter.activated.connect(lambda: self.list.currentItem() and self._double_clicked(self.list.currentItem()))
         self.list.setToolTip("Double-click a ready game to play it")
         ll.addWidget(self.list, 1)
         split.addWidget(left)
@@ -224,8 +231,24 @@ class LibraryPage(QWidget):
             it.setHidden(not ok)
 
     def _selected(self, item: QListWidgetItem | None, _prev) -> None:
-        if item is not None:
-            self._render(item.data(Qt.UserRole))
+        """A click shows the game at once; holding an arrow key through the list shows the one it stops on (each
+        page is ~40 widgets and eight look-ups — building one per passing game made the list lag behind)."""
+        if item is None:
+            return
+        import time as _t
+        now = _t.monotonic()
+        busy = now - getattr(self, "_last_select", 0.0) < 0.2
+        self._last_select = now
+        self._pending_id = item.data(Qt.UserRole)
+        if not busy:
+            self._select_timer.stop()
+            self._render(self._pending_id)
+        else:
+            self._select_timer.start()
+
+    def _render_pending(self) -> None:
+        if self._pending_id is not None:
+            self._render(self._pending_id)
 
     def _show_empty(self) -> None:
         clear_layout(self.dl)
@@ -429,7 +452,11 @@ class LibraryPage(QWidget):
     def select(self, entry_id: int) -> None:
         for i in range(self.list.count()):
             if self.list.item(i).data(Qt.UserRole) == entry_id:
+                self._last_select = 0.0                   # chosen by the app: shown at once
                 self.list.setCurrentRow(i)
+                if self.current_id != entry_id:
+                    self._select_timer.stop()
+                    self._render(entry_id)
                 return
 
     # ---------------------------------------------------------- interrupted installs
@@ -1356,15 +1383,27 @@ class LibraryPage(QWidget):
         box.addButton(QMessageBox.Cancel)
         box.exec()
         if box.clickedButton() is folder_btn:
-            path = QFileDialog.getExistingDirectory(self, "Choose the game folder", str(Path.home()))
+            path = QFileDialog.getExistingDirectory(self, "Choose the game folder", self._import_start())
         elif box.clickedButton() is file_btn:
-            path, _ = QFileDialog.getOpenFileName(self, "Choose the archive", str(Path.home()),
+            path, _ = QFileDialog.getOpenFileName(self, "Choose the archive", self._import_start(),
                                                   "Archives (*.zip *.7z *.rar *.tar *.gz *.xz *.bz2 *.001);;All files (*)")
         else:
             return
-        if not path:
-            return
-        title, ok = QInputDialog.getText(self, "Game title", "Title:", text=Path(path).stem)
+        if path:
+            self.import_path(path)
+
+    def _import_start(self) -> str:
+        """Where the import dialogs open: the Downloads folder (where browsers put files), else home."""
+        for p in (Path.home() / "Downloads", Path(self.actions.settings.get("download_dir") or "")):
+            if str(p) and p.is_dir():
+                return str(p)
+        return str(Path.home())
+
+    def import_path(self, path: str) -> None:
+        """Import a game folder or archive (also what is dropped on the window), asking only for its title."""
+        from ezgd.ui.dropin import guess_title
+        title, ok = QInputDialog.getText(self, "Import game", f"Title for “{Path(path).name}”:",
+                                         text=guess_title(path))
         if not (ok and title.strip()):
             return
 

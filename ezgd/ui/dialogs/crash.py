@@ -129,7 +129,22 @@ class CrashNotifier(QObject):
             return                          # already showing one; the saved reports keep the rest
         if getattr(report, "repeat", False):
             return                          # the same error again within a minute: shown once, not every time
-        dlg = CrashDialog(report, self._window(), self._counts[report.code])
+        couch = getattr(self._window(), "couch", None)
+        if couch is not None and couch.isVisible() and not couch.isMinimized():
+            # couch mode covers the screen and stays on top: a desktop window would open hidden behind it (and,
+            # being modal, take the controller with it — it looked frozen, 2026-10-14). Shown in couch mode instead.
+            try:
+                couch.show_crash(report)
+                return
+            except Exception:
+                pass
+        # a modal window (Diagnose, Properties…) blocks input to every window but its own children: the report
+        # opened under the main window could not be clicked or copied (2026-10-14) — it goes on top of the modal one
+        from PySide6.QtWidgets import QApplication
+        modal = QApplication.activeModalWidget()
+        dlg = CrashDialog(report, modal if modal is not None else self._window(), self._counts[report.code])
+        if modal is not None:
+            dlg.setWindowModality(Qt.ApplicationModal)
         self._open = dlg
         dlg.setAttribute(Qt.WA_DeleteOnClose)
         dlg.finished.connect(lambda _r: setattr(self, "_open", None))

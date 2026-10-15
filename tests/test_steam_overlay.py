@@ -66,7 +66,7 @@ def test_shortcuts_for_play_mode(library, tmp_path, monkeypatch):
     st = library.steam_overlay_status(a.id)
     assert st["use"] and not st["ready"] and not st["steam_running"]
     r = library.prepare_steam_shortcuts()
-    assert r == {"games": 2, "users": 1, "restarted": False}
+    assert r == {"games": 2, "users": 1, "restarted": False, "skipped": []}
     assert library.steam_overlay_status(a.id)["ready"] and library.steam_overlay_status(b.id)["ready"]
     shortcuts = steam.shortcuts_of(root, "1234")
     exe, _ = steamrun.runner()
@@ -456,3 +456,75 @@ def test_overlay_off_for_a_game_also_means_not_through_steam(library, tmp_path, 
     library.enable_fix(g.id, "no_steam_overlay")
     st = library.steam_overlay_status(g.id)
     assert not st["use"] and "off for this game" in st["reason"]
+
+
+# ------------------------------------------------------------- never the same game twice in Steam
+def _put_shortcuts(root, entries: list[dict]) -> None:
+    path = root / "userdata" / "1234" / "config" / "shortcuts.vdf"
+    path.write_bytes(vdf.binary_dumps({"shortcuts": {str(i): e for i, e in enumerate(entries)}}))
+
+
+def _user_shortcut(name: str, exe: Path, opts: str = "") -> dict:
+    return steam._native_entry(steam.shortcut_appid(f'"{exe}"', name), name, exe, exe.parent, opts)
+
+
+def test_a_game_already_in_steam_is_not_added_twice(library, tmp_path, monkeypatch):
+    """2026-10-12 on the user's PC: Steam had "PEAK.exe" (added outside the app) and the app added "PEAK" too."""
+    root = fake_steam(tmp_path, monkeypatch)
+    library.settings.set("steam_root", str(root))
+    library.settings.set("launch_through_steam", True)
+    peak = script_game(library, tmp_path, "true", "PEAK")
+    other = script_game(library, tmp_path, "true", "Other Game")
+    named = script_game(library, tmp_path, "true", "Hades II")
+    mine = _user_shortcut("PEAK.exe", Path(peak.executable), 'WINEDLLOVERRIDES="winmm=n,b" %command%')
+    by_name = _user_shortcut("Hades II.exe", tmp_path / "elsewhere" / "Hades2.exe")     # same name, other folder
+    unrelated = _user_shortcut("Some Emulator", tmp_path / "emu" / "emu.AppImage")
+    _put_shortcuts(root, [mine, by_name, unrelated])
+    before = {k: vdf.binary_dumps({"x": v}) for k, v in enumerate([mine, by_name, unrelated])}
+    st = library.steam_overlay_status(peak.id)
+    assert st["use"] is False and st["in_steam_as"] == "PEAK.exe"           # Play starts it directly then
+    assert library.steam_overlay_status(other.id)["use"] is True
+    r = library.prepare_steam_shortcuts()
+    assert r["games"] == 1 and {x["title"] for x in r["skipped"]} == {"PEAK", "Hades II"}
+    names = [v["AppName"] for v in steam.shortcuts_of(root, "1234")]
+    assert sorted(names) == sorted(["PEAK.exe", "Hades II.exe", "Some Emulator", "Other Game"])
+    kept = [vdf.binary_dumps({"x": v}) for v in steam.shortcuts_of(root, "1234") if v["AppName"] != "Other Game"]
+    assert sorted(kept) == sorted(before.values())                          # the user's own: untouched
+    with pytest.raises(Exception, match="already has this game as “PEAK.exe”"):
+        library.add_to_steam(peak.id)
+    assert library.steam_overlay_status(named.id)["in_steam_as"] == "Hades II.exe"
+
+
+def test_the_apps_own_shortcut_is_updated_not_duplicated(library, tmp_path, monkeypatch):
+    root = fake_steam(tmp_path, monkeypatch)
+    library.settings.set("steam_root", str(root))
+    library.settings.set("launch_through_steam", True)
+    a = script_game(library, tmp_path, "true", "Game A")
+    old_app = tmp_path / "old place" / "ezgd"                              # the app was somewhere else back then
+    opts = steamrun.launch_options(a.id)
+    twice = [_user_shortcut("Game A", old_app, opts), _user_shortcut("Game A", old_app, opts)]
+    _put_shortcuts(root, twice)
+    assert library.prepare_steam_shortcuts()["games"] == 1
+    sc = steam.shortcuts_of(root, "1234")
+    exe, _ = steamrun.runner()
+    assert len(sc) == 1 and sc[0]["Exe"] == f'"{exe}"' and sc[0]["LaunchOptions"] == opts
+    assert library.steam_overlay_status(a.id)["ready"]
+
+
+def test_two_library_copies_of_a_game_get_one_steam_entry(library, tmp_path, monkeypatch):
+    root = fake_steam(tmp_path, monkeypatch)
+    library.settings.set("steam_root", str(root))
+    library.settings.set("launch_through_steam", True)
+    first = script_game(library, tmp_path, "true", "Twin Game")
+    second = library.repo.insert(LibraryEntry(title="Twin Game", status=LibraryStatus.INSTALLED,
+                                              install_path=str(tmp_path / "games" / "Twin Game 2"),
+                                              executable=first.executable, executable_trusted=True))
+    r = library.prepare_steam_shortcuts()
+    assert r["games"] == 1 and r["skipped"][0]["by_app"] is True
+    assert [v["AppName"] for v in steam.shortcuts_of(root, "1234")] == ["Twin Game"]
+    assert library.steam_overlay_status(second.id)["use"] is False
+    # the first copy is removed from the Library: its leftover shortcut is reused for the second, not doubled
+    library.repo.delete(first.id)
+    assert library.prepare_steam_shortcuts()["games"] == 1
+    sc = steam.shortcuts_of(root, "1234")
+    assert len(sc) == 1 and sc[0]["LaunchOptions"].endswith(f"--play {second.id}")

@@ -17,6 +17,8 @@ import pytest
 # no test may ever see (or change) this computer's real Steam: 2026-10-12 a test found the user's real Steam game
 # and unpacked a dummy fix into it. Tests that need Steam build a fake one and point "steam_root" at it.
 os.environ["EZGD_STEAM_ROOT"] = "/nonexistent/ezgd-test-steam"
+os.environ["EZGD_NO_GAMEPADS"] = "1"       # never the real controllers (a game played meanwhile pressed buttons in tests)
+os.environ["EZGD_NO_INTRO"] = "1"          # couch mode opens straight away (tests of the intro switch it back on)
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:                    # Qt WebEngine (in-app browser) must be loaded before the QApplication exists

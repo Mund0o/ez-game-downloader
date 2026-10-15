@@ -13,14 +13,15 @@ WINDOWS = sys.platform == "win32"
 
 datas = [(str(ROOT / "ezgd" / "resources" / "certs"), "ezgd/resources/certs"),
          (str(ROOT / "ezgd" / "resources" / "adblock"), "ezgd/resources/adblock"),
+         (str(ROOT / "ezgd" / "resources" / "couch"), "ezgd/resources/couch"),       # the couch intro video
          (str(ROOT / "config.sample.toml"), ".")]
 datas += collect_data_files("certifi")
 binaries = collect_dynamic_libs("libtorrent")
 
-# Only QtCore/QtGui/QtWidgets are used; keep heavy Qt modules out of the bundle.
+# Only QtCore/QtGui/QtWidgets (+ QtMultimedia for the couch intro) are used; keep heavy Qt modules out.
 excludes = ["tkinter", "PySide6.QtWebEngineQuick",   # QtWebEngineCore/Widgets = the in-app browser
             "PySide6.QtQml", "PySide6.QtQuick", "PySide6.QtQuickWidgets", "PySide6.Qt3DCore",
-            "PySide6.QtMultimedia", "PySide6.QtPdf", "PySide6.QtCharts", "PySide6.QtDataVisualization",
+            "PySide6.QtMultimediaWidgets", "PySide6.QtPdf", "PySide6.QtCharts", "PySide6.QtDataVisualization",
             "PySide6.QtDesigner", "PySide6.QtSql", "PySide6.QtTest", "PySide6.QtBluetooth",
             "PySide6.QtPositioning", "PySide6.QtSensors", "PySide6.QtSerialPort"]
 
@@ -30,7 +31,7 @@ a = Analysis(
     binaries=binaries,
     datas=datas,
     hiddenimports=["libtorrent", "py7zr", "rarfile", "lxml.etree", "lxml._elementpath", "bs4",
-                   "backports.zstd", "backports.zstd.zipfile", "adblock"],
+                   "backports.zstd", "backports.zstd.zipfile", "adblock", "PySide6.QtMultimedia"],
     excludes=excludes,
     noarchive=False,
 )

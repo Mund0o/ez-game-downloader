@@ -18,7 +18,7 @@ from ezgd.ui.widgets.common import Banner, button, label
 class AddDownloadDialog(QDialog):
     """Paste a magnet link / direct file URL / .torrent URL, or pick a local .torrent file."""
 
-    def __init__(self, settings: dict, parent=None, initial: str = ""):
+    def __init__(self, settings: dict, parent=None, initial: str = "", torrent: str = ""):
         super().__init__(parent)
         self.setWindowTitle("Add download")
         self.setMinimumWidth(620)
@@ -37,7 +37,7 @@ class AddDownloadDialog(QDialog):
         row.addWidget(self.link, 1)
         row.addWidget(button("Paste", on_click=self._paste))
         form.addRow("Link", row)
-        self.torrent_path = QLineEdit()
+        self.torrent_path = QLineEdit(torrent)
         self.torrent_path.setPlaceholderText("…or choose a .torrent file")
         trow = QHBoxLayout()
         trow.addWidget(self.torrent_path, 1)

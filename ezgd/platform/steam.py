@@ -359,6 +359,77 @@ def _is_app_shortcut(v: dict) -> bool:
     return RUNNER_MARK in str(v.get("LaunchOptions", ""))
 
 
+class SteamDuplicateError(SteamFileError):
+    """The game is in Steam already (nothing was written): ``existing`` is the name Steam shows it under."""
+
+    def __init__(self, message: str, existing: str, by_app: bool):
+        super().__init__(message)
+        self.existing = existing
+        self.by_app = by_app
+
+
+def play_id(v: dict) -> int | None:
+    """The Library id an app shortcut starts (``… --play 18``), else None."""
+    m = re.search(r"--play\s+'?(\d+)", str(v.get("LaunchOptions", "")))
+    return int(m.group(1)) if m and _is_app_shortcut(v) else None
+
+
+def _norm_name(name: str) -> str:
+    """``"PEAK.exe"`` / ``PEAK™`` / ``peak`` → ``peak``: how a shortcut's name is compared with a game's title."""
+    n = str(name or "").strip().strip('"')
+    n = re.split(r"[\\/]", n)[-1]
+    n = re.sub(r"\.(exe|bat|cmd|sh|x86_64|x86|appimage|lnk)$", "", n, flags=re.I)
+    return re.sub(r"[\W_]+", "", n.casefold())
+
+
+def _exe_path(v: dict) -> Path | None:
+    raw = str(v.get("Exe", "")).strip().strip('"')
+    return Path(raw) if raw else None
+
+
+def same_game_shortcut(shortcuts: list[dict], *, title: str, game_exe: str | None = None,
+                       game_dir: str | None = None, entry_id: int | None = None,
+                       live_ids: set[int] | None = None) -> dict | None:
+    """A shortcut in this list that already is this game, other than the app's own for ``entry_id``:
+
+    * one made outside the app (by the user, Steam or another tool) that starts the game's executable or anything
+      in its folder, or has the game's name (``PEAK.exe`` for *PEAK*);
+    * the app's shortcut for *another* Library entry of the same game that still exists (``live_ids``).
+    Returns ``{"name", "by_app"}`` or None."""
+    key = _norm_name(title)
+    exe = Path(game_exe).resolve() if game_exe else None
+    folder = Path(game_dir).resolve() if game_dir else None
+    if folder is not None and len(folder.parts) < 4:      # never "anything under /home/me"
+        folder = None
+    for v in shortcuts:
+        pid = play_id(v)
+        if pid is not None:
+            if pid != entry_id and live_ids is not None and pid in live_ids and len(key) >= 2 \
+                    and _norm_name(v.get("AppName", "")) == key:
+                return {"name": str(v.get("AppName", "")), "by_app": True}
+            continue
+        if _is_app_shortcut(v):
+            continue
+        p = _exe_path(v)
+        try:
+            rp = p.resolve() if p is not None else None
+        except (OSError, RuntimeError):
+            rp = p
+        same = (exe is not None and rp == exe) or (folder is not None and rp is not None and folder in rp.parents)
+        if same or (len(key) >= 3 and _norm_name(v.get("AppName", "")) == key):
+            return {"name": str(v.get("AppName", "")), "by_app": False}
+    return None
+
+
+def steam_copy_of(steam_root: Path, **kw) -> dict | None:
+    """``same_game_shortcut`` over every Steam user's list (what Steam shows after its next start)."""
+    for user in steam_users(steam_root):
+        hit = same_game_shortcut(shortcuts_of(steam_root, user), **kw)
+        if hit is not None:
+            return hit
+    return None
+
+
 def write_shortcuts(path: Path, change, ours=_is_app_shortcut) -> Path | None:
     """Apply ``change(shortcuts: dict) -> bool`` to a shortcuts.vdf, safely; returns the backup made (or None).
 
@@ -405,28 +476,53 @@ def write_shortcuts(path: Path, change, ours=_is_app_shortcut) -> Path | None:
 
 
 def add_shortcut(steam_root: Path, user_id: str, *, name: str, exe: Path, start_dir: Path,
-                 launch_options: str = "", icon: str = "") -> int:
+                 launch_options: str = "", icon: str = "", game_exe: str | None = None, game_dir: str | None = None,
+                 live_ids: set[int] | None = None) -> int:
     """Add (or update) a non-Steam game shortcut in Steam's own format; returns its app id. ``icon`` is ignored:
-    Steam's own shortcuts have none on Linux, and an .exe path there is not an image."""
+    Steam's own shortcuts have none on Linux, and an .exe path there is not an image.
+
+    A game is never added twice: if Steam already has it (see :func:`same_game_shortcut` — ``game_exe`` /
+    ``game_dir`` are the game's own files, ``live_ids`` the Library's entries) nothing is written and
+    :class:`SteamDuplicateError` says under which name. The app's own shortcut for the same game is updated in
+    place, also when the app has moved since (another ``Exe``), and extra copies of it are taken out."""
     path = steam_root / "userdata" / user_id / "config" / "shortcuts.vdf"
     exe_q = f'"{exe}"'
     appid = shortcut_appid(exe_q, name)
     entry = _native_entry(appid, name, exe, start_dir, launch_options)
+    mine = play_id({"LaunchOptions": launch_options})
+    hit = same_game_shortcut(shortcuts_of(steam_root, user_id), title=name, game_exe=game_exe, game_dir=game_dir,
+                             entry_id=mine, live_ids=live_ids) if mine is not None else None
+    if hit is not None:
+        where = "for another copy of it in your Library" if hit["by_app"] else "(added outside this app)"
+        raise SteamDuplicateError(f"Steam already has this game as “{hit['name']}” {where}, so it was not added "
+                                  "a second time.", hit["name"], hit["by_app"])
+
+    def same(v: dict) -> bool:
+        if not isinstance(v, dict):
+            return False
+        if mine is not None:                   # the app's shortcut for this game, wherever the app was then
+            if play_id(v) == mine:
+                return True
+            # a leftover of a Library entry that is gone, with this game's name: reused instead of a second one
+            pid = play_id(v)
+            return pid is not None and live_ids is not None and pid not in live_ids and \
+                _norm_name(v.get("AppName", "")) == _norm_name(name)
+        return v.get("Exe") == exe_q
 
     def change(shortcuts: dict) -> bool:
-        for k, v in shortcuts.items():
-            # the same shortcut again: same program and, for shortcuts that start this app, the same game
-            if isinstance(v, dict) and v.get("Exe") == exe_q and (
-                    RUNNER_MARK not in launch_options or v.get("LaunchOptions") == launch_options):
-                if vdf.binary_dumps({"x": v}) == vdf.binary_dumps({"x": entry}):
-                    return False               # already exactly there: nothing to write
-                shortcuts[k] = entry
-                return True
-        shortcuts[str(10**6 + len(shortcuts))] = entry   # appended; renumbered by write_shortcuts
+        keys = [k for k, v in shortcuts.items() if same(v)]
+        if not keys:
+            shortcuts[str(10**6 + len(shortcuts))] = entry   # appended; renumbered by write_shortcuts
+            return True
+        first, extra = keys[0], keys[1:]
+        if not extra and vdf.binary_dumps({"x": shortcuts[first]}) == vdf.binary_dumps({"x": entry}):
+            return False                       # already exactly there: nothing to write
+        shortcuts[first] = entry
+        for k in extra:                        # the same game more than once (older versions): only one stays
+            del shortcuts[k]
         return True
     # the entry being added/updated is the one this call may touch; every other shortcut must stay as it is
-    write_shortcuts(path, change, ours=lambda v: _is_app_shortcut(v) or (v.get("Exe") == exe_q and (
-        RUNNER_MARK not in launch_options or v.get("LaunchOptions") == launch_options)))
+    write_shortcuts(path, change, ours=lambda v: _is_app_shortcut(v) or same(v))
     return appid
 
 

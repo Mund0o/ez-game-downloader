@@ -21,20 +21,21 @@ import logging
 import math
 import time
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable
 
-from PySide6.QtCore import (QEasingCurve, QObject, QPointF, QRect, QRectF, QSize, Qt, QTimer, QVariantAnimation,
-                            Signal)
-from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QLinearGradient, QPainter, QPainterPath,
-                           QPen, QPixmap, QRadialGradient)
+from PySide6.QtCore import (QBuffer, QByteArray, QEasingCurve, QIODevice, QObject, QPointF, QRect, QRectF, Qt,
+                            QTimer, QVariantAnimation, Signal)
+from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QImageReader, QLinearGradient, QPainter,
+                           QPainterPath, QPen, QPixmap, QRegion)
+from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QApplication, QWidget
 
-from ezgd.ui import gcguard, theme
+from ezgd.ui import artwork, gcguard, theme
+from ezgd.ui.couch_intro import CouchIntro
 from ezgd.ui.couch_pages import GamePage, Keyboard, Page, SettingsPage, StorePage, WishlistPage
 from ezgd.ui.gamepad import Gamepads
-from ezgd.ui.window_control import WindowControl
+from ezgd.ui.window_control import WindowControl, real_scale
 from ezgd.ui.widgets.common import ToastHost, relative_time
 
 log = logging.getLogger(__name__)
@@ -74,78 +75,55 @@ class Overlay:
     menu: bool = False                                                 # buttons as a vertical list (a menu)
     notes: list[str] = field(default_factory=list)                     # menu: a second line per entry
     scroll: float = 0.0
+    progress: float | None = None                                      # busy with a known amount done (0–1)
+    shown_progress: float = 0.0                                        # (animated towards ``progress``)
 
 
 class _ArtSignals(QObject):
-    decoded = Signal(str, object)          # url, QImage | None
     ready = Signal(object, object)         # job key, QImage | None
 
 
-def _rounded(img: QImage, radius: float, border: float = 0.0) -> QImage:
-    """The image with rounded corners (transparent outside) and, optionally, a faint border — so a tile is drawn
-    with one plain blit."""
-    out = QImage(img.size(), QImage.Format_ARGB32_Premultiplied)
-    out.fill(Qt.transparent)
-    p = QPainter(out)
-    p.setRenderHint(QPainter.Antialiasing)
-    path = QPainterPath()
-    path.addRoundedRect(QRectF(0, 0, img.width(), img.height()), radius, radius)
-    p.setClipPath(path)
-    p.drawImage(0, 0, img)
-    if border:
-        p.setClipping(False)
-        p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(QColor(255, 255, 255, 40), border))
-        inner = QPainterPath()
-        inner.addRoundedRect(QRectF(border / 2, border / 2, img.width() - border, img.height() - border),
-                             radius - border / 2, radius - border / 2)
-        p.drawPath(inner)
-    p.end()
-    return out
-
-
-def _cover(img: QImage, w: int, h: int, top: bool = False) -> QImage:
-    s = img.scaled(QSize(w, h), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-    x = max(0, (s.width() - w) // 2)
-    y = 0 if top else max(0, (s.height() - h) // 2)
-    return s.copy(x, y, w, h)
-
-
-def _blur(img: QImage, w: int, h: int) -> QImage:
-    small = img.scaled(QSize(32, 32), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-    small = small.scaled(QSize(12, 12), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-    return _cover(small, max(1, w // 4), max(1, h // 4)).scaled(QSize(w, h), Qt.IgnoreAspectRatio,
-                                                                  Qt.SmoothTransformation)
+def image_size(data: bytes) -> tuple[int, int] | None:
+    """A picture's size from its header (no decoding — that happens in the artwork helper)."""
+    buf = QBuffer()
+    buf.setData(QByteArray(data))
+    if not buf.open(QIODevice.ReadOnly):
+        return None
+    reader = QImageReader(buf)
+    size = reader.size()
+    buf.close()
+    return (size.width(), size.height()) if size.isValid() and size.width() > 0 and size.height() > 0 else None
 
 
 class Images:
     """Artwork for couch mode, prepared off the GUI thread: pictures are decoded, scaled, given rounded corners and
-    composed into whole backgrounds by worker threads, so moving the focus only ever draws finished pixmaps (made
-    for the screen's real pixels — sharp at 125 % / 150 % scaling). Until a picture is ready its place shows a
-    placeholder; nothing waits for it."""
+    composed into whole backgrounds by a helper process (see artwork.py — in a thread, Qt's image calls froze the
+    window), so moving the focus only ever draws finished images (made for the screen's real pixels — sharp at
+    125 % / 150 % scaling). Until a picture is ready its place shows a placeholder; nothing waits for it."""
 
     LIMIT = 200                               # finished tiles kept (least recently used go first)
-    LAYERS = 4                                # finished full-screen backgrounds kept
-    RAW = 60                                  # decoded originals kept (only needed to make tiles/backgrounds)
+    TILE_BYTES = 192 << 20                    # … and at most this much of them (a 4K Store tile is about 1 MB)
+    LAYERS = 3                                # finished full-screen backgrounds kept (on screen, fading out, next)
+    RAW = 150                                 # downloaded originals kept (only needed to make tiles/backgrounds)
     CAPSULE_WAIT = 2.5                        # seconds a tile waits for Steam's cover before showing the site's
     FADE = 0.18
 
     def __init__(self, owner: "CouchWindow"):
         self.owner = owner
-        self.raw: OrderedDict = OrderedDict()             # url → decoded QImage
+        self.raw: OrderedDict = OrderedDict()             # url → the downloaded (encoded) picture
         self.meta: dict[str, tuple[int, int] | None] = {}  # url → size of the picture (None: could not be loaded)
         self.asked: dict[str, float] = {}                 # url → when it was first wanted
         self.cache: OrderedDict = OrderedDict()
+        self.cache_bytes = 0
         self.layers: OrderedDict = OrderedDict()
         self.born: dict = {}                              # key → when it became ready (fade-in)
         self.jobs: set = set()
         self.pending: set[str] = set()
-        self.pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="couch-art")
-        # not a child of the window: it must outlive it until the workers have stopped (see shutdown)
+        # not a child of the window: a job may finish after it closed
         self.sig = _ArtSignals()
-        self.sig.decoded.connect(self._decoded)
         self.sig.ready.connect(self._ready)
         self.closed = False
+        artwork.warm_up()
 
     def dpr(self) -> float:
         try:
@@ -154,22 +132,32 @@ class Images:
             return 1.0
 
     def shutdown(self) -> None:
-        """Stop the workers before the window goes: a job finishing later must not signal a deleted object."""
+        """The window goes: results that arrive later are dropped (the helper keeps running for next time)."""
         self.closed = True
-        self.pool.shutdown(wait=True, cancel_futures=True)       # running jobs take well under a second
 
     def clear(self) -> None:
         self.cache.clear()
+        self.cache_bytes = 0
         self.layers.clear()
 
+    def keep_only(self, urls: set[str]) -> None:
+        """Let go of the pictures (tiles and downloaded originals) of everything not in ``urls`` — the games far
+        from where you are; they come back from the disk cache when you scroll back."""
+        for key in [k for k in self.cache if k[1] not in urls]:
+            self.cache_bytes -= self.cache.pop(key).sizeInBytes()
+            self.born.pop(key, None)
+        for url in [u for u in self.raw if u not in urls]:
+            del self.raw[url]
+
     # ------------------------------------------------------------ loading
-    def get(self, url: str | None) -> QImage | None:
+    def get(self, url: str | None) -> bytes | None:
+        """The downloaded picture (fetched when first asked for; None until it is here)."""
         if not url:
             return None
-        img = self.raw.get(url)
-        if img is not None:
+        data = self.raw.get(url)
+        if data is not None:
             self.raw.move_to_end(url)
-            return img
+            return data
         if url in self.meta and self.meta[url] is None:
             return None                                 # could not be loaded: not asked again
         self.asked.setdefault(url, time.monotonic())
@@ -177,50 +165,20 @@ class Images:
             self.pending.add(url)
             b = self.owner.bridge
             b.call(b.core.cover(url), lambda data, u=url: self._fetched(u, data),
-                   lambda _e, u=url: self._decoded(u, None), owner=self.owner)
+                   lambda _e, u=url: self._fetched(u, None), owner=self.owner)
         return None
 
     def _fetched(self, url: str, data: bytes | None) -> None:
-        if not data or self.closed:
-            self._decoded(url, None)
-            return
-
-        def work() -> None:
-            img = QImage.fromData(data)
-            if not img.isNull():
-                # wide art may fill a 4K screen; portrait covers only ever fill a tile
-                limit = QSize(3840, 2400) if img.width() >= img.height() * 1.45 else QSize(1600, 1200)
-                if img.width() > limit.width() or img.height() > limit.height():
-                    img = img.scaled(limit, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self._emit(self.sig.decoded, url, None if img.isNull() else img)
-        self._submit(work)
-
-    def _decoded(self, url: str, img) -> None:
         if self.closed:
             return
         self.pending.discard(url)
-        self.meta[url] = (img.width(), img.height()) if img is not None else None
-        if img is not None:
-            self.raw[url] = img
-            while len(self.raw) > self.RAW:             # finished tiles stay; originals can be read again
+        size = image_size(data) if data else None
+        self.meta[url] = size
+        if size is not None:
+            self.raw[url] = data
+            while len(self.raw) > self.RAW:             # finished tiles stay; originals can be fetched again
                 self.raw.popitem(last=False)
-        self.owner.update()
-
-    def _submit(self, fn) -> None:
-        if self.closed:
-            return
-        try:
-            self.pool.submit(fn)
-        except RuntimeError:                           # shutting down
-            pass
-
-    def _emit(self, signal, *args) -> None:
-        if self.closed:
-            return
-        try:
-            signal.emit(*args)
-        except RuntimeError:                           # the window is gone
-            pass
+        self.owner.art_arrived(url)
 
     def _store(self, key: tuple) -> OrderedDict:
         return self.layers if key[0] == "layer" else self.cache
@@ -228,41 +186,71 @@ class Images:
     def ready_since(self, key: tuple) -> float:
         return self.born.get(key, 0.0)
 
-    def _job(self, key: tuple, make) -> QImage | None:
-        """The finished image for ``key``, or None while a worker makes it (``make`` returns a QImage)."""
+    def _job(self, key: tuple, job: tuple | None) -> QImage | None:
+        """The finished image for ``key``, or None while the helper makes it (``job``: artwork.render's arguments
+        — kind, source url, its data, the rest)."""
         store = self._store(key)
         pm = store.get(key)
         if pm is not None:
             store.move_to_end(key)
             return pm
-        if make is None:
+        if job is None:
             return None
         if key not in self.jobs and not self.closed:
             self.jobs.add(key)
+            try:
+                fut = artwork.submit(*job)
+            except Exception:
+                log.exception("couch mode: preparing artwork failed")
+                self.jobs.discard(key)
+                return None
 
-            def work() -> None:
+            def done(f, key=key) -> None:                 # runs on a pool thread: only make the QImage here
                 try:
-                    img = make()
-                except Exception:
-                    log.exception("couch mode: preparing artwork failed")
-                    img = None
-                self._emit(self.sig.ready, key, img)
-            self._submit(work)
+                    img = artwork.to_image(f.result())
+                except Exception as exc:
+                    artwork.broken(exc)
+                    if not isinstance(exc, RuntimeError):
+                        log.warning("couch mode: preparing artwork failed: %s", exc)
+                    img = False                             # failed: may be tried again
+                if not self.closed:
+                    try:
+                        self.sig.ready.emit(key, img)
+                    except RuntimeError:                   # the app is going
+                        pass
+            fut.add_done_callback(done)
         return None
 
     def _ready(self, key: tuple, img) -> None:
         self.jobs.discard(key)
-        if img is None or img.isNull() or self.closed:
+        if self.closed:
+            return
+        if img is None:                                 # the picture could not be decoded: use another one
+            if key[0] in ("tile", "fill", "layer") and key[1]:
+                self.meta[key[1]] = None
+                self.raw.pop(key[1], None)
+            self.owner.update()
+            return
+        if img is False or img.isNull():
             return
         img.setDevicePixelRatio(key[-1])       # kept as a QImage: drawn directly, no copy into a QPixmap
         store = self._store(key)
+        tiles = store is self.cache
+        if tiles:
+            old_img = store.get(key)
+            self.cache_bytes += img.sizeInBytes() - (old_img.sizeInBytes() if old_img is not None else 0)
         store[key] = img
         self.born[key] = time.monotonic()
-        limit = self.LAYERS if store is self.layers else self.LIMIT
-        while len(store) > limit:
-            old, _ = store.popitem(last=False)
+        limit = self.LIMIT if tiles else self.LAYERS
+        while len(store) > 1 and (len(store) > limit or (tiles and self.cache_bytes > self.TILE_BYTES)):
+            old, gone = store.popitem(last=False)
             self.born.pop(old, None)
-        self.owner.update()
+            if tiles:
+                self.cache_bytes -= gone.sizeInBytes()
+        if store is self.layers:
+            self.owner.update()
+        else:
+            self.owner.art_arrived(key[1])
 
     # ------------------------------------------------------------ pictures
     def fill(self, url: str | None, w: int, h: int, top: bool = False, radius: float = 0.0) -> QImage | None:
@@ -275,14 +263,10 @@ class Images:
         done = self._job(key, None)
         if done is not None:
             return done
-        img = self.get(url)
-        if img is None:
+        data = self.get(url)
+        if data is None:
             return None
-
-        def make() -> QImage:
-            out = _cover(img, pw, ph, top)
-            return _rounded(out, radius * dpr) if radius else out
-        return self._job(key, make)
+        return self._job(key, ("fill", url, data, (pw, ph, top, radius * dpr)))
 
     def tile(self, capsule: str | None, cover: str | None, w: int, h: int, radius: float, dim: bool
              ) -> tuple[QImage | None, bool, tuple | None]:
@@ -325,113 +309,26 @@ class Images:
         done = self._job(key, None)                     # finished already: no need for the original
         if done is not None:
             return done, not portrait, key
-        art = self.get(src)
-        if art is None:
+        data = self.get(src)
+        if data is None:
             return None, True, None
-
-        def make() -> QImage:
-            if portrait:
-                out = _cover(art, pw, ph)
-            else:
-                out = _blur(art, pw, ph).convertToFormat(QImage.Format_ARGB32_Premultiplied)
-                p = QPainter(out)
-                p.setRenderHint(QPainter.SmoothPixmapTransform)
-                p.fillRect(out.rect(), QColor(0, 0, 0, 70))
-                front = art.scaled(QSize(int(pw - 12 * dpr), int(ph * 0.62)), Qt.KeepAspectRatio,
-                                   Qt.SmoothTransformation)
-                p.drawImage(int((pw - front.width()) / 2), int((ph * 0.72 - front.height()) / 2), front)
-                band = QLinearGradient(0, ph * 0.6, 0, ph)
-                band.setColorAt(0, QColor(0, 0, 0, 0))
-                band.setColorAt(1, QColor(0, 0, 0, 215))
-                p.fillRect(QRectF(0, ph * 0.6, pw, ph * 0.4), QBrush(band))
-                p.end()
-            if dim:
-                p = QPainter(out)
-                p.fillRect(out.rect(), QColor(0, 0, 0, 110))
-                p.end()
-            return _rounded(out, radius * dpr, border=max(1.0, radius / 12 * dpr))
-        return self._job(key, make), not portrait, key
+        return self._job(key, ("tile", src, data, (pw, ph, radius * dpr, dim, portrait, dpr))), not portrait, key
 
     def layer(self, url: str | None, W: int, H: int, mode: str) -> QImage | None:
-        """The whole page background (colours, glow, the artwork, shading) as one opaque pixmap, so a frame
-        starts with a single fast copy. A wide hero image spans the full width at its own shape (fading out at the
-        bottom), anything else sits on the right; both over a soft blur of the same picture."""
+        """The whole page background (colours, glow, the artwork, shading) as one opaque image, so a frame starts
+        with a single fast copy (see artwork.layer)."""
         dpr = self.dpr()
         PW, PH = max(1, round(W * dpr)), max(1, round(H * dpr))
         if url and self.meta.get(url, False) is None:
             url = None                                  # could not be loaded: a plain background
-        done = self._job(("layer", url, PW, PH, mode, theme.CURRENT.accent, dpr), None)
+        key = ("layer", url, PW, PH, mode, theme.CURRENT.accent, dpr)
+        done = self._job(key, None)
         if done is not None:
             return done
-        img = self.get(url) if url else None
-        if url and img is None:
+        data = self.get(url) if url else None
+        if url and data is None:
             return None
-        bg0, accent = QColor(theme.CURRENT.bg0), QColor(theme.CURRENT.accent)
-
-        def make() -> QImage:
-            canvas = QImage(PW, PH, QImage.Format_RGB32)
-            canvas.fill(bg0)
-            p = QPainter(canvas)
-            p.setRenderHint(QPainter.SmoothPixmapTransform)
-            glow = QRadialGradient(QPointF(PW * 0.2, PH * 0.1), PW * 0.9)
-            acc = QColor(accent)
-            acc.setAlpha(70)
-            glow.setColorAt(0, acc)
-            glow.setColorAt(1, QColor(0, 0, 0, 0))
-            p.fillRect(canvas.rect(), QBrush(glow))
-            if img is not None:
-                p.setOpacity(0.55)
-                p.drawImage(0, 0, _blur(img, PW, PH))
-                p.setOpacity(1.0)
-                aspect = img.width() / max(1, img.height())
-                if aspect >= 1.45:
-                    hh = round(PW / aspect)
-                    hero = img.scaled(QSize(PW, hh), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-                    hero = hero.copy(0, 0, PW, min(hh, PH)).convertToFormat(QImage.Format_ARGB32_Premultiplied)
-                    hp = QPainter(hero)
-                    hp.setCompositionMode(QPainter.CompositionMode_DestinationIn)
-                    g = QLinearGradient(0, 0, 0, hero.height())
-                    g.setColorAt(0.0, QColor(0, 0, 0, 255))
-                    g.setColorAt(0.62, QColor(0, 0, 0, 255))
-                    g.setColorAt(1.0, QColor(0, 0, 0, 0))
-                    hp.fillRect(hero.rect(), QBrush(g))
-                    hp.end()
-                    p.drawImage(0, 0, hero)
-                else:
-                    ph_, pw_ = PH, round(PH * aspect)
-                    if pw_ > PW * 0.62:
-                        pw_ = round(PW * 0.62)
-                        ph_ = round(pw_ / aspect)
-                    art = img.scaled(QSize(pw_, ph_), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-                    art = art.convertToFormat(QImage.Format_ARGB32_Premultiplied)
-                    ap = QPainter(art)
-                    ap.setCompositionMode(QPainter.CompositionMode_DestinationIn)
-                    g = QLinearGradient(0, 0, pw_, 0)
-                    g.setColorAt(0.0, QColor(0, 0, 0, 0))
-                    g.setColorAt(0.4, QColor(0, 0, 0, 255))
-                    g.setColorAt(1.0, QColor(0, 0, 0, 255))
-                    ap.fillRect(art.rect(), QBrush(g))
-                    g2 = QLinearGradient(0, 0, 0, ph_)
-                    g2.setColorAt(0.0, QColor(0, 0, 0, 255))
-                    g2.setColorAt(0.7, QColor(0, 0, 0, 255))
-                    g2.setColorAt(1.0, QColor(0, 0, 0, 0))
-                    ap.fillRect(art.rect(), QBrush(g2))
-                    ap.end()
-                    p.drawImage(PW - pw_, 0, art)
-            dim = {"home": 150, "game": 175}.get(mode, 205)
-            shade = QLinearGradient(0, 0, 0, PH)
-            shade.setColorAt(0.0, QColor(4, 5, 9, 140))
-            shade.setColorAt(0.45, QColor(4, 5, 9, dim))
-            shade.setColorAt(1.0, QColor(4, 5, 9, 245))
-            p.fillRect(canvas.rect(), QBrush(shade))
-            if mode in ("home", "game"):
-                side = QLinearGradient(0, 0, PW * 0.65, 0)
-                side.setColorAt(0, QColor(0, 0, 0, 180))
-                side.setColorAt(1, QColor(0, 0, 0, 0))
-                p.fillRect(canvas.rect(), QBrush(side))
-            p.end()
-            return canvas
-        return self._job(("layer", url, PW, PH, mode, theme.CURRENT.accent, dpr), make)
+        return self._job(key, ("layer", url, data, (PW, PH, mode, theme.CURRENT.bg0, theme.CURRENT.accent)))
 
 
 class CouchToasts:
@@ -517,9 +414,10 @@ FAMILY_NAMES = {"xbox": "Xbox controller", "playstation": "PlayStation controlle
                 "nintendo": "Nintendo controller", "generic": "Controller"}
 
 
-class CouchWindow(QWidget):
-    closed = Signal()
-    BG_REST = 0.12                        # seconds the focus rests on a game before the background follows it
+class _Couch:
+    """Couch mode itself — drawn by one of the two windows below (the GPU one by default)."""
+    BG_REST = 0.25                        # seconds the focus rests on a game before the background follows it
+    #                                       (each change cross-fades two full-screen images: not on every step)
 
     def __init__(self, actions, entries: list, running: set[int]):
         super().__init__(None, Qt.Window)
@@ -555,6 +453,11 @@ class CouchWindow(QWidget):
         self._title_queue: list[str] = []
         self._title_names: dict[str, str] = {}
         self._title_inflight = 0
+        self.controller: dict[str, dict] = {}         # game key → {"app", "controller", "pending"} (Store filter)
+        self.ctl_version = 0                          # bumped whenever answers arrive
+        self._ctl_queue: OrderedDict = OrderedDict()  # game key → (title, Steam App ID), in the order shown
+        self._ctl_search: OrderedDict = OrderedDict() # the same, for titles that need Steam's search
+        self._ctl_busy = self._ctl_searching = False
         self.running: set[int] = set(running)
         self.launched: set[int] = set()          # games started from couch mode (the ✕ closes these)
         self._launch_at: dict[int, float] = {}   # when each was started (monotonic)
@@ -562,6 +465,7 @@ class CouchWindow(QWidget):
         self.extraction: dict[int, float] = {}
         self.extraction_info: dict[int, dict] = {}
         self.downloads: list[dict] = []
+        self.browser_downloads: list[dict] = []   # files the in-app browser is downloading (not in the core's list)
         self.summary: dict = {}
         self.tab = T_HOME
         self.zone = "main"                        # top | buttons | main
@@ -587,8 +491,19 @@ class CouchWindow(QWidget):
         self._bg_t = 1.0
         self._fonts: dict[tuple, QFont] = {}
         self._tag_cache: dict[tuple, QPixmap] = {}
+        self._layers: OrderedDict = OrderedDict()      # see _layer
+        self._layer_bytes = 0
+        self._areas: list[QRectF] = []                  # parts of the screen to repaint (see update_area)
+        self._meter = {"paints": [], "partial": 0, "stalls": [], "delays": [], "asked": 0.0, "last_tick": 0.0,
+                       "since": time.perf_counter()}
+        self._later: dict[int, list[QRectF]] = {}
+        self._clip = QRectF()                           # what the current frame repaints
+        self._focus_rect: QRectF | None = None          # where the focused tile (and its glow) is drawn
+        self._waiting: dict[str, QRectF] = {}           # picture url → the tile waiting for it
+        self._move_tries: dict[str, int] = {}           # screen name → attempts to move there (see _fit_screen)
+        self._bands: OrderedDict = OrderedDict()       # see _copy_tile
         self._shown: dict[tuple, tuple] = {}     # tile → the picture it showed last
-        self._tab_fit: dict[tuple, float] = {}
+        self._tab_fit: dict[tuple, tuple[float, bool]] = {}
         self._paint_failed = False
         self._frame_pending = False
         self._minimize_timer = QTimer(self)
@@ -619,6 +534,7 @@ class CouchWindow(QWidget):
         self.pages = {T_STORE: StorePage(self), T_WISHLIST: WishlistPage(self), T_SETTINGS: SettingsPage(self)}
         self._known_pads: set[str] = set()
         self._opened = False
+        self.intro: CouchIntro | None = None      # the intro video while it plays (couch_intro.py)
         self.pads = Gamepads(self)
         self.pad_family = ""                      # button prompts: the controller used last ("" = keyboard)
         self.browser = None                       # the in-app browser, driven by the controller (couch_browser)
@@ -752,6 +668,74 @@ class CouchWindow(QWidget):
             self.bridge.call(self.bridge.core.steam_search(self._title_names.get(key) or key), done, failed,
                              owner=self)
 
+    # ------------------------------------------------ controller support (the Store's filter)
+    CTL_BATCH = 120                               # games answered from caches / ProtonDB's list per call
+    CTL_SEARCHES = 3                              # titles looked up with Steam's search per call (1 s apart)
+
+    def want_controller(self, groups) -> None:
+        """Ask which of these games work with a controller, in the order shown: answers from what is known offline
+        come in big batches; titles that need Steam's search go through a second, slower lane."""
+        for g in groups:
+            k = g.key
+            if not k or k in self._ctl_queue or k in self._ctl_search:
+                continue
+            known = self.controller.get(k)
+            if known is not None and not known.get("pending"):
+                continue
+            app = next((x.steam_app_id for x in g.entries if x.steam_app_id), None)
+            self._ctl_queue[k] = (g.title, app)
+        self._ctl_next()
+
+    def _ctl_next(self) -> None:
+        if self._exiting:
+            return
+        if not self._ctl_busy and self._ctl_queue:
+            self._ctl_ask(self._ctl_queue, self.CTL_BATCH, 0, "_ctl_busy")
+        if not self._ctl_searching and self._ctl_search:
+            self._ctl_ask(self._ctl_search, self.CTL_SEARCHES, self.CTL_SEARCHES, "_ctl_searching")
+
+    def _ctl_ask(self, queue: OrderedDict, n: int, searches: int, flag: str) -> None:
+        batch = []
+        for k in list(queue)[:n]:
+            title, app = queue.pop(k)
+            batch.append((k, title, app))
+        setattr(self, flag, True)
+
+        def done(res: dict) -> None:
+            setattr(self, flag, False)
+            later = []
+            for k, info in res.items():
+                if info.get("pending"):
+                    later.append(next(b for b in batch if b[0] == k))
+                    continue
+                self.controller[k] = info
+                if info.get("app") and k not in self._title_apps:
+                    self._title_apps[k] = info["app"]       # its artwork too
+            if searches:                                    # not searched yet (Steam asked to slow down): retry
+                self._ctl_search = OrderedDict([(k, (t, a)) for k, t, a in later] + list(self._ctl_search.items()))
+            else:                                           # needs Steam's search: the slow lane
+                for k, t, a in later:
+                    self._ctl_search.setdefault(k, (t, a))
+            self.load_art([i["app"] for i in res.values() if i.get("app")])
+            self.ctl_version += 1
+            store = self.pages.get(T_STORE)
+            if store is not None and self.current_page() is store:
+                store.items_changed()                       # repaints only when the screen changed
+            if searches and len(later) == len(batch):
+                setattr(self, flag, True)                   # no progress: wait a little
+                QTimer.singleShot(5000, self, lambda: (setattr(self, flag, False), self._ctl_next()))
+            else:
+                self._ctl_next()
+
+        def failed(_e) -> None:
+            for k, title, app in batch:
+                queue.setdefault(k, (title, app))
+            QTimer.singleShot(5000, self, lambda: (setattr(self, flag, False), self._ctl_next()))
+        self.bridge.call(self.bridge.core.controller_support(batch, searches), done, failed, owner=self)
+
+    def checking_controllers(self) -> bool:
+        return self._ctl_busy or self._ctl_searching or bool(self._ctl_queue) or bool(self._ctl_search)
+
     def group_capsule(self, group) -> str | None:
         return self._capsule_for(self.group_app_id(group), group.key)
 
@@ -866,8 +850,12 @@ class CouchWindow(QWidget):
     def _come_back(self) -> None:
         if self._exiting:
             return
-        if self.isMinimized() or not self.isFullScreen():
-            self.showFullScreen()
+        _screen, _geo, mode = self.display_target()
+        if mode == "fullscreen":
+            if self.isMinimized() or not self.isFullScreen():
+                self.showFullScreen()
+        elif self.isMinimized() or self.isFullScreen():
+            self.place_window(self, self.wc)            # the borderless / custom window chosen in Settings
         self.raise_()
         self.activateWindow()
         handle = self.windowHandle()
@@ -880,9 +868,31 @@ class CouchWindow(QWidget):
     def _poll_downloads(self) -> None:
         if not self.isVisible() or self.isMinimized():
             return
+        self._poll_browser()
         self.bridge.call(self.bridge.core.summary(), self._summary, owner=self)
         if self.tab == T_DOWNLOADS:
             self.bridge.call(self.bridge.core.downloads_snapshot(), self._downloads, owner=self)
+
+    def _browser_manager(self):
+        from ezgd.ui.dialogs import browser
+        return browser.manager(self.actions) if browser.AVAILABLE else None
+
+    def _poll_browser(self) -> None:
+        """Downloads of the in-app browser (most file hosts) live in the window, not in the core: without these the
+        Downloads tab stayed empty while the desktop window listed them."""
+        try:
+            m = self._browser_manager()
+            snaps = m.snapshots() if m is not None else []
+        except RuntimeError:
+            snaps = []
+        order = {"downloading": 0, "paused": 1, "failed": 2, "completed": 3, "cancelled": 4}
+        snaps = [d for d in snaps if d.get("state") != "cancelled"]
+        snaps.sort(key=lambda d: (order.get(d.get("state"), 9), -int(d.get("id") or 0)))
+        if snaps != self.browser_downloads:
+            self.browser_downloads = snaps
+            if self.tab == T_DOWNLOADS and not self.stack:
+                self.index[T_DOWNLOADS] = max(0, min(self.index[T_DOWNLOADS], len(self._download_rows()) - 1))
+                self.update()
 
     def _summary(self, s: dict) -> None:
         self.summary = s
@@ -899,11 +909,14 @@ class CouchWindow(QWidget):
 
     def _download_rows(self) -> list[tuple[str, object]]:
         installing = [e for e in self.entries if e.id in self.extraction]
-        return [("install", e) for e in installing] + [("dl", d) for d in self.downloads]
+        live = [("browser", d) for d in self.browser_downloads if d.get("state") in ("downloading", "paused")]
+        done = [("browser", d) for d in self.browser_downloads if d.get("state") not in ("downloading", "paused")]
+        return [("install", e) for e in installing] + live + [("dl", d) for d in self.downloads] + done
 
     # ============================================================== showing
     def open(self, screen=None) -> None:
         self._target_screen = screen or QApplication.primaryScreen()
+        self._move_tries.clear()
         self.place_window(self, self.wc)
         screen = self.screen() or self._target_screen
         self.raise_()
@@ -917,14 +930,38 @@ class CouchWindow(QWidget):
         self._set_pace(screen)
         QTimer.singleShot(250, self, self._fit_screen)    # the window manager has placed it: check it fills it
         QTimer.singleShot(300, self, lambda: (self.wc.keep_above(True), self.wc.activate()))
+        first = not self._opened
+        self._opened = True
+        st = self.actions.settings
+        if first and st.get("couch_intro", True):
+            intro = CouchIntro(self, sound=bool(st.get("couch_intro_sound", True)))
+            if intro.start():
+                self.intro = intro
+                intro.finished.connect(self._intro_over)
+                return
+        if first:
+            self._welcome()
+
+    def _intro_over(self) -> None:
+        self.intro = None
+        if self._opened and not self._exiting:
+            self._welcome()
+
+    def _welcome(self) -> None:
         if not self.entries:
             self.toasts.show("Your library is empty", "Find a game in the Store tab — it appears here once it is "
                                                       "downloaded.")
-        self._opened = True
         n = self.pads.names()
         self.toasts.show("Couch mode", (f"{FAMILY_NAMES.get(self.pad_family, 'Controller')} ready." if n else
                                         "Connect a controller, or use the arrow keys or the mouse.")
                          + " The ✕ in the top-right corner leaves couch mode.")
+
+    def _skip_intro(self) -> bool:
+        """Input while the intro plays only skips it."""
+        if self.intro is not None and self.intro.active:
+            self.intro.skip()
+            return True
+        return False
 
     # ----------------------------------------------------------- the screen
     def _screen_changed(self, screen) -> None:
@@ -933,6 +970,9 @@ class CouchWindow(QWidget):
             screen.geometryChanged.connect(lambda _g: self._fit_screen())
             self._set_pace(screen)
         self._fit_screen()
+
+    def real_scale(self, screen) -> float:
+        return real_scale(screen, self)
 
     def display_target(self):
         """(screen, rectangle, mode) from the display settings: which screen, full screen / borderless / a custom
@@ -944,25 +984,42 @@ class CouchWindow(QWidget):
             or self.screen() or QApplication.primaryScreen()
         mode = st.get("couch_window") or "fullscreen"
         geo = QRect(screen.geometry())
-        res = str(st.get("couch_resolution") or "")
-        if mode == "custom" and "x" in res:
-            try:
-                pw, ph = (int(v) for v in res.lower().split("x", 1))
-                dpr = max(1.0, float(screen.devicePixelRatio()))
-                geo = QRect(geo.x(), geo.y(), max(640, round(pw / dpr)), max(400, round(ph / dpr)))
-            except ValueError:
-                pass
+        px = self.custom_pixels() if mode == "custom" else None
+        if px is not None:
+            k = self.real_scale(screen)
+            geo = QRect(geo.x(), geo.y(), min(geo.width(), max(640, round(px[0] / k))),
+                        min(geo.height(), max(400, round(px[1] / k))))
         return screen, geo, mode
 
+    def custom_pixels(self) -> tuple[int, int] | None:
+        res = str(self.actions.settings.get("couch_resolution") or "")
+        try:
+            pw, ph = (int(v) for v in res.lower().split("x", 1))
+        except ValueError:
+            return None
+        return (pw, ph) if pw > 0 and ph > 0 else None
+
     def place_window(self, win, wc=None) -> None:
-        """Show ``win`` (couch mode or its browser) the way the display settings say."""
+        """Show ``win`` (couch mode or its browser) the way the display settings say.
+
+        Full screen is asked of the window manager and its size is left to it: it knows the monitor's real size.
+        (Couch mode used to set the size Qt reports for the screen as well — with fractional scaling that number
+        can be wrong, so a correct full screen shrank a moment after opening.)"""
         screen, geo, mode = self.display_target()
+        wayland = QApplication.platformName().startswith("wayland")
+        kwin = wc is not None and wc.kwin
+        if mode == "borderless" and wayland and not kwin:
+            mode = "fullscreen"         # no way to place a window here: Wayland's full screen *is* borderless
         frameless = bool(win.windowFlags() & Qt.FramelessWindowHint)
         if mode == "fullscreen":
             if frameless:
                 win.setWindowFlag(Qt.FramelessWindowHint, False)
-            win.setScreen(screen)
-            win.setGeometry(geo)                      # X11 / Windows: on that monitor (Wayland places it itself)
+            if win.screen() is not screen:
+                if win.isFullScreen():
+                    win.showNormal()
+                win.setScreen(screen)
+                if not wayland:
+                    win.move(geo.topLeft())          # X11 / Windows: the monitor it goes full screen on
             win.showFullScreen()
         else:
             if win.isFullScreen():
@@ -972,44 +1029,50 @@ class CouchWindow(QWidget):
             win.setScreen(screen)
             win.setGeometry(geo)
             win.show()
-            if wc is not None:
-                wc.place(geo.x(), geo.y(), geo.width(), geo.height())
-        log.info("couch mode display: %s (%dx%d, scale %.2f, %.0f Hz) on %s, %d screen(s); %s %dx%d", screen.name(),
-                 screen.geometry().width(), screen.geometry().height(), screen.devicePixelRatio(),
-                 screen.refreshRate(), QApplication.platformName(), len(QApplication.screens()), mode, geo.width(),
-                 geo.height())
+            if kwin:                                  # KWin measures the monitor itself (the true size and scale)
+                px = self.custom_pixels() if mode == "custom" else None
+                if px is not None:
+                    wc.place_pixels(px[0], px[1], screen.name())
+                else:
+                    wc.fill_screen(screen.name())
+        log.info("couch mode display: %s (%dx%d, scale %.2f, window scale %.2f, %.0f Hz) on %s, %d screen(s); %s "
+                 "%dx%d", screen.name(), screen.geometry().width(), screen.geometry().height(),
+                 screen.devicePixelRatio(), self.real_scale(screen), screen.refreshRate(),
+                 QApplication.platformName(), len(QApplication.screens()), mode, geo.width(), geo.height())
 
     def _fit_screen(self) -> None:
-        """Cover what the display settings ask for — the whole screen by default, whatever its size, shape or
-        scaling (a window manager may place a full-screen window short of the edges)."""
+        """Check couch mode is shown the way the display settings ask: full screen (the window manager decides the
+        size — it is never overruled), on the screen chosen in Settings, or the borderless / custom window."""
         if self._exiting or not self.isVisible() or self.isMinimized():
             return
         target, want, mode = self.display_target()
         on = self.screen()
-        if mode == "fullscreen" and on is not None:
-            # several monitors: the compositor decides where a full-screen window goes — fill *that* monitor
-            # (forcing another monitor's size onto it left part of a bigger screen uncovered); move only when a
-            # screen was chosen in Settings
-            chosen = bool(self.actions.settings.get("couch_screen"))
-            if not (chosen and target is not None and target is not on):
-                want = on.geometry()
-        if self.geometry() != want or (mode == "fullscreen") != self.isFullScreen():
-            log.info("couch mode: the window was %dx%d on %s, should be %dx%d (%s); fixing it", self.width(),
-                     self.height(), on.name() if on is not None else "?", want.width(), want.height(), mode)
-            if mode == "fullscreen" and want == (on.geometry() if on is not None else None):
-                self.setGeometry(want)
-                self.showFullScreen()
-            else:
+        log.info("couch mode: window %dx%d (scale %.2f, %s) on %s (%dx%d)", self.width(), self.height(),
+                 self.devicePixelRatioF(), "full screen" if self.isFullScreen() else "windowed",
+                 on.name() if on is not None else "?", on.geometry().width() if on else 0,
+                 on.geometry().height() if on else 0)
+        chosen = bool(self.actions.settings.get("couch_screen"))
+        moved = chosen and target is not None and on is not None and target is not on
+        if moved:                   # the compositor may refuse that screen: ask twice, then leave it where it is
+            tries = self._move_tries.get(target.name(), 0)
+            self._move_tries[target.name()] = tries + 1
+            moved = tries < 2
+        if mode == "fullscreen":
+            if moved or not self.isFullScreen():
+                log.info("couch mode: %s; asking for full screen again", "on the wrong screen" if moved else
+                         "not full screen")
                 self.place_window(self, self.wc)
-        self.images.clear()
+        elif self.isFullScreen() or moved:
+            self.place_window(self, self.wc)
         self._dirty = True
-        super().update()
+        self._request()
 
     def apply_display(self, revert: dict | None = None) -> None:
         """Display settings changed: show couch mode that way now. With ``revert`` (the previous values) ask
         "Keep these display settings?" and go back by itself after 15 seconds — a setting that does not suit the
         screen can never leave anyone stuck."""
         self.reduce_motion = bool(self.actions.settings.get("reduce_motion"))
+        self._move_tries.clear()
         self.place_window(self, self.wc)
         self._set_pace(self.screen())
         QTimer.singleShot(400, self, self._fit_screen)
@@ -1065,23 +1128,91 @@ class CouchWindow(QWidget):
 
     def update(self, *args) -> None:                    # noqa: D401 — every repaint goes through the frame pump
         if args:
-            super().update(*args)
+            self._request(*args)
             return
         self._dirty = True
         if not self._pump.isActive():
-            super().update()
+            self._request()
 
-    def _pump_tick(self) -> None:
-        if not self.isVisible() or self.isMinimized() or not self.isActiveWindow():
-            if self._dirty and self.isVisible() and not self.isMinimized():
-                self._dirty = False
-                super().update()
+    def update_area(self, r: QRectF, ms: int = 0) -> None:
+        """Repaint only this part of the screen (a tile's picture fading in, the focus growing, loading dots) —
+        a whole 4K frame for a small change made moving around stutter. ``ms``: a little later."""
+        if ms:
+            later = self._later.setdefault(ms, [])
+            later.append(QRectF(r))
+            if len(later) == 1:
+                QTimer.singleShot(ms, self, lambda ms=ms: [self.update_area(x) for x in self._later.pop(ms, [])])
             return
+        self._areas.append(QRectF(r))
+        if not self._pump.isActive():
+            self._request(r.toAlignedRect().adjusted(-2, -2, 2, 2))
+
+    def _flush(self) -> None:
+        if (self._dirty or self._areas) and not self._meter.get("asked"):
+            self._meter["asked"] = time.perf_counter()      # (the meter: how long until it is on screen)
         if self._dirty:
             self._dirty = False
-            super().update()
+            self._areas.clear()
+            self._request()
+        elif self._areas:
+            region = QRegion()
+            for r in self._areas:
+                region += r.toAlignedRect().adjusted(-2, -2, 2, 2)
+            self._areas.clear()
+            self._request(region)
         else:
-            super().update(0, 0, 1, 1)                  # nothing moved: a one-pixel frame keeps the rate steady
+            return False
+        return True
+
+    # ------------------------------------------------------- frame meter (in the log, every 10 s)
+    def _meter_frame(self, ms: float, partial: bool) -> None:
+        m = self._meter
+        m["paints"].append(ms)
+        m["partial"] += partial
+        if m.get("asked"):
+            m["delays"].append((time.perf_counter() - m["asked"]) * 1000 - ms)
+            m["asked"] = 0.0
+
+    def _meter_tick(self) -> None:
+        """How smooth couch mode really is on this screen: paint times and stalls of the event loop."""
+        now = time.perf_counter()
+        m = self._meter
+        if m["last_tick"]:
+            gap = (now - m["last_tick"]) * 1000
+            if gap > 50:
+                m["stalls"].append(gap)
+        m["last_tick"] = now
+        if now - m["since"] < 10 or not m["paints"]:
+            if now - m["since"] >= 10:
+                m["since"] = now
+            return
+        ps = sorted(m["paints"])
+        pick = lambda q: ps[min(len(ps) - 1, int(q * len(ps)))]      # noqa: E731
+        try:
+            import resource
+            rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+        except Exception:
+            rss = 0
+        ds = sorted(m["delays"]) or [0.0]
+        dpick = lambda q: ds[min(len(ds) - 1, int(q * len(ds)))]      # noqa: E731
+        log.info("couch frames (10 s, %s, %s): %d painted (%d partial), paint p50 %.1f / p90 %.1f / max %.1f ms; "
+                 "wait before painting p50 %.1f / p90 %.1f ms; stalls over 50 ms: %d (worst %.0f ms); window %dx%d at "
+                 "%.2f; memory peak %d MB",
+                 type(self.current_page()).__name__ if self.current_page() else TABS[self.tab],
+                 "GPU" if getattr(self, "gpu", False) else "CPU", len(ps), m["partial"], pick(0.5), pick(0.9), ps[-1],
+                 dpick(0.5), dpick(0.9), len(m["stalls"]), max(m["stalls"] or [0]), self.width(), self.height(),
+                 self.devicePixelRatioF(), rss)
+        self._meter = {"paints": [], "partial": 0, "stalls": [], "delays": [], "asked": 0.0, "last_tick": now,
+                       "since": now}
+
+    def _pump_tick(self) -> None:
+        self._meter_tick()
+        if not self.isVisible() or self.isMinimized() or not self.isActiveWindow():
+            if self.isVisible() and not self.isMinimized():
+                self._flush()
+            return
+        if not self._flush():
+            self._request(QRect(0, 0, 1, 1))            # nothing moved: a one-pixel frame keeps the rate steady
 
     def _pads_changed(self, names: list) -> None:
         new = [n for n in names if n not in self._known_pads]
@@ -1173,12 +1304,18 @@ class CouchWindow(QWidget):
         super().resizeEvent(e)
         self.images.clear()
         self._tag_cache.clear()
+        self._layers.clear()
+        self._layer_bytes = 0
+        self._bands.clear()
         self._shown.clear()
         self._fonts.clear()
         self._tab_fit.clear()
 
     def keyPressEvent(self, e) -> None:                       # noqa: N802 (Qt API)
         k = e.key()
+        if not e.isAutoRepeat() and k not in (Qt.Key_Alt, Qt.Key_Meta, Qt.Key_Super_L, Qt.Key_Super_R) \
+                and self._skip_intro():
+            return
         if self.keyboard is not None:                         # typing into the on-screen keyboard
             nav = {Qt.Key_Up: "up", Qt.Key_Down: "down", Qt.Key_Left: "left", Qt.Key_Right: "right"}.get(k)
             try:
@@ -1221,6 +1358,8 @@ class CouchWindow(QWidget):
         """One input, whatever it came from: up/down/left/right, a (confirm), b (back), x (details), lb/rb (tabs),
         start (go to ✕), select."""
         gcguard.defer()                        # no slow garbage collection in the middle of moving around
+        if self._skip_intro():
+            return
         try:
             self._command(name)
         except Exception:
@@ -1391,6 +1530,7 @@ class CouchWindow(QWidget):
     def pop_page(self) -> None:
         if self.stack:
             self.stack.pop()
+            self.drop_layers("gameinfo")                # a game page's text column is big (12 MB at 4K)
         self.zone = "main"
         self.refresh_bg()
         self.update()
@@ -1429,6 +1569,8 @@ class CouchWindow(QWidget):
         self.update()
 
     def mousePressEvent(self, e) -> None:                     # noqa: N802
+        if self._skip_intro():
+            return
         if e.button() == Qt.BackButton:
             self.command("b")
             return
@@ -1519,6 +1661,31 @@ class CouchWindow(QWidget):
                                list(lines or []), cancel=cancel or self.close_overlay, tag=tag)
         self.update()
 
+    def fix_progress(self, payload: dict) -> None:
+        """“Fix my game” reports a step: the progress bar and the line above it follow."""
+        o = self.overlay
+        if o is None or o.tag != f"fixing:{payload.get('id')}":
+            return
+        if payload.get("progress") is not None:
+            o.progress = max(o.progress or 0.0, float(payload["progress"]))
+        detail = str(payload.get("detail") or "")
+        o.text = f"{payload.get('step', '')}" + (f" — {detail}" if detail else "")
+        if len(o.text) > 260:
+            o.text = o.text[:257] + "…"
+        self.update()
+
+    def show_crash(self, report) -> None:
+        """An error report inside couch mode (with its code to copy) — a desktop window would be hidden under it."""
+        def copy(what: str, text: str) -> None:
+            QApplication.clipboard().setText(text)
+            self.toasts.show("Copied", f"The {what} is on the clipboard.", "success")
+        where = f"Saved as {report.path.name} in the app's log folder." if getattr(report, "path", None) else ""
+        self.show_overlay("Something went wrong", f"{report.summary}\n\nError code: {report.code}. {where} Couch "
+                          "mode keeps working.",
+                          [("Copy the error code", lambda: copy("error code", report.code), "primary"),
+                           ("Copy the full report", lambda: copy("full report", report.text), "ghost"),
+                           ("Close", self.close_overlay, "ghost")], tag="crash")
+
     def busy(self, title: str, text: str = "") -> None:
         self.overlay = Overlay(title, text, busy=True, tag="busy")
         self.update()
@@ -1538,6 +1705,30 @@ class CouchWindow(QWidget):
     def close_overlay(self) -> None:
         self._close_overlay()
 
+    def unload_except(self, groups) -> None:
+        """Keep only the pictures of these game groups (plus the library's): the Store's far-away pages unload."""
+        urls: set[str] = set()
+        for g in list(groups) + list(self.entries):
+            for u in ((self.group_capsule(g), g.primary.cover_url) if hasattr(g, "primary") else
+                      (self.capsule_url(g), g.cover_url, self.hero_url(g))):
+                if u and not u.startswith("wait:"):
+                    urls.add(u)
+        for layer in (self._bg_cur, self._bg_prev, self._bg_want):
+            if layer and layer[0]:
+                urls.add(layer[0])
+        self.images.keep_only(urls)
+        self._shown = {k: v for k, v in self._shown.items() if k[1] in urls}
+        self._bands.clear()
+        self._waiting = {u: r for u, r in self._waiting.items() if u in urls}
+
+    def art_arrived(self, url: str | None) -> None:
+        """A picture (or the tile made from it) is ready: repaint just the tile waiting for it."""
+        r = self._waiting.pop(url, None) if url else None
+        if r is not None:
+            self.update_area(r)
+        else:
+            self.update()
+
     def refresh_bg(self) -> None:
         self._update_bg()
         self.update()
@@ -1550,6 +1741,57 @@ class CouchWindow(QWidget):
                 self._frame_pending = False
                 self.update()
             QTimer.singleShot(ms, self, go)              # tied to this window: never runs after it closed
+
+    LAYERS = 260                                         # finished bars, chip strips, titles, glows kept
+    LAYER_BYTES = 160 << 20                              # … and at most this much of them (a 4K top bar is 3 MB)
+
+    def _layer(self, key: tuple, w: float, h: float, draw: Callable[[QPainter], None]) -> tuple[QImage, list]:
+        """Something that rarely changes (a bar, the filter chips, a tile's title) painted once into a transparent
+        image at the screen's real pixels — frames then only copy it. At 4K a frame of text, rounded shapes and
+        glows took longer than the screen's refresh: the Store stuttered. ``draw(p)`` paints at (0, 0); the hit
+        areas it adds are kept with the image."""
+        dpr = self.images.dpr()
+        full = (key, max(1, round(w * dpr)), max(1, round(h * dpr)), dpr)
+        done = self._layers.get(full)
+        if done is not None:
+            self._layers.move_to_end(full)
+            return done
+        img = QImage(full[1], full[2], QImage.Format_ARGB32_Premultiplied)
+        img.setDevicePixelRatio(dpr)
+        img.fill(Qt.transparent)
+        saved, self._hit = self._hit, []
+        p = QPainter(img)
+        try:
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            p.setRenderHint(QPainter.TextAntialiasing)
+            draw(p)
+            hits = self._hit
+        finally:
+            p.end()
+            self._hit = saved
+        self._layers[full] = (img, hits)
+        self._layer_bytes += img.sizeInBytes()
+        while len(self._layers) > 1 and (len(self._layers) > self.LAYERS or self._layer_bytes > self.LAYER_BYTES):
+            _k, (old, _h) = self._layers.popitem(last=False)
+            self._layer_bytes -= old.sizeInBytes()
+        return img, hits
+
+    def drop_layers(self, kind: str) -> None:
+        for full in [k for k in self._layers if k[0][0] == kind]:
+            self._layer_bytes -= self._layers.pop(full)[0].sizeInBytes()
+
+    def blit(self, p: QPainter, x: float, y: float, key: tuple, w: float, h: float,
+             draw: Callable[[QPainter], None], clip: QRectF | None = None) -> None:
+        """Draw a cached layer (see ``_layer``) at (x, y) on whole device pixels, with its hit areas."""
+        img, hits = self._layer(key, w, h, draw)
+        dpr = img.devicePixelRatio()
+        x, y = round(x * dpr) / dpr, round(y * dpr) / dpr
+        p.drawImage(QPointF(x, y), img)
+        for r, kind, idx in hits:
+            r = r.translated(x, y)
+            if clip is None or clip.intersects(r):
+                self._hit.append((r, kind, idx))
 
     # ============================================================== actions
     def _hero_buttons(self) -> list[tuple[str, Callable[[], None], str]]:
@@ -1928,9 +2170,9 @@ class CouchWindow(QWidget):
             return
 
         def go() -> None:
-            self.busy(f"Checking {e.title}…", "Looking at the files, the setup and the logs; when the evidence is "
-                                              "weak the game is started once for a test. This can take a few "
-                                              "minutes.")
+            self.overlay = Overlay(f"Fixing {e.title}…", "Looking at the files, the setup and the logs.", busy=True,
+                                   tag=f"fixing:{e.id}", progress=0.0)
+            self.update()
             self.bridge.call(self.bridge.core.fix_my_game(e.id, "", True), lambda v: self._fixed(e, v),
                              lambda err: self.message("Could not check the game", str(err)), owner=self)
         self.show_overlay(f"Fix {e.title}?", "The app checks the game and repairs what it is sure about. It may start "
@@ -1996,6 +2238,9 @@ class CouchWindow(QWidget):
 
     # --------------------------------------------------------- downloads
     def _download_menu(self, kind: str, d) -> None:
+        if kind == "browser":
+            self._browser_menu(d)
+            return
         if kind == "install":
             info = self.extraction_info.get(d.id) or {}
             rows = []
@@ -2033,6 +2278,43 @@ class CouchWindow(QWidget):
             lines.append(("Error", str(d["error"])[:200]))
         self.menu(title, rows, lines=lines)
 
+    def _browser_menu(self, d: dict) -> None:
+        m = self._browser_manager()
+        did, st = d.get("id"), d.get("state")
+        title = d.get("game") or d.get("name") or "Download"
+
+        def do(fn, text: str) -> None:
+            try:
+                fn(did)
+            except Exception as exc:                       # the transfer may have just ended
+                self.message("Could not do that", str(exc))
+                return
+            self._close_overlay()
+            self.toasts.show(text, title, "success")
+            self._poll_browser()
+        rows = []
+        if m is not None:
+            if st == "downloading":
+                rows.append(("Pause", lambda: do(m.pause, "Paused"), "ghost", ""))
+            if st == "paused":
+                rows.append(("Resume", lambda: do(m.resume, "Resumed"), "primary", ""))
+            if st in ("downloading", "paused"):
+                rows.append(("Cancel download", lambda: self.show_overlay(
+                    f"Cancel {title}?", "The download stops. It has to be started again in the browser.",
+                    [("Cancel download", lambda: do(m.cancel, "Download cancelled"), "danger"),
+                     ("Keep downloading", self._close_overlay, "ghost")], focus=1), "danger", ""))
+            else:
+                rows.append(("Remove from the list", lambda: do(m.remove, "Removed"), "ghost",
+                             "The downloaded file stays"))
+        rows.append(("Close", self._close_overlay, "ghost", ""))
+        lines = [("Status", self._browser_row_text(d)[1]), ("From", f"In-app browser — {d.get('host') or ''}"),
+                 ("File", d.get("name") or "")]
+        if st == "downloading":
+            lines.append(("Note", "Browser downloads stop if the app is closed (torrents and Pixeldrain resume)."))
+        if d.get("error"):
+            lines.append(("Error", str(d["error"])[:200]))
+        self.menu(title, rows, lines=lines)
+
     def _download_command(self, command: str, tid: int, done_text: str) -> None:
         def ok(_r) -> None:
             self._close_overlay()
@@ -2047,7 +2329,19 @@ class CouchWindow(QWidget):
                             "danger"), ("Keep downloading", self._close_overlay, "ghost")], focus=1)
 
     def _pause_or_resume_all(self) -> None:
-        active = any(d.get("status") in ("downloading", "metadata", "queued", "checking") for d in self.downloads)
+        active = any(d.get("status") in ("downloading", "metadata", "queued", "checking") for d in self.downloads) \
+            or any(d.get("state") == "downloading" for d in self.browser_downloads)
+        m = self._browser_manager()
+        if m is not None:
+            for d in self.browser_downloads:
+                try:
+                    if active and d.get("state") == "downloading":
+                        m.pause(d["id"])
+                    elif not active and d.get("state") == "paused":
+                        m.resume(d["id"])
+                except Exception:
+                    log.exception("couch mode: pausing/resuming a browser download failed")
+            self._poll_browser()
         coro = self.bridge.core.pause_all() if active else self.bridge.core.resume_all()
         self.bridge.call(coro, lambda _r: (self.toasts.show("All downloads paused" if active else "Downloads resumed"),
                                            self.bridge.call(self.bridge.core.downloads_snapshot(), self._downloads,
@@ -2206,6 +2500,13 @@ class CouchWindow(QWidget):
             t.stop()
         self.wc.forget()
         self.toasts.stop()
+        intro, self.intro = self.intro, None
+        if intro is not None:
+            try:
+                intro.finished.disconnect(self._intro_over)
+            except (RuntimeError, TypeError):
+                pass
+            intro.stop()                                 # no sound after couch mode is gone
         self.images.shutdown()
         if self._closing_watchdog is not None:
             self._closing_watchdog.stop()
@@ -2230,7 +2531,10 @@ class CouchWindow(QWidget):
 
     def _focus_value(self, v) -> None:
         self._focus_anim = float(v)
-        self.update()
+        if self._focus_rect is not None:                # only the focused tile grows
+            self.update_area(self._focus_rect)
+        else:
+            self.update()
 
     def _bg_value(self, v) -> None:
         self._bg_t = float(v)
@@ -2287,17 +2591,29 @@ class CouchWindow(QWidget):
             self._fonts[key] = f
         return f
 
-    def paintEvent(self, _e) -> None:                         # noqa: N802
-        rect = _e.rect()
+    def _request(self, area=None) -> None:
+        """Ask for a frame of ``area`` (a QRect / QRegion; the whole window when None)."""
+        if area is None:
+            QWidget.update(self)
+        else:
+            QWidget.update(self, area)
+
+    def _render(self, rect: QRect) -> None:
+        """One frame (``rect``: the part that changed; everything else on screen stays as it is)."""
         if rect.width() <= 1 and rect.height() <= 1 and not self._dirty:
             return                                      # the frame pump's keep-alive: the picture stays as it is
+        t0 = time.perf_counter()
         p = QPainter(self)
         try:
             p.setRenderHint(QPainter.Antialiasing)
             p.setRenderHint(QPainter.SmoothPixmapTransform)
             p.setRenderHint(QPainter.TextAntialiasing)
             self._hit = []
+            self._clip = QRectF(rect)
+            self._focus_rect = None
             p.setBrush(Qt.NoBrush)
+            if self.intro is not None and self.intro.active and self.intro.paint(p, self.width(), self.height()):
+                return                                  # the intro covers everything
             self._paint_background(p)
             page = self.current_page()
             if page is not None:
@@ -2321,6 +2637,8 @@ class CouchWindow(QWidget):
                 p.setBrush(Qt.NoBrush)
                 self.keyboard.paint(p)
                 self._hit.append((self._x_rect(), "x", X_INDEX))
+            if self.intro is not None and self.intro.showing:
+                self.intro.paint(p, self.width(), self.height())    # fading out over couch mode
             self._paint_failed = False
         except Exception:
             if not self._paint_failed:
@@ -2339,6 +2657,8 @@ class CouchWindow(QWidget):
                 pass
         finally:
             p.end()
+            self._meter_frame((time.perf_counter() - t0) * 1000, rect.width() * rect.height() < self.width() *
+                              self.height() * 0.9)
 
     def _paint_background(self, p: QPainter) -> None:
         """One or two finished full-screen pixmaps (made by worker threads, see Images.layer) — no gradients or
@@ -2378,7 +2698,25 @@ class CouchWindow(QWidget):
         else:
             p.drawImage(QPointF(0, 0), cur)
 
+    def _top_status(self) -> str:
+        browsing = [d for d in self.browser_downloads if d.get("state") == "downloading"]
+        if not (int(self.summary.get("active") or 0) + int(self.summary.get("extracting") or 0) + len(browsing)):
+            return ""
+        from ezgd.core.fsutil import format_speed
+        speed = (self.summary.get("speed") or 0) + sum(d.get("speed") or 0 for d in browsing)
+        return f"↓ {format_speed(speed)}" if self.summary.get("active") or browsing else "Installing…"
+
     def _paint_top(self, p: QPainter) -> None:
+        s, W = self._s(), self.width()
+        idle = self.overlay is None and self.keyboard is None
+        r = self._x_rect()
+        hot = (self.zone == "top" and self.top_index == X_INDEX and idle) or \
+            r.contains(QPointF(self.mapFromGlobal(self.cursor().pos())))
+        key = ("top", W, round(s, 3), self.tab, self.top_index if self.zone == "top" and idle else -1,
+               time.strftime("%H:%M"), self._top_status(), hot, theme.CURRENT.accent, theme.CURRENT.danger)
+        self.blit(p, 0, 0, key, W, 124 * s, lambda q: self._draw_top(q, hot))
+
+    def _draw_top(self, p: QPainter, hot: bool) -> None:
         s, W = self._s(), self.width()
         h = 96 * s
         bar = QLinearGradient(0, 0, 0, h)
@@ -2397,27 +2735,14 @@ class CouchWindow(QWidget):
         clock = time.strftime("%H:%M")
         p.setFont(self._font(22 * s, 600))
         cw = QFontMetrics(p.font()).horizontalAdvance(clock)
-        active = int(self.summary.get("active") or 0) + int(self.summary.get("extracting") or 0)
-        status = ""
-        if active:
-            from ezgd.core.fsutil import format_speed
-            status = f"↓ {format_speed(self.summary.get('speed') or 0)}" if self.summary.get("active") else \
-                "Installing…"
+        status = self._top_status()
         p.setFont(self._font(17 * s, 600))
         sw = QFontMetrics(p.font()).horizontalAdvance(status) + 28 * s if status else 0
-        # tabs: as big as fits between the logo and the clock
-        avail = right - cw - sw - 30 * s - x
-        fit_key = (round(avail), round(s, 3))
-        fpx = self._tab_fit.get(fit_key)
-        if fpx is None:
-            fpx = 21 * s
-            while fpx > 11:
-                fm = QFontMetrics(self._font(fpx, 700))
-                need = sum(fm.horizontalAdvance(n) for n in TABS) + (len(TABS) - 1) * fpx * 1.9
-                if need <= avail:
-                    break
-                fpx -= 1
-            self._tab_fit[fit_key] = fpx
+        # tabs: as big as fits between the logo and the clock (on a small window the clock makes room)
+        fpx, fits = self._fit_tabs(right - cw - sw - 30 * s - x, s)
+        if not fits:
+            clock, status = "", ""
+            fpx, _ = self._fit_tabs(right - x, s)
         f = self._font(fpx, 700)
         fm = QFontMetrics(f)
         p.setFont(f)
@@ -2442,13 +2767,29 @@ class CouchWindow(QWidget):
         # right side: downloads, clock, the ✕
         p.setFont(self._font(22 * s, 600))
         p.setPen(QColor(255, 255, 255, 220))
-        p.drawText(QRectF(right - cw, 0, cw, h), Qt.AlignVCenter | Qt.AlignRight, clock)
+        if clock:
+            p.drawText(QRectF(right - cw, 0, cw, h), Qt.AlignVCenter | Qt.AlignRight, clock)
         if status:
             p.setFont(self._font(17 * s, 600))
             tw = QFontMetrics(p.font()).horizontalAdvance(status)
             p.setPen(QColor(theme.CURRENT.success))
             p.drawText(QRectF(right - cw - 28 * s - tw, 0, tw, h), Qt.AlignVCenter | Qt.AlignRight, status)
-        self._paint_x(p)
+        self._paint_x(p, hot)
+
+    def _fit_tabs(self, avail: float, s: float) -> tuple[float, bool]:
+        """The biggest tab font that fits ``avail``, and whether even the smallest one fits."""
+        fit_key = (round(avail), round(s, 3))
+        got = self._tab_fit.get(fit_key)
+        if got is None:
+            fpx = 21 * s
+            while True:
+                fm = QFontMetrics(self._font(fpx, 700))
+                need = sum(fm.horizontalAdvance(n) for n in TABS) + (len(TABS) - 1) * fpx * 1.9
+                if need <= avail or fpx <= 11:
+                    break
+                fpx -= 1
+            got = self._tab_fit[fit_key] = (fpx, need <= avail)
+        return got
 
     def _x_rect(self) -> QRectF:
         s = self._s()
@@ -2456,12 +2797,12 @@ class CouchWindow(QWidget):
         c = QPointF(self.width() - 62 * s, 48 * s)
         return QRectF(c.x() - r, c.y() - r, 2 * r, 2 * r)
 
-    def _paint_x(self, p: QPainter) -> None:
+    def _paint_x(self, p: QPainter, hot: bool | None = None) -> None:
         s = self._s()
         r = self._x_rect()
         focused = self.zone == "top" and self.top_index == X_INDEX and self.overlay is None and self.keyboard is None
-        hovered = r.contains(QPointF(self.mapFromGlobal(self.cursor().pos())))
-        hot = focused or hovered
+        if hot is None:
+            hot = focused or r.contains(QPointF(self.mapFromGlobal(self.cursor().pos())))
         if hot:
             for k in range(4, 0, -1):                       # glow
                 g = QColor(theme.CURRENT.danger)
@@ -2570,54 +2911,52 @@ class CouchWindow(QWidget):
         p.fillRect(QRectF(c.x() - arm / 2, c.y() - arm / 2, arm, arm), QColor(255, 255, 255, 120))
         return d
 
+    def _bottom_hints(self) -> list[tuple[str, str]]:
+        """The button prompts along the bottom: (action, meaning)."""
+        if self.keyboard is not None:
+            return [("a", "Type"), ("b", "Delete"), ("start", self.keyboard.done_label)]
+        if self.overlay is not None:
+            return [] if self.overlay.busy else [("a", "Select"), ("b", "Back")]
+        page = self.current_page()
+        e = self._focused_entry()
+        if self.zone == "top":
+            out = [("a", "Leave couch mode" if self.top_index == X_INDEX else "Open"), ("b", "Back")]
+        elif page is not None:
+            out = list(page.hints())
+        elif self.tab in (T_HOME, T_LIBRARY) and e is not None:
+            step = self._next_step(e)
+            act = "Stop" if e.id in self.running else "Play" if self.ready(e) else \
+                (step[0].split("  ", 1)[-1] if step else "Why not?")
+            out = [("a", act if self.zone == "main" else "Select"), ("x", "Manage"), ("b", "Exit…")]
+        elif self.tab == T_DOWNLOADS:
+            out = ([("a", "Options")] if self._download_rows() else []) + [("x", "Pause / resume all"),
+                                                                          ("b", "Exit…")]
+        else:
+            out = ([("a", "Go to the Store")] if self.tab in (T_HOME, T_LIBRARY) else []) + [("b", "Exit…")]
+        return out + [("lb", ""), ("rb", "Tabs")]
+
     def _paint_bottom(self, p: QPainter) -> None:
         s, W, H = self._s(), self.width(), self.height()
         h = 76 * s
-        top = H - h
-        p.fillRect(QRectF(0, top, W, h), QColor(0, 0, 0, 150))
-        p.fillRect(QRectF(0, top, W, 1 * s), QColor(255, 255, 255, 30))
-        y = top + h / 2
-        x = 56 * s
-        if self.keyboard is not None:
-            x = self._glyph(p, x, y, "a", "Type")
-            x = self._glyph(p, x, y, "b", "Delete")
-            x = self._glyph(p, x, y, "start", self.keyboard.done_label)
-        elif self.overlay is not None:
-            if not self.overlay.busy:
-                x = self._glyph(p, x, y, "a", "Select")
-                x = self._glyph(p, x, y, "b", "Back")
-        else:
-            page = self.current_page()
-            e = self._focused_entry()
-            if self.zone == "top":
-                x = self._glyph(p, x, y, "a", "Leave couch mode" if self.top_index == X_INDEX else "Open")
-                x = self._glyph(p, x, y, "b", "Back")
-            elif page is not None:
-                for action, text in page.hints():
-                    x = self._glyph(p, x, y, action, text)
-            elif self.tab in (T_HOME, T_LIBRARY) and e is not None:
-                step = self._next_step(e)
-                act = "Stop" if e.id in self.running else "Play" if self.ready(e) else \
-                    (step[0].split("  ", 1)[-1] if step else "Why not?")
-                x = self._glyph(p, x, y, "a", act if self.zone == "main" else "Select")
-                x = self._glyph(p, x, y, "x", "Manage")
-                x = self._glyph(p, x, y, "b", "Exit…")
-            elif self.tab == T_DOWNLOADS:
-                if self._download_rows():
-                    x = self._glyph(p, x, y, "a", "Options")
-                x = self._glyph(p, x, y, "x", "Pause / resume all")
-                x = self._glyph(p, x, y, "b", "Exit…")
-            else:
-                if self.tab in (T_HOME, T_LIBRARY):
-                    x = self._glyph(p, x, y, "a", "Go to the Store")
-                x = self._glyph(p, x, y, "b", "Exit…")
-            x = self._glyph(p, x, y, "lb")
-            x = self._glyph(p, x, y, "rb", "Tabs")
-        # right: the controller in use
+        hints = self._bottom_hints()
         fam = self.pad_family
         names = self.pads.names()
         txt = (FAMILY_NAMES.get(fam, "Controller") + (f"  ·  {len(names)} connected" if len(names) > 1 else "")) \
             if names else "Keyboard: arrows · Enter · Esc · Tab"
+        key = ("bottom", W, round(s, 3), tuple(hints), fam, txt)
+        self.blit(p, 0, H - h, key, W, h, lambda q: self._draw_bottom(q, hints, txt))
+
+    def _draw_bottom(self, p: QPainter, hints: list[tuple[str, str]], txt: str) -> None:
+        s, W = self._s(), self.width()
+        h = 76 * s
+        top = 0.0
+        p.fillRect(QRectF(0, top, W, h), QColor(0, 0, 0, 150))
+        p.fillRect(QRectF(0, top, W, 1 * s), QColor(255, 255, 255, 30))
+        y = top + h / 2
+        x = 56 * s
+        for action, text in hints:
+            x = self._glyph(p, x, y, action, text)
+        # right: the controller in use
         p.setFont(self._font(16 * s, 600))
         p.setPen(QColor(255, 255, 255, 150))
         room = W - x - 56 * s
@@ -2716,20 +3055,36 @@ class CouchWindow(QWidget):
         s = self._s()
         radius = 12 * s
         w, h = max(1, int(round(r.width()))), max(1, int(round(r.height())))
+        pad = 20 * s
+        area = r.adjusted(-4 * s, -4 * s, 4 * s, 4 * s)          # what this tile covers on screen
+        if focused:
+            c = r.center()
+            area = QRectF(c.x() - w * 1.06 / 2 - pad, c.y() - h * 1.06 / 2 - pad, w * 1.06 + 2 * pad,
+                          h * 1.06 + 2 * pad)
+            self._focus_rect = area
+        elif not self._clip.intersects(area):          # outside the part being repainted: nothing to draw
+            self._hit.append((r, hit[0], hit[1]))
+            return
         if focused:
             grow = 1.0 + 0.06 * self._focus_anim
-            c = r.center()
             r = QRectF(c.x() - r.width() * grow / 2, c.y() - r.height() * grow / 2, r.width() * grow,
                        r.height() * grow)
-            for k in range(5, 0, -1):
-                g = QColor(theme.CURRENT.accent)
-                g.setAlpha(26)
-                gp = QPainterPath()
-                gp.addRoundedRect(r.adjusted(-k * 4 * s, -k * 4 * s, k * 4 * s, k * 4 * s), radius + k * 4 * s,
-                                  radius + k * 4 * s)
-                p.fillPath(gp, g)
-        path = QPainterPath()
-        path.addRoundedRect(r, radius, radius)
+            gw, gh = w * 1.06 + 2 * pad, h * 1.06 + 2 * pad
+
+            def glow(q: QPainter) -> None:
+                inner = QRectF(pad, pad, w * 1.06, h * 1.06)
+                for k in range(5, 0, -1):
+                    g = QColor(theme.CURRENT.accent)
+                    g.setAlpha(26)
+                    gp = QPainterPath()
+                    gp.addRoundedRect(inner.adjusted(-k * 4 * s, -k * 4 * s, k * 4 * s, k * 4 * s),
+                                      radius + k * 4 * s, radius + k * 4 * s)
+                    q.fillPath(gp, g)
+            img, _h = self._layer(("glow", w, h, round(s, 3), theme.CURRENT.accent), gw, gh, glow)
+            p.drawImage(r.adjusted(-pad, -pad, pad, pad), img, QRectF(img.rect()))
+        path = QPainterPath()                           # only the focused tile draws shapes itself
+        if focused:
+            path.addRoundedRect(r, radius, radius)
         pm, needs_title, key = self.images.tile(capsule, cover, w, h, radius, dim)
         ident = (title, cover, w, h, dim)
         prev = self._shown.get(ident)                   # what this tile showed last (never back to blank)
@@ -2742,15 +3097,32 @@ class CouchWindow(QWidget):
         if pm is None or fade < 1.0:
             if under is not None:                       # cross-fade from the picture it had
                 p.drawImage(r, under, QRectF(under.rect()))
-            else:                                       # a quiet placeholder (no bright flash)
+            elif focused:                               # a quiet placeholder (no bright flash)
                 p.fillPath(path, QColor(255, 255, 255, 16))
                 if dim:
                     p.fillPath(path, QColor(0, 0, 0, 90))
+            else:                                       # the same, with its border, drawn once and copied
+
+                def blank(q: QPainter) -> None:
+                    bp = QPainterPath()
+                    bp.addRoundedRect(QRectF(0.5 * s, 0.5 * s, w - s, h - s), radius, radius)
+                    q.fillPath(bp, QColor(255, 255, 255, 16))
+                    if dim:
+                        q.fillPath(bp, QColor(0, 0, 0, 90))
+                    q.setPen(QPen(QColor(255, 255, 255, 40), 1 * s))
+                    q.drawPath(bp)
+                self.blit(p, r.left(), r.top(), ("blank", w, h, dim, round(s, 3)), w, h, blank)
             if fade < 1.0:
-                self._schedule_frame()
+                self.update_area(area)                  # only this tile, until its picture has faded in
+        if pm is None:                                  # its picture is on its way: repaint the tile when it is here
+            for url in (capsule, cover):
+                if url and not url.startswith("wait:"):
+                    self._waiting[url] = area
+            if capsule and self.images.meta.get(capsule, False) is False:
+                self.update_area(area, 300)             # waits for Steam's cover only so long (CAPSULE_WAIT)
         if pm is not None and key is not None and fade >= 1.0:
             self._shown[ident] = (pm, needs_title)
-            if len(self._shown) > 400:
+            if len(self._shown) > 160:
                 self._shown.pop(next(iter(self._shown)))
         if pm is not None:
             p.setOpacity(fade)
@@ -2758,34 +3130,77 @@ class CouchWindow(QWidget):
                 p.drawImage(r, pm, QRectF(pm.rect()))
             else:                                       # on whole device pixels: a plain copy, no resampling
                 dpr = pm.devicePixelRatio()
-                p.drawImage(QPointF(round(r.left() * dpr) / dpr, round(r.top() * dpr) / dpr), pm)
+                pos = QPointF(round(r.left() * dpr) / dpr, round(r.top() * dpr) / dpr)
+                if fade < 1.0:
+                    p.drawImage(pos, pm)
+                else:
+                    self._copy_tile(p, pos, pm, radius * dpr)
             p.setOpacity(1.0)
         if needs_title:                                  # above the site tags, at most two lines
             f = self._font(max(12, r.width() * 0.075), 800)
-            fm = QFontMetrics(f)
             lift = self.tag_height(tags) + 8 * s if tags else 0.0
-            th = 2 * fm.lineSpacing()
-            tr = QRectF(r.left() + 10 * s, r.bottom() - 10 * s - lift - th, r.width() - 20 * s, th)
-            p.setPen(QColor("white"))
-            p.setFont(f)
-            p.drawText(tr, Qt.AlignHCenter | Qt.AlignBottom | Qt.TextWordWrap, title)
+            th = 2 * QFontMetrics(f).lineSpacing()
+            tw = r.width() - 20 * s
+
+            def text(q: QPainter, f=f, tw=tw, th=th) -> None:
+                q.setPen(QColor("white"))
+                q.setFont(f)
+                q.drawText(QRectF(0, 0, tw, th), Qt.AlignHCenter | Qt.AlignBottom | Qt.TextWordWrap, title)
+            if focused:                                  # changes size while it grows: drawn directly
+                text_rect = QRectF(r.left() + 10 * s, r.bottom() - 10 * s - lift - th, tw, th)
+                p.save()
+                p.translate(text_rect.topLeft())
+                text(p)
+                p.restore()
+            else:
+                self.blit(p, r.left() + 10 * s, r.bottom() - 10 * s - lift - th, ("title", title, f.pixelSize(),
+                                                                                   round(tw)), tw, th, text)
         if badge:
-            p.setFont(self._font(12 * s, 800))
-            tw = QFontMetrics(p.font()).horizontalAdvance(badge[0]) + 16 * s
-            br = QRectF(r.left() + 8 * s, r.top() + 8 * s, min(tw, r.width() - 16 * s), 24 * s)
-            bp = QPainterPath()
-            bp.addRoundedRect(br, 12 * s, 12 * s)
-            p.fillPath(bp, QColor(badge[1]))
-            p.setPen(QColor("white"))
-            p.drawText(br, Qt.AlignCenter, QFontMetrics(p.font()).elidedText(badge[0], Qt.ElideRight,
-                                                                             int(br.width() - 8 * s)))
+            bf = self._font(12 * s, 800)
+            bw = min(QFontMetrics(bf).horizontalAdvance(badge[0]) + 16 * s, r.width() - 16 * s)
+
+            def pill(q: QPainter) -> None:
+                br = QRectF(0, 0, bw, 24 * s)
+                bp = QPainterPath()
+                bp.addRoundedRect(br, 12 * s, 12 * s)
+                q.fillPath(bp, QColor(badge[1]))
+                q.setPen(QColor("white"))
+                q.setFont(bf)
+                q.drawText(br, Qt.AlignCenter, QFontMetrics(bf).elidedText(badge[0], Qt.ElideRight,
+                                                                           int(br.width() - 8 * s)))
+            self.blit(p, r.left() + 8 * s, r.top() + 8 * s, ("badge", badge, round(bw), round(s, 3)), bw, 24 * s,
+                      pill)
         if tags:
             self._tags(p, r, tags, w)
-        if focused or pm is None:                       # unfocused tiles have their faint border built in
+        if focused:                                     # unfocused tiles have their faint border built in
             p.setBrush(Qt.NoBrush)
             p.setPen(QPen(QColor(255, 255, 255, 255 if focused else 40), (3 if focused else 1) * s))
             p.drawPath(path)
         self._hit.append((r, hit[0], hit[1]))
+
+    def _copy_tile(self, p: QPainter, pos: QPointF, pm: QImage, radius_px: float) -> None:
+        """A finished tile, fast: only the rows with rounded corners need blending — everything between them is
+        opaque and goes out as a plain copy (blending ~30 big tiles per frame was most of a 4K frame)."""
+        W, H = pm.width(), pm.height()
+        rp = math.ceil(radius_px) + 1
+        if H <= 2 * rp + 2:
+            p.drawImage(pos, pm)
+            return
+        ck = (pm.cacheKey(), rp)
+        band = self._bands.get(ck)
+        if band is None:
+            band = pm.copy(0, rp, W, H - 2 * rp).convertToFormat(QImage.Format_RGB32)
+            band.setDevicePixelRatio(pm.devicePixelRatio())
+            self._bands[ck] = band
+            while len(self._bands) > 160:
+                self._bands.popitem(last=False)
+        else:
+            self._bands.move_to_end(ck)
+        dpr = pm.devicePixelRatio()
+        x, y = pos.x(), pos.y()
+        p.drawImage(QRectF(x, y, W / dpr, rp / dpr), pm, QRectF(0, 0, W, rp))
+        p.drawImage(QPointF(x, y + rp / dpr), band)
+        p.drawImage(QRectF(x, y + (H - rp) / dpr, W / dpr, rp / dpr), pm, QRectF(0, H - rp, W, rp))
 
     def _tags(self, p: QPainter, r: QRectF, tags: list[tuple[str, str]], base_w: int) -> None:
         """Small coloured pills along the bottom of a tile (what does not fit becomes "+N"), drawn once into a
@@ -3078,6 +3493,8 @@ class CouchWindow(QWidget):
                 p.drawPath(path)
             if kind == "install":
                 title, status, frac, extra = d.title, "Installing", self.extraction.get(d.id, 0.0), ""
+            elif kind == "browser":
+                title, status, frac, extra = self._browser_row_text(d)
             else:
                 title = d.get("title") or d.get("filename") or "Download"
                 status = str(d.get("status") or "").capitalize()
@@ -3111,11 +3528,34 @@ class CouchWindow(QWidget):
                 fp = QPainterPath()
                 fp.addRoundedRect(QRectF(bar.left(), bar.top(), bar.width() * min(1.0, frac), bar.height()), 4 * s,
                                   4 * s)
-                color = theme.CURRENT.success if (kind == "dl" and d.get("status") == "completed") else \
-                    theme.CURRENT.danger if (kind == "dl" and d.get("status") == "failed") else theme.CURRENT.accent
+                state = d.get("status") if kind == "dl" else d.get("state") if kind == "browser" else ""
+                color = theme.CURRENT.success if state == "completed" else \
+                    theme.CURRENT.danger if state == "failed" else theme.CURRENT.accent
                 p.fillPath(fp, QColor(color))
             self._hit.append((r, "row", k))
         p.restore()
+
+    @staticmethod
+    def _browser_row_text(d: dict) -> tuple[str, str, float, str]:
+        from ezgd.core.fsutil import format_bytes, format_speed
+        title = d.get("game") or d.get("name") or "Download"
+        st = d.get("state") or ""
+        lib = d.get("library") or ""
+        status = {"adding": "Adding to your Library", "added": "In your Library"}.get(lib, st.capitalize())
+        if lib.startswith("failed"):
+            status = "Could not add it to the Library"
+        got, total = d.get("received") or 0, d.get("total") or 0
+        frac = got / total if total else (1.0 if st == "completed" else 0.0)
+        extra = f"{format_bytes(got)} of {format_bytes(total)}" if total else format_bytes(got)
+        if st == "downloading" and d.get("speed"):
+            extra += f"  ·  {format_speed(d['speed'])}"
+            if d.get("eta"):
+                m = int(d["eta"]) // 60
+                extra += f"  ·  {m // 60} h {m % 60} min left" if m >= 60 else f"  ·  {max(1, m)} min left"
+        extra += f"  ·  in-app browser ({d.get('host') or 'file host'})"
+        if st == "failed" and d.get("error"):
+            extra = str(d["error"])
+        return title, status, frac, extra
 
     # ------------------------------------------------------------- overlay
     def _paint_launch(self, p: QPainter, o: Overlay) -> None:
@@ -3211,6 +3651,25 @@ class CouchWindow(QWidget):
             p.setPen(QColor(255, 255, 255, 230))
             p.drawText(QRectF(x + 220 * s, y, inner - 220 * s, hh), Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, v)
             y += hh
+        if o.busy and o.progress is not None:
+            # a progress bar (how far "Fix my game" is), moving smoothly to the latest value
+            o.shown_progress += (o.progress - o.shown_progress) * (1.0 if self.reduce_motion else 0.18)
+            if abs(o.progress - o.shown_progress) > 0.002:
+                self._schedule_frame(30)
+            bar = QRectF(x, r.bottom() - 70 * s, inner, 18 * s)
+            track = QPainterPath()
+            track.addRoundedRect(bar, 9 * s, 9 * s)
+            p.fillPath(track, QColor(255, 255, 255, 40))
+            done = QRectF(bar.left(), bar.top(), max(bar.height(), bar.width() * min(1.0, o.shown_progress)),
+                          bar.height())
+            fill = QPainterPath()
+            fill.addRoundedRect(done, 9 * s, 9 * s)
+            p.fillPath(fill, QColor(theme.CURRENT.accent))
+            p.setFont(self._font(17 * s, 700))
+            p.setPen(QColor(255, 255, 255, 200))
+            p.drawText(QRectF(x, r.bottom() - 46 * s, inner, 30 * s), Qt.AlignRight | Qt.AlignVCenter,
+                       f"{int(round(min(1.0, o.shown_progress) * 100))} %")
+            return
         if o.busy:
             # a simple spinner: three dots that pulse
             t = time.monotonic()
@@ -3298,3 +3757,56 @@ class CouchWindow(QWidget):
             bar = QPainterPath()
             bar.addRoundedRect(QRectF(rect.right() + 14 * s, by, 6 * s, bh), 3 * s, 3 * s)
             p.fillPath(bar, QColor(255, 255, 255, 80))
+
+
+class CouchWindow(_Couch, QWidget):
+    """Couch mode (drawn with QPainter; see make_couch for how its frames reach the screen)."""
+    closed = Signal()
+    gpu = False
+
+    def paintEvent(self, e) -> None:                          # noqa: N802
+        self._render(e.rect())
+
+
+def gpu_available() -> bool:
+    """Can couch mode draw with OpenGL here? (Not on Qt's test platforms, or when no OpenGL context can be made.)"""
+    import os
+    if os.environ.get("EZGD_COUCH_GPU") == "0":
+        return False
+    if QApplication.platformName() in ("offscreen", "minimal") and os.environ.get("EZGD_COUCH_GPU") != "1":
+        return False
+    try:
+        from PySide6.QtGui import QOpenGLContext
+        ctx = QOpenGLContext()
+        return bool(ctx.create())
+    except Exception:
+        return False
+
+
+class _Presenter(QOpenGLWidget):
+    """A 1-pixel OpenGL child: with it, Qt hands the whole window's frames to the screen through the graphics card
+    (only the changed parts are uploaded as a texture) instead of passing a 33 MB picture per 4K frame to the
+    desktop. Couch mode is drawn exactly as before."""
+
+    def paintGL(self) -> None:                                # noqa: N802
+        from PySide6.QtGui import QOpenGLContext
+        ctx = QOpenGLContext.currentContext()
+        if ctx is not None:
+            f = ctx.functions()
+            f.glClearColor(0.0, 0.0, 0.0, 1.0)
+            f.glClear(0x00004000)                             # GL_COLOR_BUFFER_BIT
+
+
+def make_couch(actions, entries: list, running: set[int]):
+    """Couch mode's window, its frames shown through the GPU unless switched off (Settings) or unavailable."""
+    w = CouchWindow(actions, entries, running)
+    if actions.settings.get("couch_gpu", True) and gpu_available():
+        try:
+            w._presenter = _Presenter(w)
+            w._presenter.setGeometry(0, 0, 1, 1)
+            w._presenter.setAttribute(Qt.WA_TransparentForMouseEvents)
+            w.gpu = True
+            log.info("couch mode: frames shown through the GPU (OpenGL)")
+        except Exception:
+            log.exception("couch mode: GPU presentation unavailable; frames go through the CPU")
+    return w

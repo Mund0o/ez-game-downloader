@@ -125,6 +125,29 @@ class AllGamesPage(QWidget):
             self.reload()
             self.bridge.call(self.bridge.core.genres(), self._set_genres, owner=self)
 
+    def view_state(self) -> dict:
+        """Filters and sort to remember for the next start."""
+        return {"sort": self.sort.currentIndex(), "method": self.method.currentIndex(),
+                "install": self.install.currentIndex(), "genre": self.genre.currentText(),
+                "platform": self.platform.currentText(),
+                "off": [sid for sid, b in self.source_buttons.items() if not b.isChecked()]}
+
+    def restore_view(self, st: dict) -> None:
+        for combo, key in ((self.sort, "sort"), (self.method, "method"), (self.install, "install")):
+            i = st.get(key)
+            if isinstance(i, int) and 0 <= i < combo.count():
+                combo.blockSignals(True)
+                combo.setCurrentIndex(i)
+                combo.blockSignals(False)
+        for sid in st.get("off") or []:
+            b = self.source_buttons.get(sid)
+            if b is not None:
+                b.blockSignals(True)
+                b.setChecked(False)
+                b.blockSignals(False)
+        self._wanted_genre = st.get("genre") or ""          # genres and platforms arrive later
+        self._wanted_platform = st.get("platform") or ""
+
     def set_query(self, text: str) -> None:
         self._started = True
         self.search.blockSignals(True)
@@ -291,6 +314,12 @@ class AllGamesPage(QWidget):
         genres = sorted(set(facets["genres"]) | set(self.known_genres))
         self._fill(self.genre, "All genres", genres)
         self._fill(self.platform, "Any platform", facets["platforms"])
+        for combo, attr in ((self.genre, "_wanted_genre"), (self.platform, "_wanted_platform")):
+            want = getattr(self, attr, "")
+            i = combo.findText(want) if want else -1
+            if i > 0:                                        # last session's choice, once it is offered again
+                setattr(self, attr, "")
+                combo.setCurrentIndex(i)
 
     @staticmethod
     def _fill(combo: QComboBox, first: str, values: list[str]) -> None:

@@ -571,21 +571,10 @@ class AppCore:
         if found is None:                              # ProtonDB's index knows ~34 000 titles (offline)
             found = await asyncio.to_thread(appid.from_protondb, self._protondb_index(), keys)
         if found is None and use_network:
-            from urllib.parse import quote
-            for term in appid.search_terms(e.title):
-                url = f"https://store.steampowered.com/api/storesearch/?term={quote(term)}&l=english&cc=US"
-                res = await self.client.fetch(url, max_bytes=512 * 1024, headers={"Accept": "application/json"})
-                if res.status != 200:
-                    continue
-                try:
-                    items = json.loads(res.content).get("items") or []
-                except (ValueError, AttributeError):
-                    items = []
-                exact = [i for i in items if isinstance(i, dict) and i.get("type") == "app" and isinstance(i.get("id"), int)
-                         and appid.key(str(i.get("name", ""))) in keys]
-                if len({i["id"] for i in exact}) == 1:
-                    found = exact[0]["id"]
-                    break
+            try:
+                found = await self._steam_app_by_search(e.title)
+            except RuntimeError as exc:
+                log.info("Steam search for %r failed: %s", e.title, exc)
         _ = dedup_key
         if found:
             self.library.update(entry_id, steam_app_id=found)
@@ -1170,15 +1159,18 @@ class AppCore:
             return None
 
     async def run_trials(self, entry_id: int, findings: list[dict], generated: list[dict] | None = None,
-                         deep: bool = False, repairs: list | None = None, symptom: str = "") -> list[dict]:
+                         deep: bool = False, repairs: list | None = None, symptom: str = "",
+                         protons: bool = True) -> list[dict]:
         """“Try fixes for me”: test candidate setups one after another (each in a throw-away prefix).
         ``deep`` (“Try everything”): many more setups; stops at the first one that keeps the game running."""
         if self.library.is_running(entry_id):
             raise SourceError("Stop the game first.")
-        cands = self.library.trial_candidates(entry_id, findings, generated, deep=deep)
-        self._trial_cancel = threading.Event()
+        cands = self.library.trial_candidates(entry_id, findings, generated, deep=deep, protons=protons)
+        if getattr(self, "_trial_cancel", None) is None or self._trial_cancel.is_set():
+            self._trial_cancel = threading.Event()
         found: list = [] if repairs is None else repairs
-        results = await self._run_candidates(entry_id, cands, stop_on_success=deep, repairs=found, symptom=symptom)
+        # stop at the first setup that works: the rest would only make you wait
+        results = await self._run_candidates(entry_id, cands, stop_on_success=True, repairs=found, symptom=symptom)
         if found and repairs is None:              # the UI offers them (they change the real prefix: not tested)
             self.emit("trial_repairs", {"id": entry_id, "findings": found})
         return results
@@ -1491,14 +1483,24 @@ class AppCore:
         if self.library.is_running(entry_id):
             raise SourceError("Stop the game first.")
 
-        def step(name: str, status: str, detail: str = "") -> None:
-            self.emit("fixmygame", {"id": entry_id, "step": name, "status": status, "detail": detail})
+        progress = [0.0]
+        stage_at = {"Checking the game": 0.02, "Investigating": 0.1, "Repairing": 0.2, "Fixing the cause": 0.3,
+                    "Testing": 0.55, "Thinking again": 0.85}
+
+        def step(name: str, status: str, detail: str = "", at: float | None = None) -> None:
+            if at is not None:
+                progress[0] = max(progress[0], at)
+            elif status == "running":
+                progress[0] = max(progress[0], stage_at.get(name, progress[0]))
+            self.emit("fixmygame", {"id": entry_id, "step": name, "status": status, "detail": detail,
+                                    "progress": round(progress[0], 3)})
         before = {"launch_args": e.launch_args or "", "compat": e.compat_config.to_dict(),
                   "proton_version": e.proton_version or "", "executable": e.executable}
         step("Checking the game", "running", "files, Steam setup, fix archives, logs and your system")
         d = await self.diagnose_game(entry_id, symptom)
         step("Checking the game", "done", d["summary"])
         top = max((f["confidence"] for f in d["findings"] if f.get("fix")), default=0.0)
+        seen_ev = None                                 # the investigation's test run (its evidence is kept)
         if test and top < 0.6 and d.get("suggest_diagnostic_run", True):
             # weak evidence: look first (what "Investigate" did) — one start with Wine's detailed logging
             step("Investigating", "running", "starting the game once with detailed logging (about a minute)")
@@ -1509,6 +1511,7 @@ class AppCore:
             ev = self.library.trial_evidence.get(entry_id, {}).get(1)
             if ev and r["outcome"] != "ran":
                 d = await self.diagnose_game(entry_id, symptom, evidence=ev)
+                seen_ev = ev
             step("Investigating", "done", r["detail"] + (f" — {d['summary']}" if ev and r["outcome"] != "ran" else ""))
         applied: list[str] = []
         step("Repairing", "running")
@@ -1519,11 +1522,38 @@ class AppCore:
         if not test:
             verdict.update(status="changed" if applied else "nothing", kept=None)
             return verdict
-        step("Testing", "running", "starting the game in a throw-away copy of its prefix")
-        d2 = await self.diagnose_game(entry_id, symptom)          # findings after the repairs
+        # the root cause first: act on what the evidence names (the game's own error message, a missing DLL or
+        # runtime), test once, read that test, repeat — a fixed list of setups (every Proton…) only as a last resort
+        d2 = await self.diagnose_game(entry_id, symptom, evidence=seen_ev)    # findings after the repairs
+        rounds, d2, acted = await self._root_cause(entry_id, symptom, d2, applied, step,
+                                                   tested=seen_ev is not None and not applied)
+        verdict["applied"] = applied
+        if rounds and rounds[-1]["outcome"] == "ran":
+            last = rounds[-1]
+            step("Testing", "running", "it ran — checking once more", at=0.9)
+            again = await asyncio.to_thread(self.library.run_trial, entry_id,
+                                            {"label": "Second check", "overrides": {}}, len(rounds) + 1,
+                                            self._trial_cancel)
+            if again["outcome"] == "ran":
+                kept = "; ".join(a.split(" — ")[0] for a in (acted or applied)) or "the repaired setup"
+                verdict.update(status="fixed", kept=kept, trials=rounds + [again])
+                step("Testing", "done", f"✓ the game kept running after: {kept} (checked twice)", at=1.0)
+                return verdict
+            step("Testing", "running", f"✗ the second check failed ({again['detail']})")
+            rounds.append(again)
+            del last
+        if self._trial_cancel.is_set():
+            verdict.update(status="not_fixed", kept=None, trials=rounds, reason="Stopped by you.")
+            step("Testing", "done", "stopped", at=1.0)
+            return verdict
+        # nothing certain left: test setups — other Protons only when the evidence is about Wine/Proton itself
+        protons = not acted or any(f["key"].startswith(("proton-lacks", "unimplemented", "exception", "dump",
+                                                        "graphics", "wine")) for f in d2["findings"][:3])
+        step("Testing", "running", "no single clear cause left — testing setups"
+             + ("" if protons else " (not other Protons: the cause is not Proton)"), at=0.6)
         found_repairs: list = []
-        results = await self.run_trials(entry_id, d2["findings"], d2.get("generated"), repairs=found_repairs,
-                                        symptom=symptom)
+        results = rounds + await self.run_trials(entry_id, d2["findings"], d2.get("generated"), repairs=found_repairs,
+                                                 symptom=symptom, protons=protons)
         if getattr(self, "_trial_cancel", None) is None:
             self._trial_cancel = threading.Event()
         if not any(r["outcome"] == "ran" for r in results) and not self._trial_cancel.is_set():
@@ -1615,6 +1645,69 @@ class AppCore:
                            "findings, or try the game's other release.")
             step("Testing", "done", "✗ no setup kept the game running")
         return verdict
+
+    ROOT_KINDS = ("repair_files", "write_file", "edit", "copy_files", "copy_folder", "apply_archive", "set_executable",
+                  "winetricks", "enable_fix", "launch_args", "set_overrides", "proton", "add_args")
+    ROOT_CONFIDENCE = 0.85               # what the evidence names this clearly is fixed, not tested among others
+    ROOT_ROUNDS = 5
+
+    async def _root_cause(self, entry_id: int, symptom: str, d: dict, applied: list[str], step,
+                          tested: bool = False) -> tuple[list[dict], dict, list[str]]:
+        """Fix the cause the evidence names, test once, read what that test showed, repeat. Returns (the test runs,
+        the last diagnosis, what was changed)."""
+        if getattr(self, "_trial_cancel", None) is None or self._trial_cancel.is_set():
+            self._trial_cancel = threading.Event()
+        results: list[dict] = []
+        acted: list[str] = []
+        done: set = set()
+        for rnd in range(1, self.ROOT_ROUNDS + 1):
+            if self._trial_cancel.is_set():
+                break
+            base = 0.3 + 0.5 * (rnd - 1) / self.ROOT_ROUNDS
+            already = {a.split(" — ")[0] for a in applied}       # (repaired in the step before)
+            causes = [f for f in d["findings"] if f.get("fix") and f["confidence"] >= self.ROOT_CONFIDENCE
+                      and f["fix"]["kind"] in self.ROOT_KINDS and (f["fix"]["kind"], f["fix"]["value"]) not in done
+                      and f["title"] not in already]
+            if not causes and (rnd > 1 or tested):
+                break                                   # nothing certain (and the game was just tested as it is)
+            label = "Current setup"
+            if causes:
+                f = causes[0]
+                fx = f["fix"]
+                done.add((fx["kind"], fx["value"]))
+                step("Fixing the cause", "running", f"{f['title']} → {fx['label']}", at=base)
+                try:
+                    if fx["kind"] == "winetricks":
+                        step("Fixing the cause", "running", f"installing {fx['value']} (a few minutes)", at=base)
+                        code = await asyncio.to_thread(self.library.run_winetricks, entry_id, fx["value"].split(), True)
+                        if code not in (0, None):
+                            raise SourceError(self.library._winetricks_failure(entry_id, fx["value"]))
+                        msg = f"installed {fx['value']}"
+                    else:
+                        msg = await self.apply_fix(entry_id, fx["kind"], fx["value"])
+                        if fx["kind"] == "proton":           # its own prefix, before anything is installed into it
+                            await asyncio.to_thread(self.library.ensure_prefix_for, self.library.get(entry_id))
+                    applied.append(f"{f['title']} — {msg}")
+                    acted.append(f"{fx['label']} — {msg}")
+                    label = f"After: {fx['label']}"
+                    step("Fixing the cause", "running", f"✓ {fx['label']}", at=base + 0.04)
+                except Exception as exc:
+                    applied.append(f"{f['title']} — could not apply: {exc}")
+                    step("Fixing the cause", "running", f"✗ {fx['label']}: {exc}", at=base + 0.04)
+                    d = {**d, "findings": [g for g in d["findings"] if g is not f]}
+                    continue
+            step("Testing", "running", "starting the game once — " + ("did that fix it?" if causes else
+                                                                     "what does it do?"), at=base + 0.05)
+            r = await asyncio.to_thread(self.library.run_trial, entry_id, {"label": label, "overrides": {}},
+                                        len(results) + 1, self._trial_cancel)
+            results.append(r)
+            mark = "✓" if r["outcome"] == "ran" else "✗"
+            step("Testing", "running", f"{mark} {label}: {r['detail']}", at=base + 0.09)
+            if r["outcome"] == "ran":
+                break
+            ev = self.library.trial_evidence.get(entry_id, {}).get(len(results))
+            d = await self.diagnose_game(entry_id, symptom, evidence=ev)    # what did this test show?
+        return results, d, acted
 
     def _real_start_difference(self, entry_id: int, base: dict) -> dict | None:
         """The current setup ran in the test copy but the game's real starts fail: what is different?"""
@@ -2258,30 +2351,155 @@ class AppCore:
             await asyncio.sleep(self.WISHLIST_EVERY)
 
     # ------------------------------------------------------------- Steam artwork (couch mode)
-    async def steam_art(self, app_ids: list[int]) -> dict[int, dict]:
-        """Big artwork for library games (portrait capsule, hero), cached on disk for a week."""
-        from ezgd.catalog import steamstore
-        path = self.paths.cache / "steam-art.json"
-        try:
-            cache = json.loads(path.read_text("utf-8"))
-        except (OSError, ValueError):
-            cache = {}
-        want = [int(a) for a in app_ids if a]
-        stale = [a for a in want if time.time() - (cache.get(str(a)) or {}).get("at", 0) > 7 * 86400]
-        if stale:
+    def _json_cache(self, name: str) -> dict:
+        """A small JSON cache file, read once and then kept in memory (see _save_json_cache)."""
+        caches = self.__dict__.setdefault("_json_caches", {})
+        if name not in caches:
             try:
-                info = await steamstore.items(self.client, stale)
+                caches[name] = json.loads((self.paths.cache / name).read_text("utf-8"))
+            except (OSError, ValueError):
+                caches[name] = {}
+        return caches[name]
+
+    def _save_json_cache(self, name: str) -> None:
+        tmp = self.paths.cache / f".{name}.tmp"
+        try:
+            tmp.write_text(json.dumps(self._json_cache(name)), "utf-8")
+            os.replace(tmp, self.paths.cache / name)
+        except OSError:
+            pass
+
+    async def steam_art(self, app_ids: list[int], need: str = "") -> dict[int, dict]:
+        """Big artwork for library games (portrait capsule, hero) and controller support, cached on disk for a
+        week. ``need="controller"`` also refreshes entries saved before controller support was recorded."""
+        from ezgd.catalog import steamstore
+        cache = self._json_cache("steam-art.json")
+        want = list(dict.fromkeys(int(a) for a in app_ids if a))
+        now = time.time()
+        stale = [a for a in want if now - (cache.get(str(a)) or {}).get("at", 0) > 7 * 86400
+                 or (need and need not in (cache.get(str(a)) or {}))]
+        changed = False
+        for k in range(0, len(stale), 50):
+            chunk = stale[k:k + 50]
+            try:
+                info = await steamstore.items(self.client, chunk)
             except Exception as exc:
                 log.info("Steam artwork lookup failed: %s", exc)
-                info = None
-            if info is not None:
-                for a in stale:
-                    cache[str(a)] = {**(info.get(a) or {}), "at": time.time()}
-                try:
-                    path.write_text(json.dumps(cache), "utf-8")
-                except OSError:
-                    pass
+                break
+            for a in chunk:
+                cache[str(a)] = {**(info.get(a) or {}), "at": time.time()}
+                if a not in info:
+                    cache[str(a)].setdefault("controller", None)       # not a game on Steam (any more)
+            changed = True
+        if changed:
+            self._save_json_cache("steam-art.json")
         return {a: cache.get(str(a)) or {} for a in want}
+
+    # ------------------------------------------------------------- controller support (couch mode's Store)
+    TITLE_MISS_DAYS = 14
+
+    def _protondb_titles(self) -> dict[str, int | None]:
+        """ProtonDB's ~34 000 game titles → Steam App ID (offline; None where a title is ambiguous)."""
+        from ezgd.library import appid, protondb
+        path = self._protondb_index()
+        if not path.exists():
+            return {}
+        stamp = path.stat().st_mtime
+        cached = self.__dict__.get("_pdb_titles")
+        if cached and cached[0] == stamp:
+            return cached[1]
+        out: dict[str, int | None] = {}
+        for app, g in (protondb._load(path).get("games") or {}).items():
+            if g.get("t"):
+                k = appid.key(g["t"])
+                out[k] = int(app) if k not in out or out[k] == int(app) else None
+        self._pdb_titles = (stamp, out)
+        return out
+
+    async def _steam_app_by_search(self, title: str) -> int | None:
+        """Steam's store search for a title (and its variants: "… Online", edition names); exact matches only."""
+        from urllib.parse import quote
+        from ezgd.library import appid
+        keys = appid.title_keys(title)
+        for term in appid.search_terms(title):
+            url = f"https://store.steampowered.com/api/storesearch/?term={quote(term)}&l=english&cc=US"
+            res = await self.client.fetch(url, max_bytes=512 * 1024, headers={"Accept": "application/json"})
+            if res.status == 429:
+                raise RuntimeError("Steam asks to slow down (HTTP 429)")
+            if res.status != 200:
+                continue
+            try:
+                items = json.loads(res.content).get("items") or []
+            except (ValueError, AttributeError):
+                items = []
+            exact = {i["id"] for i in items if isinstance(i, dict) and i.get("type") == "app"
+                     and isinstance(i.get("id"), int) and appid.key(str(i.get("name", ""))) in keys}
+            if len(exact) == 1:
+                return exact.pop()
+        return None
+
+    async def controller_support(self, items: list[tuple[str, str, int | None]], searches: int = 6) -> dict:
+        """Which games work with a controller, by Steam's store data: ``items`` are (key, title, Steam App ID or
+        None). The App ID comes from the site, a cache, ProtonDB's title list (offline), or — for at most
+        ``searches`` titles per call — Steam's store search. Returns {key: {"app", "controller", "pending"}}:
+        controller is "full" / "partial" / "none", or None when the game is not on Steam; ``pending`` means "ask
+        again" (its search did not fit into this call)."""
+        from ezgd.library import appid
+        titles = self._json_cache("steam-titles.json")
+        pdb = await asyncio.to_thread(self._protondb_titles)
+        now = time.time()
+        apps: dict[str, int | None] = {}
+        to_search: list[tuple[str, str]] = []
+        learned = False
+        for key, title, app in items:
+            if app:
+                apps[key] = int(app)
+                continue
+            hit = titles.get(key)
+            if hit is not None and (hit[0] or now - hit[1] < self.TITLE_MISS_DAYS * 86400):
+                apps[key] = hit[0] or None
+                continue
+            found = None
+            for k in appid.title_keys(title):
+                if pdb.get(k):
+                    found = pdb[k]
+                    break
+            if found:
+                apps[key] = found
+                titles[key] = [found, now]
+                learned = True
+            else:
+                to_search.append((key, title))
+        pending: set[str] = set()
+        throttled = now < self.__dict__.get("_steam_search_pause", 0.0)
+        sem = asyncio.Semaphore(3)
+
+        async def look(key: str, title: str) -> None:
+            async with sem:
+                try:
+                    found = await self._steam_app_by_search(title)
+                except Exception as exc:
+                    log.info("Steam search for %r failed: %s", title, exc)
+                    if "429" in str(exc):
+                        self._steam_search_pause = time.time() + 60
+                    pending.add(key)
+                    return
+                apps[key] = found
+                titles[key] = [found or 0, time.time()]
+        if throttled:
+            pending.update(k for k, _t in to_search)
+        else:
+            pending.update(k for k, _t in to_search[searches:])
+            await asyncio.gather(*(look(k, t) for k, t in to_search[:searches]))
+        if learned or to_search:
+            self._save_json_cache("steam-titles.json")
+        info = await self.steam_art([a for a in apps.values() if a], need="controller")
+        out = {}
+        for key, _title, _app in items:
+            a = apps.get(key)
+            out[key] = {"app": a, "controller": (info.get(a) or {}).get("controller") if a else None,
+                        "pending": key in pending}
+        return out
 
     # ------------------------------------------------------------- storage
     async def storage_report(self) -> dict:
