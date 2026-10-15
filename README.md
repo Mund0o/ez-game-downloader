@@ -47,11 +47,13 @@ Built with Python 3.12, PySide6 (Qt 6), SQLite, httpx, Beautiful Soup and libtor
 | **Proton (Linux)** | Runs Windows games the way Steam does — your Proton build inside the Steam Linux Runtime it requires, one prefix per game; protonfixes keyed by the real Steam App ID (auto-detected); Steam's Proton toggles; DLL-override detection; winecfg/winetricks/reset prefix; Steam launch-option syntax (`VAR=1 gamemoderun %command% -arg`). |
 | **Couch mode** | Full-screen, controller-friendly library in the style of SteamOS (F11 or the sidebar button), opening with a 2-second intro (any button skips it): Steam artwork, a shelf of your games, Library grid, Downloads; any Linux game controller, keyboard or mouse. The big ✕ leaves it — and first closes, completely, a game started from it. |
 | **Wishlist** | Its own tab: add any game through Steam's store search (even unreleased ones) or with ♡ on a game page; the app keeps looking for it on every source and notifies you when one has it. |
-| **Game updates** | Knows which version is installed (from the archive name) and checks the game's page every few hours; *Update* downloads the new release over the installed game — saves, settings, fixes and the Proton prefix stay. |
-| **Save backups** | Saves in each game's Proton prefix are zipped after every session and before updates, uninstalls and prefix rebuilds (caches/logs left out); restore with undo; backups survive a reinstall. |
+| **Game updates** | Knows which version is installed (from the archive name) and checks the game's page every few hours; *Update* downloads the new release over the installed game — saves, settings, fixes and the Proton prefix stay. Optional: updates download and install by themselves. |
+| **Save backups** | Saves in each game's Proton prefix are zipped after every session and before updates, uninstalls and prefix rebuilds (caches/logs left out); restore with undo; backups survive a reinstall — and, with a synced folder (Syncthing, Nextcloud, Drive), move between your PCs. |
 | **Storage** | Disk use per game (files, prefix, downloads, saves), free space per drive, and one-click cleanup of archives, leftovers, cache and unused prefixes. |
 | **App updates** | Checks a GitHub releases page once a day; downloads are verified against GitHub's SHA-256 and the app swaps itself in on restart (previous version kept until the new one runs). |
 | **Settings** | *Find a setting* search box; folders, queue, torrent network & bandwidth, extraction, sources on/off, cache TTL & clearing, logs, accent colour / contrast / card size / reduced motion, notifications, database backup & restore. |
+| **Runs on Linux?** | Every card, couch tile and game page shows how well the game runs under Proton — "Linux 92%" = 92 % of ProtonDB players' reports say it works (offline index; game pages add ProtonDB's own tier). |
+| **Organise** | Favourites (always on top), collections, hiding, and the order of the Library (recently played, A–Z, recently added, most played) — on the desktop and in couch mode. |
 | **Quick ways in** | Drop a `.torrent`, a magnet / download link, a game folder or an archive on the window; a magnet link on the clipboard is offered as a download; tray menu, progress on the taskbar icon, *Keep downloading in the tray* when closing; the app reopens where you left it (page, All Games filters, selected game). |
 
 ## Source integration notes (verified)
@@ -389,6 +391,10 @@ focused game's artwork fills the background, with its playtime, a big **Play** a
   Steam does not know are hidden too. *Settings → Store* switches it off.
 * **Playing:** A starts the game the way Play does (the same confirmation, Proton setup and fixes). Couch mode
   steps aside while you play and comes back when the game ends ("Welcome back"). It never restarts Steam.
+* **Quit from the controller:** hold the PS / Xbox / Steam button (1.6 s) while playing a game started from couch
+  mode: couch mode comes to the front and asks *Quit <game>?* (*Keep playing* is focused; *Quit game* stops it
+  completely, like the ✕). Games started from the desktop are never touched.
+* **Organise:** X (Manage) on a game: ★ favourite (favourites come first), hide it, and the Library's order.
 * **The ✕** (top right; B on the home shelf jumps to it): leaves couch mode and brings the normal window back. If a
   game you started from couch mode is still running it asks *Quit <game>?* first, then closes that game
   completely — asked to quit, force-stopped after a few seconds if needed (including Wine processes that left the
@@ -422,6 +428,18 @@ checks the local catalog all the time and searches the sources every few hours (
 SteamRIP is searched only when you press *Check now*; unreleased games are not searched in the background). When a
 source has it you get a notification, and *Get it* opens its download options. Closed guides are shown as such.
 
+### Download hours and playing
+
+*Settings → Downloads*: **Download hours** (e.g. 01:00–08:00) — outside them downloads wait in the queue and continue
+by themselves when the hours start (downloads you paused stay paused; the sidebar says "Downloads wait until 01:00").
+**While a game runs** caps torrent and direct downloads at a speed you choose, so online games do not lag; the normal
+limits come back when the game ends. **Start with the computer** puts the app in the tray at sign-in (XDG autostart
+on Linux, the Run key on Windows; `ezgd --minimized` does the same by hand).
+
+Before downloading, the game page and the download confirmation show the space needed — the download **plus** the
+installed game (the page's own "installed size" when it states one, else an estimate) — and warn when the download
+fits but installing it would not.
+
 ### Game updates
 
 Each game remembers the release it was installed from (`How.to.Fish.v1.0.10-OFME.rar` → 1.0.10, else the version
@@ -430,6 +448,11 @@ off; SteamRIP only on *Check for updates*) and tells you when a newer version is
 game as updating and opens its page: the next download or import of that game goes **over the installed game**
 (the same folder, the same Library entry) — its saves are backed up first; its settings, fixes, playtime and
 Proton prefix stay. *Cancel update* undoes the mark.
+
+**Install game updates automatically** (*Settings → Library*, off by default): a new version found by the check is
+downloaded by itself from the game's page (in the app — torrent first, it resumes) and installed over the game the
+same way. A game that is running, a page with only browser downloads or a multi-part set is left to you (you get the
+usual "update available" message); each version is tried once.
 
 ### Save backups
 
@@ -440,6 +463,11 @@ caches, logs, crash dumps and Windows' own folders — **after every play sessio
 saves are not zipped again; the newest 10 automatic and 10 safety backups (20 manual) are kept, per game
 *title* — so a reinstall finds them. Library → a game → **Saves**: *Back up now*, *Restore…* (your current saves
 are backed up first), delete, open the folder. Backups live in the app's data folder (`save-backups/`).
+
+**Synced save folder** (*Settings → Library*): choose a folder that Syncthing, Nextcloud, Google Drive … keeps in
+sync, and backups are written to `EZ Game saves/<game>` there — another PC with the same folder and this app lists
+and restores them. Backups made before are copied in; if the folder is not there (an unplugged drive), backups stay
+on this PC.
 
 ### Storage
 

@@ -73,6 +73,7 @@ class DownloadOptionsDialog(QDialog):
         self.extract_row = folder_row(self.extract_dest, self, "Choose extraction folder")
         form.addRow("" if one else "Extract to", self.extract_row)
         self.extract.toggled.connect(self.extract_row.setEnabled)
+        self.extract.toggled.connect(self._update_space)
         if one:
             self.extract_row.hide()
             self.dest.textChanged.connect(self.extract_dest.setText)
@@ -146,9 +147,18 @@ class DownloadOptionsDialog(QDialog):
         except OSError:
             free = None
         text = f"Free space: {format_bytes(free)}" if free is not None else "Free space: unknown"
-        if wanted:
+        install = self.prep.get("install_size") if self.extract.isChecked() else None
+        if wanted and install:
+            approx = "about " if self.prep.get("install_size_guessed") else ""
+            text += (f" · needed: {format_bytes(wanted)} download + {approx}{format_bytes(install)} installed = "
+                     f"{approx}{format_bytes(wanted + install)}")
+        elif wanted:
             text += f" · needed: {format_bytes(wanted)}"
         self.space.setText(text)
+        tight = bool(free is not None and wanted and install and wanted <= free < wanted + install)
+        self.space.setStyleSheet(f"color: {theme.CURRENT.warning};" if tight else "")
+        if tight:
+            self.space.setText(text + " — the download fits, but installing it may run out of space")
         problem = None
         if not dest or not Path(dest).is_absolute():
             problem = "Choose an absolute folder for the download."

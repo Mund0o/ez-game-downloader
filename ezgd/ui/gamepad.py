@@ -40,6 +40,7 @@ BUTTONS = {BTN_SOUTH: "a", BTN_EAST: "b", BTN_NORTH: "x", BTN_WEST: "x", BTN_C: 
 EVENT = struct.Struct("llHHi")                      # struct input_event (64-bit: timeval, type, code, value)
 ABSINFO = struct.Struct("iiiiii")                   # value, minimum, maximum, fuzz, flat, resolution
 REPEAT_DELAY, REPEAT_EVERY, REPEAT_FAST, FAST_AFTER = 0.36, 0.11, 0.055, 1.4
+HOME_HOLD = 1.6                                     # seconds the guide button is held for "quit the game?"
 DUPLICATE_WINDOW = 0.25                             # the same press from two devices (Steam's virtual pad + the real):
 #                                                     Steam's copy can come late — even after the real button is up
 STEAM_VIRTUAL = (0x28DE, 0x11FF)                    # Steam Input's virtual pad (mirrors a real controller)
@@ -151,6 +152,7 @@ class Gamepads(QObject):
     devices_changed = Signal(list)
     family_changed = Signal(str)
     button = Signal(str, bool)                       # a button went down / up (holding A holds a click)
+    home_held = Signal()                             # the guide button (PS / Xbox / Steam) held down HOME_HOLD s
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -161,6 +163,10 @@ class Gamepads(QObject):
         self._last: dict[str, tuple[float, str]] = {}
         self._raw_owner: dict[str, tuple[str, float, bool]] = {}    # button → (device, pressed at, still down)
         self._raw_ignored: set[tuple[str, str]] = set()             # (button, device) presses dropped as copies
+        self._home_timer = QTimer(self)
+        self._home_timer.setSingleShot(True)
+        self._home_timer.setInterval(int(HOME_HOLD * 1000))
+        self._home_timer.timeout.connect(self.home_held.emit)
         self.family = ""                                 # "" until a controller is connected
         self.pointer_mode = False                        # the left stick moves a pointer: no stick → directions
         self._repeat = QTimer(self)
@@ -181,6 +187,7 @@ class Gamepads(QObject):
     def stop(self) -> None:
         self._scan.stop()
         self._repeat.stop()
+        self._home_timer.stop()
         self._held = None
         for path in list(self.devices):
             self._close(path)
@@ -369,6 +376,8 @@ class Gamepads(QObject):
                 self._raw_ignored.add((name, dev.path))
                 return
             self._raw_owner[name] = (dev.path, now, True)
+            if name == "home":
+                self._home_timer.start()
             self.button.emit(name, True)
             return
         if (name, dev.path) in self._raw_ignored:
@@ -378,6 +387,8 @@ class Gamepads(QObject):
             if owner[0] != dev.path:
                 return                            # not the device that pressed it
             self._raw_owner[name] = (owner[0], owner[1], False)
+        if name == "home":
+            self._home_timer.stop()
         self.button.emit(name, False)
 
     def _emit(self, dev: _Device, name: str) -> None:

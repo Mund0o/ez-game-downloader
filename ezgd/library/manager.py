@@ -1401,8 +1401,43 @@ class LibraryManager:
         return str(old)
 
     # ------------------------------------------------------------ save backups
+    SYNC_SUBDIR = "EZ Game saves"
+
+    def _sync_folder(self, e: LibraryEntry) -> Path | None:
+        """The game's backups in the synced folder (Settings → Library), if one is set and reachable."""
+        base = (getattr(self.settings.settings, "save_sync_dir", "") or "").strip()
+        if not base or not Path(base).is_dir():         # not set, or the drive / share is not there right now
+            return None
+        return Path(base) / self.SYNC_SUBDIR / saves.key_for(e.title)
+
     def save_folder(self, e: LibraryEntry) -> Path:
+        """Where new backups go: the synced folder when one is set (so every PC sees them), else the app's own."""
+        sync = self._sync_folder(e)
+        if sync is not None:
+            try:
+                sync.mkdir(parents=True, exist_ok=True)
+                self._copy_local_backups(e, sync)
+                return sync
+            except OSError as exc:
+                log.warning("synced save folder %s not usable: %s — backups stay on this PC", sync, exc)
         return self.paths.save_backups / saves.key_for(e.title)
+
+    def _save_folders(self, e: LibraryEntry) -> list[Path]:
+        local = self.paths.save_backups / saves.key_for(e.title)
+        sync = self._sync_folder(e)
+        return [p for p in (sync, local) if p is not None]
+
+    def _copy_local_backups(self, e: LibraryEntry, sync: Path) -> None:
+        """Backups made before the synced folder was chosen join it (copied — the local ones stay)."""
+        local = self.paths.save_backups / saves.key_for(e.title)
+        if not local.is_dir():
+            return
+        for z in local.glob("*.zip"):
+            target = sync / z.name
+            if not target.exists():
+                tmp = target.with_suffix(".zip.part")
+                shutil.copy2(z, tmp)
+                os.replace(tmp, target)
 
     def backup_saves(self, entry_id: int, reason: str = "manual", quiet: bool = False,
                      max_bytes: int | None = None) -> dict | None:
@@ -1432,14 +1467,21 @@ class LibraryManager:
         e = self.get(entry_id)
         pfx = self.prefix_dir(entry_id)
         files = saves.collect(pfx) if saves.users_dir(pfx).is_dir() else []
-        return {"backups": [b.public() for b in saves.list_backups(self.save_folder(e))],
-                "folder": str(self.save_folder(e)), "has_prefix": saves.users_dir(pfx).is_dir(),
+        folder = self.save_folder(e)
+        seen: dict[str, dict] = {}
+        for f in self._save_folders(e):                # the synced folder first: backups from every PC
+            for b in saves.list_backups(f):
+                seen.setdefault(b.path.name, {**b.public(), "synced": f != self.paths.save_backups /
+                                              saves.key_for(e.title)})
+        backups = sorted(seen.values(), key=lambda b: b["created"], reverse=True)
+        return {"backups": backups, "synced": self._sync_folder(e) is not None,
+                "folder": str(folder), "has_prefix": saves.users_dir(pfx).is_dir(),
                 "current_files": len(files), "current_bytes": sum(f[2] for f in files),
                 "current_folders": saves._folders(files), "supported": IS_LINUX}
 
     def _own_backup(self, e: LibraryEntry, path: str) -> Path:
         p = Path(path)
-        if p.suffix != ".zip" or not is_within(p, self.save_folder(e)) or not p.is_file():
+        if p.suffix != ".zip" or not p.is_file() or not any(is_within(p, f) for f in self._save_folders(e)):
             raise LibraryError("That is not a save backup of this game.")
         return p
 
@@ -1717,6 +1759,33 @@ class LibraryManager:
             if not is_within(d, self.paths.prefixes) or d.resolve() == self.paths.prefixes.resolve():
                 raise LibraryError("Refusing to delete a folder outside the app's prefixes.")
             shutil.rmtree(d)
+
+    # ------------------------------------------------- organising
+    def organize(self, entry_id: int, *, favorite: bool | None = None, hidden: bool | None = None,
+                 collections: list[str] | None = None) -> LibraryEntry:
+        """Favourite / hide / put a game into collections (names are trimmed; an empty list takes it out of all)."""
+        e = self.get(entry_id)
+        org = dict(e.organize or {})
+        if favorite is not None:
+            org["favorite"] = bool(favorite)
+        if hidden is not None:
+            org["hidden"] = bool(hidden)
+        if collections is not None:
+            names: list[str] = []
+            for c in collections:
+                c = " ".join(str(c).split())[:40]
+                if c and c.casefold() not in {n.casefold() for n in names}:
+                    names.append(c)
+            org["collections"] = names
+        e.organize = {k: v for k, v in org.items() if v}
+        self.repo.update(e)
+        self.emit("library_changed", e.id)
+        return e
+
+    def collections(self) -> list[str]:
+        """Every collection name in use (A–Z)."""
+        names = {c for e in self.repo.all() for c in e.collections}
+        return sorted(names, key=str.casefold)
 
     # ------------------------------------------------- Steam overlay
     def _runner_shortcut(self, e: LibraryEntry) -> tuple[Path, str, int]:

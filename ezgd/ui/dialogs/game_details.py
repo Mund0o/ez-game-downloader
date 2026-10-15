@@ -237,6 +237,12 @@ class GameDetailsDialog(QDialog):
         add("Release date", g.release_date)
         if g.size_text:
             add("Size", f"{g.size_text} (as stated by the source)")
+        from ezgd.core.fsutil import install_estimate
+        est = install_estimate(g, g.size_bytes)
+        if g.size_bytes and est["install_size"]:
+            approx = "about " if est["install_size_guessed"] else ""
+            add("Space needed", f"{approx}{format_bytes(g.size_bytes + est['install_size'])} "
+                                "(download + installed game)")
         add("Platform", ", ".join(g.platforms))
         add("Developer", g.extra.get("developer"))
         add("Released by", g.extra.get("released_by") or g.extra.get("release_group"))
@@ -259,6 +265,17 @@ class GameDetailsDialog(QDialog):
             add("Servers", "Plays on official servers")
         add("Steam App ID", g.steam_app_id)
         add("Page checked", relative_time(g.details_checked_at) if g.details_checked_at else None)
+        self._linux = label("", wrap=True, selectable=True)
+        self._linux_row = label("Runs on Linux", "muted")
+        form.addRow(self._linux_row, self._linux)
+        self._linux_row.hide()
+        self._linux.hide()
+        self._linux_info: dict = {}
+        self.bridge.call(self.bridge.core.linux_ratings([(g.steam_app_id, g.title)]),
+                         lambda r: self._show_linux(rating=r[0] if r else None), lambda _e: None, owner=self)
+        if g.steam_app_id:
+            self.bridge.call(self.bridge.core.protondb_summary(g.steam_app_id),
+                             lambda t: self._show_linux(tier=t), lambda _e: None, owner=self)
         col.addLayout(form)
         btns = QHBoxLayout()
         btns.addWidget(button(f"Open on {theme.source_name(g.source)}", "external",
@@ -283,6 +300,28 @@ class GameDetailsDialog(QDialog):
             d = label(g.description, wrap=True, selectable=True)
             d.setStyleSheet(f"color: {theme.CURRENT.text}; line-height: 140%;")
             self.body_lay.addWidget(d)
+
+    def _show_linux(self, rating: dict | None = None, tier: dict | None = None) -> None:
+        """How well it runs under Proton: the players' reports (offline index) and ProtonDB's own tier."""
+        from ezgd.ui.ratings import LEVEL_COLORS
+        if rating is not None:
+            self._linux_info["rating"] = rating
+        if tier and tier.get("tier"):
+            self._linux_info["tier"] = tier
+        parts = []
+        r, t = self._linux_info.get("rating"), self._linux_info.get("tier")
+        if r:
+            parts.append(f"<span style='color:{LEVEL_COLORS[r['level']]}'>●</span> {r['text']}")
+        if t:
+            parts.append(f"ProtonDB: <b>{str(t['tier']).capitalize()}</b>"
+                         + (f" ({t['total']} reports)" if t.get("total") else ""))
+        try:
+            if parts:
+                self._linux.setText(" · ".join(parts))
+                self._linux.show()
+                self._linux_row.show()
+        except RuntimeError:
+            pass
 
     def _wish_state(self, on: bool) -> None:
         from ezgd.ui.icons import icon

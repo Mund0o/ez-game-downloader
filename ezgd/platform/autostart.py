@@ -1,0 +1,82 @@
+"""Start the app with the desktop session, in the tray (``--minimized``): downloads finish, the wishlist and game
+updates are checked without opening the window.
+
+Linux: an XDG autostart entry (``~/.config/autostart/ezgd.desktop`` — KDE, GNOME, Xfce … all read it).
+Windows: the per-user ``Run`` key. The entry is rewritten at every start while the setting is on, so it keeps
+pointing at the app after it was moved or updated."""
+
+from __future__ import annotations
+
+import logging
+import os
+import shlex
+from pathlib import Path
+
+from ezgd.platform import IS_WINDOWS
+
+log = logging.getLogger(__name__)
+
+NAME = "EZGameDownloader"
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def entry_path() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "autostart" / "ezgd.desktop"
+
+
+def command() -> list[str]:
+    """How this app is started (the packaged program, or Python with ``-m ezgd``), in the tray."""
+    from ezgd.library import steamrun
+    exe, args = steamrun.runner()
+    return [str(exe), *args, "--minimized"]
+
+
+def desktop_entry(cmd: list[str]) -> str:
+    return ("[Desktop Entry]\nType=Application\nName=EZ Game Downloader\n"
+            "Comment=Finishes downloads and checks for game updates in the tray\n"
+            f"Exec={' '.join(shlex.quote(c) for c in cmd)}\nIcon=ezgd\nTerminal=false\n"
+            "X-GNOME-Autostart-enabled=true\nX-KDE-autostart-after=panel\n")
+
+
+def enabled() -> bool:
+    if IS_WINDOWS:
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+                winreg.QueryValueEx(k, NAME)
+                return True
+        except OSError:
+            return False
+    return entry_path().is_file()
+
+
+def apply(on: bool) -> None:
+    """Add or remove the autostart entry (best effort: a failure is logged, never raised)."""
+    try:
+        if IS_WINDOWS:
+            import subprocess
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+                if on:
+                    winreg.SetValueEx(k, NAME, 0, winreg.REG_SZ, subprocess.list2cmdline(command()))
+                else:
+                    try:
+                        winreg.DeleteValue(k, NAME)
+                    except FileNotFoundError:
+                        pass
+            return
+        path = entry_path()
+        if on:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            text = desktop_entry(command())
+            if not path.is_file() or path.read_text(encoding="utf-8", errors="replace") != text:
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text(text, encoding="utf-8")
+                os.replace(tmp, path)
+                log.info("autostart entry written: %s", path)
+        elif path.is_file():
+            path.unlink()
+            log.info("autostart entry removed")
+    except OSError as exc:
+        log.warning("autostart could not be %s: %s", "set up" if on else "removed", exc)

@@ -315,6 +315,10 @@ class MainWindow(QMainWindow):
             sel = 0
         if sel and self.pages["library"].current_id is None:
             self.pages["library"].current_id = sel
+        lib_sort = self.pages["library"].sort
+        lib_sort.blockSignals(True)
+        lib_sort.setCurrentIndex(max(0, lib_sort.findData(self._ui_state.value("library_sort", "recent"))))
+        lib_sort.blockSignals(False)
         self.navigate(page if page in REMEMBERED_PAGES else "home")
 
     def _save_view(self) -> None:
@@ -323,6 +327,7 @@ class MainWindow(QMainWindow):
         self._ui_state.setValue("page", key)
         self._ui_state.setValue("games_view", json.dumps(self.pages["games"].view_state()))
         self._ui_state.setValue("library_selected", self.pages["library"].current_id or 0)
+        self._ui_state.setValue("library_sort", self.pages["library"].sort.currentData() or "recent")
 
     # ------------------------------------------------------------- the tray
     def _tray_activated(self, reason) -> None:
@@ -519,6 +524,10 @@ class MainWindow(QMainWindow):
     def _poll_summary(self) -> None:
         def show(s: dict) -> None:
             text = f"↓ {format_speed(s['speed'])}  ·  {s['active']} active, {s['queued']} queued"
+            if s.get("waits_until"):
+                text += f"\n⏾ Downloads wait until {s['waits_until']}"
+            elif s.get("limited_for_game"):
+                text += "\n🎮 Slower while you play"
             if s.get("torrent_error"):
                 text += f"\n⚠ {s['torrent_error']}"
             self.side_status.setText(text)

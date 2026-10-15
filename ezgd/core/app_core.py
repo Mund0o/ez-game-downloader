@@ -21,7 +21,7 @@ from typing import Any, Callable
 
 from ezgd.catalog.models import DownloadMethod, Game
 from ezgd.catalog.normalize import dedup_key
-from ezgd.core.fsutil import dir_size, is_within
+from ezgd.core.fsutil import dir_size, install_estimate, is_within, safe_dirname
 from ezgd.core.logging_setup import set_level
 from ezgd.core.settings import SettingsStore, download_folder
 from ezgd.database.db import Database
@@ -89,7 +89,8 @@ class PreparedDownload:
         return {"token": self.token, "kind": self.kind, "name": self.name, "size": self.size,
                 "checksum": self.checksum, "files": self.files, "title": self.game.title,
                 "source": self.game.source, "method": self.method.label,
-                "has_password": bool(self.archive_password), "password": self.archive_password}
+                "has_password": bool(self.archive_password), "password": self.archive_password,
+                **install_estimate(self.game, self.size)}
 
 
 class AppCore:
@@ -178,8 +179,13 @@ class AppCore:
         self.downloads = DownloadManager(self.download_repo, self.settings, self.http_engine, self.torrents,
                                          self.emit, client=self.client, on_completed=self._after_download,
                                          log_event=db.log_event)
+        self.downloads.is_playing = lambda: bool(self.library.running_ids())   # "slower while playing"
         await self.downloads.start()
+        self.downloads._apply_rates()
         self.settings.subscribe(self._on_setting)
+        if s.start_with_session:                 # keep the autostart entry pointing at this copy of the app
+            from ezgd.platform import autostart
+            await asyncio.to_thread(autostart.apply, True)
         self.http_cache.prune()
         self._maintenance_task = asyncio.create_task(self.maintenance())
         adblock.set_data_dir(self.paths.data / "adblock")
@@ -251,6 +257,9 @@ class AppCore:
             self.registry.hide_adult = bool(value)
         elif key == "cache_ttl_minutes":
             self.fetcher.default_ttl = int(value) * 60
+        elif key == "start_with_session":
+            from ezgd.platform import autostart
+            autostart.apply(bool(value))
         self.downloads.apply_settings(key, value)
         self.emit("settings_changed", key)
 
@@ -625,6 +634,7 @@ class AppCore:
 
     async def library_call(self, method: str, *args, **kwargs) -> Any:
         allowed = {"candidates", "set_executable", "mark_installed", "update", "launch", "add_to_steam",
+                   "organize", "collections",
                    "remove", "import_folder", "duplicates", "allow_execute", "launch_plan", "get", "preview",
                    "stop", "running_ids", "suggest_overrides", "protonfix_status", "prefix_info", "prefix_tool",
                    "suggestions", "apply_suggestion", "fixes_for", "set_fixes",
@@ -1142,6 +1152,25 @@ class AppCore:
                                 user_comment=comment, status=st.state if st else None))
 
     # ---------------------------------------------------- debugging assistant
+    async def linux_ratings(self, items: list) -> list[dict | None]:
+        """How well games run on Linux (ProtonDB players' reports, offline index) — for the Store's cards.
+        ``items``: ``[(steam_app_id or None, title), …]``; games without an App ID are found by title. Nothing is
+        fetched: without the index (Settings → Library → ProtonDB) every answer is None."""
+        from ezgd.library import appid, protondb
+
+        def work() -> list[dict | None]:
+            path = self._protondb_index()
+            if not path.exists():
+                return [None] * len(items)
+            games = protondb._load(path).get("games") or {}
+            titles = self._protondb_titles()
+            out = []
+            for app, title in items:
+                a = app or next((titles[k] for k in appid.title_keys(title or "") if titles.get(k)), None)
+                out.append(protondb.rating(games.get(str(a)), a) if a else None)
+            return out
+        return await asyncio.to_thread(work)
+
     async def protondb_summary(self, app_id: int | None) -> dict | None:
         """ProtonDB's public rating summary for a Steam game (cached for a day); None when unknown/offline."""
         if not app_id:
@@ -2060,6 +2089,7 @@ class AppCore:
         from ezgd.library import updates
         entries = [self.library.get(entry_id)] if entry_id is not None else await asyncio.to_thread(self.library.all)
         out = []
+        to_update: list[tuple[int, Game]] = []
         for e in entries:
             if not e.game_id or e.status not in (LibraryStatus.INSTALLED, LibraryStatus.EXTRACTED):
                 continue
@@ -2085,6 +2115,14 @@ class AppCore:
                 new["version"] = new.get("latest") or new.get("version")
                 new["status"] = updates.CURRENT
             e = self.library.get(e.id)
+            auto = (new["status"] == updates.UPDATE and self.settings.settings.auto_update_games
+                    and not (e.release or {}).get("updating") and (e.release or {}).get("auto_tried") != new.get("latest"))
+            if auto:
+                new["auto_tried"] = new.get("latest")
+                new["notified"] = new.get("latest")         # (the automatic update says so itself)
+                to_update.append((e.id, fresh))
+            elif (e.release or {}).get("auto_tried"):
+                new["auto_tried"] = e.release["auto_tried"]
             if new["status"] == updates.UPDATE and new.get("notified") != new.get("latest"):
                 new["notified"] = new.get("latest")
                 self.emit("notify", ("Update available", f"{e.title}: version {new['latest']} is out on "
@@ -2100,7 +2138,55 @@ class AppCore:
             out.append({"entry_id": e.id, "title": e.title, "status": new["status"],
                         "installed": new.get("version"), "latest": new.get("latest"),
                         "text": updates.describe(new)})
+        for eid, fresh in to_update:
+            try:
+                await self.auto_update_game(eid, fresh)
+            except Exception as exc:                   # one game failing must not stop the others
+                log.warning("automatic update of entry %s failed: %s", eid, exc)
         return out
+
+    async def auto_update_game(self, entry_id: int, game: Game) -> dict | None:
+        """Automatic game updates (Settings → Library): download the new version from the game's page and install
+        it over the old one — the same path as pressing Update (saves backed up first). Only in-app downloads
+        (torrent preferred, it resumes); a running game, browser-only links or multi-part sets are left to the user
+        (they get the usual "update available" message)."""
+        from ezgd.catalog.models import MethodKind
+        from ezgd.installation.volumes import volume_info
+        e = self.library.get(entry_id)
+        latest = (e.release or {}).get("latest") or game.version or "a new version"
+
+        def tell(why: str) -> None:
+            self.emit("notify", ("Update available", f"{e.title}: version {latest} is out — {why} Open the game in "
+                                                     "your Library to update it.", {"library": e.id}))
+        if self.library.is_running(entry_id):
+            tell("it was not updated automatically because it is running.")
+            return None
+        methods = list(enumerate(game.download_methods or []))
+        usable = [(i, m) for i, m in methods if m.supported and m.kind in (MethodKind.TORRENT, MethodKind.DIRECT)
+                  and volume_info(m.file_name or m.label.split("—")[-1].strip()) is None]
+        usable.sort(key=lambda im: 0 if im[1].kind == MethodKind.TORRENT else 1)
+        if not usable:
+            tell("its page only offers downloads that need a browser (or come in parts).")
+            return None
+        info = await self.begin_game_update(entry_id)
+        last_error = None
+        for idx, _m in usable:
+            try:
+                prep = await self.prepare_download(game.id, idx)
+            except Exception as exc:                    # this mirror did not resolve: the next one
+                last_error = exc
+                continue
+            s = self.settings.settings
+            game_dir = Path(s.install_dir or Path.home() / "Games") / safe_dirname(game.title)
+            dest = game_dir if s.downloads_in_game_folder else Path(s.download_dir or Path.home() / "Downloads")
+            snap = await self.start_prepared(prep["token"], str(dest), auto_extract=True)
+            log.info("automatic update of %s to %s started (download %s)", e.title, latest, snap.get("id"))
+            self.emit("notify", ("Updating " + e.title, f"Version {latest} is downloading by itself and will be "
+                                 "installed over your game — your saves are backed up first.", {"library": e.id}))
+            return {**info, "download": snap}
+        await self.cancel_game_update(entry_id)
+        tell(f"the automatic download did not start ({last_error}).")
+        return None
 
     async def _game_updates_loop(self) -> None:
         await asyncio.sleep(180)

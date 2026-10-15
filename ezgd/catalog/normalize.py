@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import re
 import unicodedata
 
@@ -34,6 +35,7 @@ def clean_title(raw: str) -> tuple[str, str | None]:
     return title or (raw or "").strip(), version
 
 
+@functools.lru_cache(maxsize=16384)
 def dedup_key(title: str) -> str:
     """Aggressively normalised key used to detect the same game across sources.
 

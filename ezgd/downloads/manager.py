@@ -59,6 +59,9 @@ class DownloadManager:
         self._last_emit: dict[int, float] = {}
         self._last_persist: dict[int, float] = {}
         self._last_resume_save = time.monotonic()
+        self.is_playing: Callable[[], bool] = lambda: False     # set by the core: a game is running
+        self._playing = False
+        self._held: set[int] = set()              # downloads put back in the queue outside the download hours
 
     # ------------------------------------------------------------ lifecycle
     @property
@@ -120,9 +123,87 @@ class DownloadManager:
             await asyncio.to_thread(self.torrents.shutdown)
 
     # ------------------------------------------------------------ scheduler
+    # ------------------------------------------------------------ download hours / playing
+    def outside_hours(self, now: time.struct_time | None = None) -> bool:
+        """Download hours are on and it is not one of them now (a span may go past midnight: 22:00–07:00)."""
+        s = self.settings.settings
+        if not getattr(s, "download_hours", False):
+            return False
+        t = now or time.localtime()
+        cur = t.tm_hour * 60 + t.tm_min
+        a = int(s.download_from[:2]) * 60 + int(s.download_from[3:])
+        b = int(s.download_to[:2]) * 60 + int(s.download_to[3:])
+        if a == b:
+            return False                          # the whole day
+        inside = a <= cur < b if a < b else (cur >= a or cur < b)
+        return not inside
+
+    def _hours_text(self) -> str:
+        s = self.settings.settings
+        return f"Waits for the download hours ({s.download_from}–{s.download_to})"
+
+    def _apply_hours(self) -> None:
+        if not self.outside_hours():
+            if self._held:
+                self._held.clear()
+                for t in self.tasks.values():
+                    if t.status is DownloadStatus.QUEUED and t.status_detail == self._hours_text():
+                        t.status_detail = "Download hours started"
+                        self._publish(t, force=True)
+            return
+        for task in [t for t in self.tasks.values() if t.status in ACTIVE]:
+            self._hold(task)
+
+    def _hold(self, task: DownloadTask) -> None:
+        """Back into the queue until the download hours start (resumed by itself then — not a user pause)."""
+        if task.kind is DownloadKind.HTTP:
+            job = self._jobs.pop(task.id, None)
+            if job:
+                job.cancel()
+        elif self.torrents and task.id in self.torrents.handles:
+            self.torrents.pause(task)
+        task.status = DownloadStatus.QUEUED
+        task.status_detail = self._hours_text()
+        task.speed = 0.0
+        self._held.add(task.id)
+        self._persist(task, force=True)
+        self._publish(task, force=True)
+        log.info("download %s waits for the download hours", task.id)
+
+    def _apply_rates(self) -> None:
+        """The speed limits in effect: the user's, and the lower "while playing" one while a game runs."""
+        s = self.settings.settings
+        play = int(getattr(s, "play_speed_limit_kbps", 0) or 0) if self._playing else 0
+
+        def eff(limit: int) -> int:
+            limits = [x for x in (int(limit or 0), play) if x > 0]
+            return min(limits) if limits else 0
+        self.http.bucket.set_rate(eff(s.http_speed_limit_kbps) * 1024)
+        if self.torrents:
+            self.torrents.apply_settings({
+                "listen_port": s.torrent_listen_port, "max_connections": s.torrent_max_connections,
+                "download_limit_kbps": eff(s.torrent_download_limit_kbps),
+                "upload_limit_kbps": s.torrent_upload_limit_kbps, "enable_dht": s.torrent_enable_dht,
+                "enable_lsd": s.torrent_enable_lsd, "enable_upnp": s.torrent_enable_upnp,
+                "stall_minutes": s.torrent_stall_minutes})
+
+    def _check_playing(self) -> None:
+        try:
+            playing = bool(self.is_playing())
+        except Exception:
+            playing = False
+        if playing != self._playing:
+            self._playing = playing
+            if int(getattr(self.settings.settings, "play_speed_limit_kbps", 0) or 0):
+                log.info("a game %s: download speed %s", "started" if playing else "ended",
+                         "limited while playing" if playing else "back to normal")
+                self._apply_rates()
+
     async def _run(self) -> None:
         while not self._stopping:
             try:
+                self._check_playing()
+                self._apply_hours()
                 self._schedule()
                 if self.torrents:
                     self._poll_torrents()
@@ -141,6 +222,8 @@ class DownloadManager:
         return sum(1 for t in self.tasks.values() if t.status in ACTIVE)
 
     def _schedule(self) -> None:
+        if self.outside_hours():
+            return                                # nothing starts outside the download hours
         free = self.max_concurrent - self._active_count()
         if free <= 0:
             return
@@ -562,20 +645,21 @@ class DownloadManager:
                 "speed_text": format_bytes(speed) + "/s",
                 # all running and queued downloads together (the taskbar's progress, the tray's tooltip)
                 "progress": done / total if total else None,
-                "eta": (total - done) / speed if total and speed > 0 else None}
+                "eta": (total - done) / speed if total and speed > 0 else None,
+                # downloads wait for the download hours (Settings → Downloads)
+                "waits_until": self.settings.settings.download_from if pending and self.outside_hours() else None,
+                "limited_for_game": bool(self._playing and getattr(self.settings.settings,
+                                                                   "play_speed_limit_kbps", 0))}
 
     def apply_settings(self, key: str, value: Any) -> None:
         s = self.settings.settings
-        if key == "http_speed_limit_kbps":
-            self.http.bucket.set_rate(int(value) * 1024)
+        if key in ("http_speed_limit_kbps", "play_speed_limit_kbps", "torrent_download_limit_kbps"):
+            self._apply_rates()
+        elif key in ("download_hours", "download_from", "download_to"):
+            self.wake()
         elif key == "http_max_retries":
             self.http.max_retries = int(value)
         elif key == "max_concurrent_downloads":
             self.wake()
         elif self.torrents and key.startswith("torrent_"):
-            self.torrents.apply_settings({
-                "listen_port": s.torrent_listen_port, "max_connections": s.torrent_max_connections,
-                "download_limit_kbps": s.torrent_download_limit_kbps,
-                "upload_limit_kbps": s.torrent_upload_limit_kbps, "enable_dht": s.torrent_enable_dht,
-                "enable_lsd": s.torrent_enable_lsd, "enable_upnp": s.torrent_enable_upnp,
-                "stall_minutes": s.torrent_stall_minutes})
+            self._apply_rates()                   # (keeps the "while playing" limit in force)

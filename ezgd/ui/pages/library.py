@@ -21,7 +21,21 @@ from ezgd.ui.widgets.common import (Banner, EmptyState, FlowLayout, PasswordBann
 
 STATUS_TEXT = {"downloaded": "Downloaded", "extracting": "Extracting", "extracted": "Needs setup",
                "installed": "Ready to play", "broken": "Files missing"}
-FILTERS = [("all", "All games"), ("ready", "Ready to play"), ("setup", "Needs setup"), ("running", "Running")]
+FILTERS = [("all", "All games"), ("favorites", "★ Favourites"), ("ready", "Ready to play"), ("setup", "Needs setup"),
+           ("running", "Running"), ("hidden", "Hidden games")]
+SORTS = [("recent", "Last played"), ("title", "A–Z"), ("added", "Newest"), ("playtime", "Most played")]
+
+
+def sort_key(e, how: str):
+    """Favourites first, then the chosen order (shared with couch mode's Library)."""
+    fav = 0 if e.favorite else 1
+    if how == "title":
+        return (fav, e.title.casefold())
+    if how == "added":
+        return (fav, -(e.added_at or 0), e.title.casefold())
+    if how == "playtime":
+        return (fav, -(e.playtime_seconds or 0), e.title.casefold())
+    return (fav, -(e.last_played_at or 0), e.title.casefold())
 
 
 def _friendly_notes(notes: str | None) -> str:
@@ -92,7 +106,16 @@ class LibraryPage(QWidget):
         for key, text in FILTERS:
             self.filter_kind.addItem(text, key)
         self.filter_kind.currentIndexChanged.connect(self._apply_filter)
-        ll.addWidget(self.filter_kind)
+        self.sort = QComboBox()
+        for key, text in SORTS:
+            self.sort.addItem(text, key)
+        self.sort.setToolTip("Order of the list (favourites stay on top)")
+        self.sort.currentIndexChanged.connect(lambda _i: self.entries and self._loaded(list(self.entries.values())))
+        kinds = QHBoxLayout()
+        kinds.setSpacing(6)
+        kinds.addWidget(self.filter_kind, 1)
+        kinds.addWidget(self.sort, 1)
+        ll.addLayout(kinds)
         self.list = QListWidget()
         self.list.setIconSize(QSize(64, 36))
         self.list.setSpacing(2)
@@ -103,6 +126,8 @@ class LibraryPage(QWidget):
         self._select_timer.setInterval(120)
         self._select_timer.timeout.connect(self._render_pending)
         self.list.itemDoubleClicked.connect(self._double_clicked)
+        self.list.setContextMenuPolicy(Qt.CustomContextMenu)                 # right-click: organise
+        self.list.customContextMenuRequested.connect(self._list_menu)
         enter = QShortcut(QKeySequence(Qt.Key_Return), self.list, context=Qt.WidgetShortcut)   # Enter = Play too
         enter.activated.connect(lambda: self.list.currentItem() and self._double_clicked(self.list.currentItem()))
         self.list.setToolTip("Double-click a ready game to play it")
@@ -157,7 +182,9 @@ class LibraryPage(QWidget):
         keep = self.current_id
         self.list.blockSignals(True)
         self.list.clear()
-        for e in sorted(entries, key=lambda x: (-(x.last_played_at or 0), x.title.casefold())):
+        self._fill_kinds(entries)
+        how = self.sort.currentData() or "recent"
+        for e in sorted(entries, key=lambda x: sort_key(x, how)):
             it = QListWidgetItem()
             it.setData(Qt.UserRole, e.id)
             it.setSizeHint(QSize(100, 48))
@@ -186,7 +213,7 @@ class LibraryPage(QWidget):
                 continue
             status = self._status_text(e)
             src = theme.source_name(e.source) if e.source else "Imported"
-            it.setText(f"{e.title}\n{status} · {src}")
+            it.setText(f"{'★ ' if e.favorite else ''}{e.title}\n{status} · {src}")
             it.setIcon(self._thumb(e))
 
     def _status_text(self, e) -> str:
@@ -222,13 +249,74 @@ class LibraryPage(QWidget):
             if e is None:
                 continue
             ok = not q or q in e.title.lower()
-            if kind == "ready":
+            if kind == "hidden":
+                ok = ok and e.hidden
+            elif e.hidden:
+                ok = False                                 # hidden games: only under "Hidden games"
+            if kind == "favorites":
+                ok = ok and e.favorite
+            elif isinstance(kind, str) and kind.startswith("c:"):
+                ok = ok and kind[2:] in e.collections
+            elif kind == "ready":
                 ok = ok and e.status is LibraryStatus.INSTALLED
             elif kind == "setup":
                 ok = ok and e.status is not LibraryStatus.INSTALLED
             elif kind == "running":
                 ok = ok and e.id in self.running
             it.setHidden(not ok)
+
+    def _fill_kinds(self, entries) -> None:
+        """The filter list: the fixed ones, then one per collection."""
+        names = sorted({c for e in entries for c in e.collections}, key=str.casefold)
+        want = [(k, t) for k, t in FILTERS] + [(f"c:{n}", f"▸ {n}") for n in names]
+        have = [(self.filter_kind.itemData(i), self.filter_kind.itemText(i)) for i in range(self.filter_kind.count())]
+        if want == have:
+            return
+        cur = self.filter_kind.currentData()
+        self.filter_kind.blockSignals(True)
+        self.filter_kind.clear()
+        for k, t in want:
+            self.filter_kind.addItem(t, k)
+        self.filter_kind.setCurrentIndex(max(0, self.filter_kind.findData(cur)))
+        self.filter_kind.blockSignals(False)
+
+    # ---------------------------------------------------------------- organising
+    def _organize(self, e, **kw) -> None:
+        def done(_r) -> None:
+            self.load()
+        self.bridge.call(self.bridge.core.library_call("organize", e.id, **kw), done,
+                         lambda err: self.actions.fail("Library", err), owner=self)
+
+    def _new_collection(self, e) -> None:
+        name, ok = QInputDialog.getText(self, "New collection", f"Put “{e.title}” into a new collection:")
+        if ok and name.strip():
+            self._organize(e, collections=e.collections + [name.strip()])
+
+    def _organize_menu(self, m: QMenu, e) -> None:
+        m.addAction("☆ Remove from favourites" if e.favorite else "★ Add to favourites",
+                    lambda: self._organize(e, favorite=not e.favorite))
+        col = m.addMenu("Collections")
+        names = sorted({c for x in self.entries.values() for c in x.collections}, key=str.casefold)
+        for n in names:
+            a = col.addAction(n)
+            a.setCheckable(True)
+            a.setChecked(n in e.collections)
+            a.toggled.connect(lambda on, n=n: self._organize(
+                e, collections=[c for c in e.collections if c != n] + ([n] if on else [])))
+        if names:
+            col.addSeparator()
+        col.addAction("New collection…", lambda: self._new_collection(e))
+        m.addAction("Show in the Library again" if e.hidden else "Hide from the Library",
+                    lambda: self._organize(e, hidden=not e.hidden))
+
+    def _list_menu(self, pos) -> None:
+        it = self.list.itemAt(pos)
+        e = self.entries.get(it.data(Qt.UserRole)) if it is not None else None
+        if e is None:
+            return
+        m = QMenu(self)
+        self._organize_menu(m, e)
+        m.exec(self.list.viewport().mapToGlobal(pos))
 
     def _selected(self, item: QListWidgetItem | None, _prev) -> None:
         """A click shows the game at once; holding an arrow key through the list shows the one it stops on (each
@@ -1225,6 +1313,8 @@ class LibraryPage(QWidget):
 
     def _more_menu(self, e, anchor) -> None:
         m = QMenu(self)
+        self._organize_menu(m, e)
+        m.addSeparator()
         m.addAction("Fixes…", lambda: self._open_fixes(e)).setEnabled(bool(e.executable))
         m.addAction("Diagnose (why doesn't it work?)…", lambda: self._diagnose(e)).setEnabled(bool(e.executable))
         m.addAction("Properties…", lambda: self._properties(e))

@@ -547,6 +547,8 @@ class StorePage(Page):
         self._all_sort = None                        # "All games": the order chosen last
         self.hscroll: dict[int, float] = {}
         self._gen = 0
+        from ezgd.ui import ratings
+        self.ratings = ratings.store(w.bridge)          # (the window repaints when answers come: see _Couch)
 
     # ------------------------------------------------------------ filters
     def chips(self) -> list[tuple[str, str]]:
@@ -1196,7 +1198,17 @@ class StorePage(Page):
         game = g.primary
         badge = ("IN LIBRARY", theme.CURRENT.success) if game.dedup_key in self.w.actions.installed_keys else None
         self.w.art_tile(p, r, focused, self.w.group_capsule(g), game.cover_url, g.title, badge, False,
-                        ("page", idx), tags=source_tags(g))
+                        ("page", idx), tags=source_tags(g) + self._linux_tag(g))
+
+    def _linux_tag(self, g) -> list[tuple[str, str]]:
+        """How well the game runs on Linux (ProtonDB players) as one more pill on its tile."""
+        from ezgd.ui.ratings import LEVEL_COLORS
+        r = self.ratings.get(g)
+        if r is None:
+            app = self.w.group_app_id(g)
+            self.ratings.want((g,), app_ids={g.key: app} if app else None)
+            return []
+        return [(r["label"], LEVEL_COLORS[r["level"]])] if r["level"] != "few" else []
 
     def _see_all_tile(self, p: QPainter, g: SeeAll, r: QRectF, focused: bool, idx: int) -> None:
         w, s = self.w, self.s
@@ -1386,6 +1398,7 @@ class GamePage(Page):
         self.focus = 0
         self.wishlisted: bool | None = None
         self.steam_base: dict | None = None
+        self.linux: dict | None = None
         self._settled = False
         self._gen = 0
 
@@ -1411,6 +1424,7 @@ class GamePage(Page):
         self.error = ""
         self.steam_base = None
         self.wishlisted = None
+        self.linux = None
         self._settled = False
         self._gen += 1
         gen = self._gen
@@ -1425,6 +1439,9 @@ class GamePage(Page):
             self.game = g
             self.games[self.cur] = g
             self.w.load_art([g.steam_app_id] if g.steam_app_id else [])
+            b.call(b.core.linux_ratings([(self._app_id(), g.title)]),
+                   lambda r: gen == self._gen and (setattr(self, "linux", r[0] if r else None), self.w.update()),
+                   lambda _e: None, owner=self.w)
             if g.extra.get("steam_base_game"):
                 b.call(b.core.steam_base_info(g.id), lambda info: self._base(gen, info), lambda _e: None,
                        owner=self.w)
@@ -1630,7 +1647,16 @@ class GamePage(Page):
                              ", ".join(g.genres[:3])) if x]
         if g.dedup_key in w.actions.installed_keys:
             facts.insert(0, "In your library")
+        if g.size_bytes:
+            from ezgd.core.fsutil import install_estimate
+            est = install_estimate(g, g.size_bytes)
+            if est["install_size"]:
+                facts.append(f"needs {'~' if est['install_size_guessed'] else ''}"
+                             f"{format_bytes(g.size_bytes + est['install_size'])} free")
         notes = self._notes(g)
+        if self.linux is not None:
+            from ezgd.ui.ratings import LEVEL_COLORS
+            notes.insert(0, (LEVEL_COLORS[self.linux["level"]], self.linux["text"] + "."))
         desc = " ".join(g.description.split()) if g.description and not self.loading else ""
         key = ("gameinfo", W, H, round(s, 3), theme.CURRENT.accent, source, g.title, "  ·  ".join(facts),
                tuple(notes), hash(desc))
@@ -1741,6 +1767,13 @@ def _confirm_lines(prep: dict, v: dict) -> tuple[list[tuple[str, str]], str | No
              ("How", ("Torrent" if prep.get("kind") == "torrent" else "Direct download") + f" · {prep.get('method')}"),
              ("Saved to", v["dest_dir"]),
              ("Free space", format_bytes(free) if free is not None else "unknown")]
+    install = prep.get("install_size") if v["auto_extract"] else None
+    if size and install:
+        approx = "about " if prep.get("install_size_guessed") else ""
+        need = f"{approx}{format_bytes(size + install)} (download + installed game)"
+        if free is not None and size <= free < size + install:
+            need += " — installing it may run out of space"
+        lines.append(("Needs", need))
     if prep.get("password"):
         lines.append(("Password", f"{prep['password']} (entered for you)"))
     lines.append(("Then", "Installed automatically when it finishes" if v["auto_extract"] else
@@ -2111,10 +2144,12 @@ class WishlistPage(Page):
 # ================================================================== settings
 TOGGLES = [
     ("Downloads", [("auto_extract", "Install games automatically when the download finishes"),
-                   ("delete_archive_after_extract", "Delete the archive after installing")]),
+                   ("delete_archive_after_extract", "Delete the archive after installing"),
+                   ("download_hours", "Only download during the download hours (set on the desktop)")]),
     ("Playing", [("confirm_before_launch", "Ask before starting a game"),
                  ("auto_backup_saves", "Back up saves automatically (after playing, before updates)"),
                  ("check_game_updates", "Check installed games for new versions"),
+                 ("auto_update_games", "Install game updates automatically"),
                  ("steam_overlay", "Steam overlay in games (friends list)"),
                  ("launch_through_steam", "Full Steam overlay: start games through Steam")]),
     ("Store", [("couch_controller_only", "Only show games that work with a controller (Steam's data)"),
@@ -2125,6 +2160,7 @@ TOGGLES = [
              ("couch_gpu", "Show couch mode through the graphics card (next time it opens)"),
              ("reduce_motion", "Reduce animations"),
              ("notifications_enabled", "Desktop notifications when downloads finish"),
+             ("start_with_session", "Start with the computer (in the tray)"),
              ("check_app_updates", "Look for a new version of the app once a day")]),
 ]
 SPEEDS = [0, 1024, 2560, 5120, 10240, 25600, 51200, 102400]

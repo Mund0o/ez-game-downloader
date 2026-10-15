@@ -252,12 +252,18 @@ CREATE INDEX idx_wishlist_dedup ON wishlist (dedup_key);
 """
 
 
+V6 = """
+ALTER TABLE library ADD COLUMN organize TEXT NOT NULL DEFAULT '{}';
+"""
+
+
 MIGRATIONS: list[Migration] = [
     Migration(1, "initial schema", _sql(V1)),
     Migration(2, "library: Steam App ID, Proton compatibility options, playtime", _sql(V2)),
     Migration(3, "paths created by the app; user-added sources", _sql(V3)),
     Migration(4, "library: installer (repack) state", _sql(V4)),
     Migration(5, "library: installed release (update checks); wishlist", _sql(V5)),
+    Migration(6, "library: favourites, hidden games, collections", _sql(V6)),
 ]
 
 LATEST_VERSION = MIGRATIONS[-1].version

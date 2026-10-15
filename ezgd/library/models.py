@@ -54,11 +54,13 @@ class LibraryEntry:
     playtime_seconds: int = 0
     setup: dict[str, Any] = field(default_factory=dict)    # installer releases: see ezgd.library.repack
     release: dict[str, Any] = field(default_factory=dict)  # installed release + update check: see ezgd.library.updates
+    organize: dict[str, Any] = field(default_factory=dict) # {"favorite": bool, "hidden": bool, "collections": [...]}
 
     COLUMNS = ("title", "dedup_key", "game_id", "source", "download_id", "cover_url", "download_path",
                "install_path", "executable", "executable_trusted", "launch_method", "proton_version",
                "launch_args", "status", "steam_shortcut_appid", "notes", "added_at", "updated_at",
-               "last_played_at", "play_count", "steam_app_id", "compat", "playtime_seconds", "setup", "release")
+               "last_played_at", "play_count", "steam_app_id", "compat", "playtime_seconds", "setup", "release",
+               "organize")
 
     @property
     def compat_config(self) -> "CompatConfig":
@@ -68,6 +70,18 @@ class LibraryEntry:
     def dedup_key(self) -> str:
         return dedup_key(self.title)
 
+    @property
+    def favorite(self) -> bool:
+        return bool((self.organize or {}).get("favorite"))
+
+    @property
+    def hidden(self) -> bool:
+        return bool((self.organize or {}).get("hidden"))
+
+    @property
+    def collections(self) -> list[str]:
+        return [str(c) for c in (self.organize or {}).get("collections") or []]
+
     def to_row(self) -> dict[str, Any]:
         row = {k: getattr(self, k) for k in self.COLUMNS}
         row["status"] = str(self.status)
@@ -76,6 +90,7 @@ class LibraryEntry:
         row["compat"] = json.dumps(self.compat or {})
         row["setup"] = json.dumps(self.setup or {})
         row["release"] = json.dumps(self.release or {})
+        row["organize"] = json.dumps(self.organize or {})
         return row
 
     @classmethod
@@ -93,6 +108,7 @@ class LibraryEntry:
             play_count=r.get("play_count") or 0, steam_app_id=r.get("steam_app_id"),
             compat=_load_json(r.get("compat")), playtime_seconds=r.get("playtime_seconds") or 0,
             setup=_load_json(r.get("setup")), release=_load_json(r.get("release")),
+            organize=_load_json(r.get("organize")),
         )
 
 

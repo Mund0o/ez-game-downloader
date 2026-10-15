@@ -192,3 +192,17 @@ def for_game(path: Path, app_id: int | None) -> dict | None:
     if not app_id or not path.exists():
         return None
     return (_load(path).get("games") or {}).get(str(app_id))
+
+
+def rating(game: dict | None, app_id: int | None = None) -> dict | None:
+    """How well a game runs on Linux, from the players' reports in the index: ``pct`` of ``reports`` say it works.
+    ``level``: great (≥ 85 %) · good (≥ 65 %) · mixed (≥ 40 %) · bad · few (under 3 reports — not enough to say)."""
+    if not game or not game.get("r"):
+        return None
+    n, ok = int(game["r"]), int(game.get("ok") or 0)
+    pct = ok / n
+    level = "few" if n < 3 else "great" if pct >= 0.85 else "good" if pct >= 0.65 else "mixed" if pct >= 0.4 else "bad"
+    return {"app": app_id, "pct": round(pct, 3), "reports": n, "level": level,
+            "label": f"Linux {round(pct * 100)}%" if level != "few" else "Linux: few reports",
+            "text": (f"{round(pct * 100)}% of {n} ProtonDB report{'s' if n != 1 else ''} say it runs on Linux"
+                     if level != "few" else f"Only {n} ProtonDB report{'s' if n != 1 else ''} — not enough to say")}

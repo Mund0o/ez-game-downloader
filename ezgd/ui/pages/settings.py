@@ -226,6 +226,28 @@ class SettingsPage(QWidget):
         self._spin(f, "http_speed_limit_kbps", "HTTP speed limit", 0, 1_000_000, " KiB/s", "unlimited", 256)
         self._spin(f, "http_max_retries", "Retries per download", 0, 20)
         self._spin(f, "http_timeout_seconds", "Network timeout", 5, 300, " s")
+        hours = QCheckBox("Only download during these hours")
+        hours.setToolTip("Outside these hours downloads wait in the queue and continue by themselves when the hours "
+                         "start (e.g. at night). Downloads you paused yourself stay paused.")
+        hours.toggled.connect(lambda v: self._save("download_hours", v))
+        self.widgets["download_hours"] = hours
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        row.addWidget(hours)
+        times = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)]
+        for key, text in (("download_from", "from"), ("download_to", "to")):
+            c = QComboBox()
+            for t in times:
+                c.addItem(t, t)
+            c.currentIndexChanged.connect(lambda _i, c=c, key=key: self._save(key, c.currentData()))
+            self.widgets[key] = c
+            row.addWidget(label(text, "muted"))
+            row.addWidget(c)
+        row.addStretch(1)
+        f.addRow("Download hours", row)
+        self._spin(f, "play_speed_limit_kbps", "While a game runs", 0, 1_000_000, " KiB/s", "no change", 256) \
+            .setToolTip("Downloads (torrents and direct) go at most this fast while you play, so online games do "
+                        "not lag; your normal limits come back when the game ends.")
 
         f = self._section("Torrents", "The built-in BitTorrent engine (libtorrent). No external client is needed. "
                                       "Actual speed depends on how many peers share a torrent.")
@@ -309,10 +331,19 @@ class SettingsPage(QWidget):
                     "Re-reads each installed game's page on its source and tells you when a newer version is out. "
                     "Sites that ask tools not to crawl them (SteamRIP) are only checked when you press “Check for "
                     "updates” in the Library.")
+        self._check(f, "auto_update_games", "Install game updates automatically",
+                    "When a newer version is out, it downloads by itself (in the app, torrent first) and is installed "
+                    "over the game — saves are backed up first. Games that are running, or whose page only has "
+                    "browser downloads, are left to you.")
         self._check(f, "auto_backup_saves", "Back up saves automatically (after playing, before updates and "
                                             "uninstalls)",
                     "Zips each game's saves from its Proton prefix (caches and logs left out). Backups are kept per "
                     "game title in the app's data folder, so a reinstall finds them again.")
+        sync = self._folder(f, "save_sync_dir", "Synced save folder")
+        sync.setPlaceholderText("optional — a Syncthing / Nextcloud / Google Drive folder: your saves on every PC")
+        sync.setToolTip("Save backups are written into “EZ Game saves” in this folder, so another computer with the "
+                        "same folder (and this app) can restore them. Backups made before stay here too. Leave it "
+                        "empty to keep backups on this computer only.")
         self._check(f, "steam_overlay", "Steam overlay in games while Steam is running (friends list)",
                     "Loads Steam's overlay into games started here, without changing anything in Steam. Steam only "
                     "shows the friends list there, and Shift+Tab may not open it again once closed.")
@@ -383,6 +414,9 @@ class SettingsPage(QWidget):
                                                    ("large", "Large")])
         self._check(f, "reduce_motion", "Reduce animations")
         self._check(f, "notifications_enabled", "Show desktop notifications when downloads finish or fail")
+        self._check(f, "start_with_session", "Start with the computer (in the tray)",
+                    "The app starts when you sign in, as an icon in the tray: downloads finish and the wishlist and "
+                    "game updates are checked without opening the window.")
 
         f = self._section("Couch mode display", "Couch mode fills the screen the app is on by itself. If it does not "
                                                 "fit your setup, choose the screen, a borderless window or the exact "

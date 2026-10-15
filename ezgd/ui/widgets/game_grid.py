@@ -62,6 +62,8 @@ class GameCardDelegate(QStyledItemDelegate):
         self.installed: set[str] = set()
         self.card_width = CARD_WIDTHS["comfortable"]
         self._lock: QPixmap | None = None
+        from ezgd.ui import ratings
+        self.ratings = ratings.store(covers.bridge)
 
 
     @staticmethod
@@ -119,11 +121,14 @@ class GameCardDelegate(QStyledItemDelegate):
         url = group.primary.cover_url or next((e.cover_url for e in group.entries if e.cover_url), None)
         pm = self.covers.variant(url, ("card", url, cw, ch, dpr), lambda img: self._finish(img, cw, ch, dpr))
         meta = self._meta(group)
+        rating = self.ratings.get(group)
+        if rating is None:
+            self.ratings.want((group,))                  # (asked once; answers come in a batch)
         key = (group.key, group.title, tuple(group.sources), meta, w, h, dpr, pm.cacheKey() if pm else None,
-               group.key in self.installed, pal.accent, pal.bg2, option.font.key())
+               group.key in self.installed, pal.accent, pal.bg2, option.font.key(), rating and rating["label"])
         card = self._cards.get(key)
         if card is None:
-            card = self._render_card(group, meta, w, h, dpr, pm, option.font)
+            card = self._render_card(group, meta, w, h, dpr, pm, option.font, rating)
             self._cards[key] = card
             while len(self._cards) > self.CARDS:
                 self._cards.popitem(last=False)
@@ -138,7 +143,7 @@ class GameCardDelegate(QStyledItemDelegate):
         p.restore()
 
     def _render_card(self, group: GameGroup, meta: str, w: int, h: int, dpr: float, pm: QPixmap | None,
-                     font: QFont) -> QPixmap:
+                     font: QFont, rating: dict | None = None) -> QPixmap:
         pal = theme.CURRENT
         out = QPixmap(max(1, round(w * dpr)), max(1, round(h * dpr)))
         out.setDevicePixelRatio(dpr)
@@ -217,6 +222,24 @@ class GameCardDelegate(QStyledItemDelegate):
             p.setBrush(Qt.NoBrush)
             p.drawPath(check)
 
+        if rating is not None and rating["level"] != "few":
+            # how well it runs on Linux (ProtonDB players) — bottom-right of the cover
+            from ezgd.ui.ratings import LEVEL_COLORS
+            f = QFont(font)
+            f.setPointSizeF(7.8)
+            f.setBold(True)
+            p.setFont(f)
+            text = rating["label"]
+            bw = QFontMetrics(f).horizontalAdvance(text) + 24
+            pill = QRectF(cover.right() - bw - 8, cover.bottom() - 27, bw, 19)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(11, 13, 18, 215))
+            p.drawRoundedRect(pill, 6, 6)
+            p.setBrush(QColor(LEVEL_COLORS[rating["level"]]))
+            p.drawEllipse(QRectF(pill.left() + 6, pill.center().y() - 3, 6, 6))
+            p.setPen(QColor("white"))
+            p.drawText(pill.adjusted(16, 0, 0, 0), Qt.AlignVCenter | Qt.AlignLeft, text)
+
         # text
         body = QRectF(r.left() + 12, cover.bottom() + 9, r.width() - 24, r.bottom() - cover.bottom() - 14)
         tf = QFont(font)
@@ -294,6 +317,7 @@ class GameGridView(QListView):
         self.activated.connect(self._emit)
         self.verticalScrollBar().valueChanged.connect(self._check_bottom)
         covers.ready.connect(lambda _url: self.viewport().update())
+        self.delegate.ratings.changed.connect(self.viewport().update)
 
     ROW_BAR = 14                                 # height of a row's drag bar (px)
 
@@ -331,6 +355,7 @@ class GameGridView(QListView):
         sb = self.horizontalScrollBar() if self.horizontal else self.verticalScrollBar()
         pos = sb.value()
         self.model_.set_groups(groups)
+        self.delegate.ratings.want(groups)
         if pos:
             from PySide6.QtCore import QTimer
             QTimer.singleShot(0, lambda: sb.setValue(min(pos, sb.maximum())))

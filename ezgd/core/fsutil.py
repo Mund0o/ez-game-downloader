@@ -152,3 +152,15 @@ def parse_size(text: str | None) -> int | None:
     except ValueError:
         return None
     return int(value * _SIZE_MULT[m.group(2).upper()])
+
+
+def install_estimate(game, download: int | None) -> dict:
+    """How much room the installed game needs besides the download: the page's own "installed size" when it says
+    one, else a guess from the archive (repacks unpack to ~2.5×, other archives ~1.15×)."""
+    stated = parse_size(game.extra.get("installed_size") or game.extra.get("original_size")) if game else None
+    if stated:
+        return {"install_size": stated, "install_size_guessed": False}
+    if not download:
+        return {"install_size": None, "install_size_guessed": True}
+    factor = 2.5 if game is not None and game.extra.get("installer") else 1.15
+    return {"install_size": int(download * factor), "install_size_guessed": True}

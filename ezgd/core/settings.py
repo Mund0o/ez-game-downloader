@@ -37,6 +37,10 @@ class Settings:
     # queue / http
     max_concurrent_downloads: int = 3
     http_speed_limit_kbps: int = 0              # 0 = unlimited (shared by all HTTP transfers)
+    download_hours: bool = False                 # only download between download_from and download_to
+    download_from: str = "01:00"
+    download_to: str = "08:00"
+    play_speed_limit_kbps: int = 0               # while a game runs, downloads go at most this fast (0 = as usual)
     http_max_retries: int = 5
     http_timeout_seconds: int = 30
     # torrent
@@ -72,10 +76,13 @@ class Settings:
     proton_version: str = ""                     # "" = newest detected
     steam_root: str = ""                         # "" = auto-detect
     check_game_updates: bool = True              # re-check installed games' pages for newer versions (every 6 h)
+    auto_update_games: bool = False              # download and install new versions by themselves
     auto_backup_saves: bool = True               # back up saves after playing and before updates/uninstalls
+    save_sync_dir: str = ""                      # save backups go here too (a Syncthing / Nextcloud / Drive folder)
     # app updates (GitHub releases)
     update_repo: str = ""                        # "owner/name" with the app's releases; empty = the official one
     check_app_updates: bool = True               # look for a new version of the app once a day
+    start_with_session: bool = False             # start (in the tray) when the computer starts / you sign in
     # ui
     theme_accent: str = "violet"
     theme_contrast: str = "dark"                 # dark | midnight
@@ -89,6 +96,7 @@ class Settings:
     couch_steady_frames: bool = True             # one steady frame rate (no flicker on VRR screens)
     couch_gpu: bool = True                       # couch mode's frames shown through OpenGL (off: as before)
     couch_controller_only: bool = True           # couch Store: only games with (full or partial) controller support
+    couch_library_sort: str = "title"            # couch Library order: title | recent | added | playtime
     couch_intro: bool = True                     # the 2-second intro video when couch mode opens (any button skips)
     couch_intro_sound: bool = True               # … with its sound
     notifications_enabled: bool = True
@@ -98,6 +106,7 @@ class Settings:
     _LIMITS = {
         "max_concurrent_downloads": (1, 16),
         "http_speed_limit_kbps": (0, 10_000_000),
+        "play_speed_limit_kbps": (0, 10_000_000),
         "http_max_retries": (0, 20),
         "http_timeout_seconds": (5, 300),
         "torrent_listen_port": (0, 65535),
@@ -115,6 +124,7 @@ class Settings:
         "card_size": ("compact", "comfortable", "large"),
         "log_level": ("DEBUG", "INFO", "WARNING", "ERROR"),
         "couch_window": ("fullscreen", "borderless", "custom"),
+        "couch_library_sort": ("title", "recent", "added", "playtime"),
     }
 
     @classmethod
@@ -143,6 +153,11 @@ class Settings:
             value = str(value)
             if key.endswith("_dir") or key in ("steam_root", "unrar_tool"):
                 value = os.path.expanduser(value) if value else value
+            if key in ("download_from", "download_to"):
+                m = re.fullmatch(r"(\d{1,2})[:.h](\d{2})", value.strip())
+                if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+                    raise ValueError(f"{key} must be a time like 01:30")
+                value = f"{int(m.group(1)):02d}:{m.group(2)}"
             if key == "couch_resolution":
                 value = value.strip().lower().replace("×", "x").replace(" ", "")
                 if value and not re.fullmatch(r"\d{3,5}x\d{3,5}", value):

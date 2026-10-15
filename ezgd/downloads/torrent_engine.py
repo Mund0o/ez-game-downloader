@@ -408,7 +408,8 @@ class TorrentEngine:
                 task.status_detail = "Seeding" if st.is_seeding and not paused else None
             return
         if paused:
-            task.status = DownloadStatus.PAUSED
+            if task.status is not DownloadStatus.QUEUED:   # (queued: waiting for its turn / the download hours)
+                task.status = DownloadStatus.PAUSED
             task.speed = task.upload_speed = 0.0
             return
         if st.state == states.downloading_metadata:
