@@ -55,6 +55,14 @@ def load(name: str, rate: int = RATE) -> array | None:
     return data
 
 
+def stereo(data: array) -> array:
+    """Mono samples as left/right pairs: the same sound in both ears."""
+    out = array("h", bytes(4 * len(data)))
+    out[0::2] = data
+    out[1::2] = data
+    return out
+
+
 def mix(voices: list[list], n: int) -> bytes:
     """The next ``n`` samples of every playing sound added up (16-bit, clipped); finished sounds are dropped from
     ``voices`` ([samples, position] each). Silence when nothing plays."""
@@ -84,18 +92,20 @@ def mix(voices: list[list], n: int) -> bytes:
 class _Stream(QIODevice):
     """What the audio output reads from: the playing sounds, mixed, or silence."""
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.voices: list[list] = []
-        self.lock = threading.Lock()
-
     def add(self, samples: array) -> None:
         with self.lock:
             self.voices.append([samples, 0])
             del self.voices[:-8]                       # (never more than a few at once)
 
+    def __init__(self, parent=None, channels: int = 1):
+        super().__init__(parent)
+        self.voices: list[list] = []
+        self.lock = threading.Lock()
+        self.channels = channels
+
     def readData(self, maxlen):                           # noqa: N802 (Qt API)
         n = max(0, int(maxlen) // 2)
+        n -= n % self.channels                            # (whole frames: left and right never swap)
         with self.lock:
             return mix(self.voices, n)
 
@@ -148,27 +158,34 @@ class CouchSounds(QObject):
             device = mm.QMediaDevices.defaultAudioOutput()
             if device.isNull():
                 return False
+            # Stereo, named front-left / front-right. A plain one-channel stream reaches PipeWire as "aux0" (Qt
+            # names no position), which it plays on the first channel only: the sounds were heard in the left ear.
             fmt = mm.QAudioFormat()
-            fmt.setChannelCount(1)
             fmt.setSampleFormat(mm.QAudioFormat.Int16)
-            rate = RATE
-            for r in (RATE, 44100, device.preferredFormat().sampleRate()):
-                fmt.setSampleRate(r)
-                if device.isFormatSupported(fmt):
-                    rate = r
+            rate = channels = 0
+            for ch, config in ((2, mm.QAudioFormat.ChannelConfigStereo), (1, mm.QAudioFormat.ChannelConfigMono)):
+                fmt.setChannelCount(ch)
+                fmt.setChannelConfig(config)
+                for r in (RATE, 44100, device.preferredFormat().sampleRate()):
+                    fmt.setSampleRate(r)
+                    if device.isFormatSupported(fmt):
+                        rate, channels = r, ch
+                        break
+                if rate:
                     break
-            else:
+            if not rate:
                 return False
             for name in NAMES:
                 data = load(name, rate)
                 if data:
-                    self._samples[name] = data
-            self._stream = _Stream(self)
+                    self._samples[name] = stereo(data) if channels == 2 else data
+            self._stream = _Stream(self, channels)
             self._stream.open(QIODevice.ReadOnly)
             self._sink = mm.QAudioSink(device, fmt, self)
-            self._sink.setBufferSize(int(rate * 2 * LATENCY))
+            self._sink.setBufferSize(int(rate * 2 * channels * LATENCY))
             self._sink.start(self._stream)
-            log.info("couch sounds: one stream at %d Hz on %s", rate, device.description())
+            log.info("couch sounds: one %s stream at %d Hz on %s", "stereo" if channels == 2 else "mono", rate,
+                     device.description())
             return True
         except Exception:
             log.info("couch sounds: no audio stream; one player per sound instead", exc_info=True)

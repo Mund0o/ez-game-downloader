@@ -1,6 +1,8 @@
 """A Steam controller (Steam Deck, Steam Controller) shows its own buttons in couch mode — also while Steam turns it
 into keyboard and mouse input outside games."""
 
+import re
+
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QKeyEvent
 
@@ -239,6 +241,52 @@ def test_steams_desktop_layouts_are_read_not_assumed():
     assert si.keys_of(my)["E"] == "a" and "RETURN" not in si.keys_of(my)
 
 
+# a layout the user saved in Steam (Steam Controller Configs/<id>/config/413080/*.vdf): Steam's configurator writes a
+# label after every binding — "key_press LEFT_CONTROL, Left Control, , "
+SAVED_V3 = re.sub(r'"((?:key_press|mouse_button|mouse_wheel|controller_action) [^"]+)"',
+                  lambda m: '"%s, %s, , "' % (m.group(1), m.group(1).split()[-1].title()), NEPTUNE_V3)
+
+
+def test_layouts_saved_in_steam_are_read_too():
+    """A friend's Steam controller under his own saved desktop layout: the bumpers did not switch tabs and Y opened
+    the Play box (Space, unrecognised, fell back to "press") — every key had come out as "LEFT_CONTROL,"."""
+    assert "key_press LEFT_CONTROL, Left_Control, , " in SAVED_V3
+    assert si.keys_of(SAVED_V3) == si.keys_of(NEPTUNE_V3)
+    k = si.keys_of(SAVED_V3)
+    assert k["LEFT_CONTROL"] == "lb" and k["LEFT_ALT"] == "rb" and k["SPACE"] == "x" and k["RETURN"] == "a"
+    assert si.labels_of(SAVED_V3, "neptune") == si.labels_of(NEPTUNE_V3, "neptune")
+    assert si.browser_hints(SAVED_V3, si.LABELS["neptune"]) == si.browser_hints(NEPTUNE_V3, si.LABELS["neptune"])
+
+
+def test_a_saved_layout_drives_couch_mode(ui, qtbot):
+    from ezgd.ui import couch as C
+    win, core, _ = ui
+    folder = core.paths.data.parent / "games" / "Saved Pad Game"
+    folder.mkdir(parents=True)
+    (folder / "Game.exe").write_bytes(b"MZ" + b"\0" * 100)
+    e = win.bridge.run_sync(core.library_call("import_folder", "Saved Pad Game", str(folder)))
+    win._reload_library()
+    couch = _open_couch(win, qtbot)
+    qtbot.waitUntil(lambda: any(x.id == e.id for x in couch.entries), timeout=5000)
+    _use(couch, SAVED_V3, "neptune")
+
+    def press(k):
+        couch.keyPressEvent(QKeyEvent(QEvent.KeyPress, k, Qt.NoModifier))
+    couch._switch_tab(C.T_LIBRARY, force=True)
+    couch.zone = "main"
+    press(Qt.Key_Space)                                              # Y: Manage, not the Play box
+    assert couch.overlay is not None and couch.overlay.tag == "details"
+    press(Qt.Key_Escape)
+    assert couch.overlay is None
+    tab = couch.tab
+    press(Qt.Key_Alt)                                                # right bumper
+    assert couch.tab == (tab + 1) % len(C.TABS)
+    press(Qt.Key_Control)                                            # left bumper
+    assert couch.tab == tab
+    couch.pads.steam_hw = False
+    couch.force_close()
+
+
 def test_the_configuration_steam_logged_is_the_one_used(tmp_path, monkeypatch):
     root = tmp_path / "Steam"
     (root / "controller_base").mkdir(parents=True)
@@ -398,3 +446,42 @@ def test_a_steam_controller_read_directly_without_steam(qtbot):
     assert got == ["left", "x", "home", "lt"] and pads.family == "steam"
     assert not pads.steam_as_keys()                                    # (read directly: no keys from Steam)
     pads.stop()
+
+
+def test_steams_virtual_pad_coming_and_going_is_not_announced(ui, qtbot, monkeypatch):
+    """A friend's Steam Controller: couch mode said "Controller connected — Microsoft X-Box 360 pad 0" over and over
+    (Steam's virtual pad for it, taken away and made again). A real new controller is still announced."""
+    from types import SimpleNamespace
+    win, core, _ = ui
+    couch = _open_couch(win, qtbot)
+    shown = []
+    monkeypatch.setattr(couch.toasts, "show", lambda title, text="", *a, **k: shown.append(text))
+    couch._opened = True
+    couch._known_pads = set()
+    pads = couch.pads
+    monkeypatch.setattr(pads, "steam_hw", True)
+    xbox = "Microsoft X-Box 360 pad 0"
+    monkeypatch.setattr(pads, "devices", {"/dev/input/event258": SimpleNamespace(name=xbox, virtual=False)})
+    couch._pads_changed([xbox])                                      # Steam's pad for its controller (Microsoft ids)
+    couch._pads_changed([])
+    couch._pads_changed([xbox])
+    assert shown == []
+    monkeypatch.setattr(pads, "steam_hw", False)
+    monkeypatch.setattr(pads, "devices", {"/dev/input/event30": SimpleNamespace(name="Steam Virtual Gamepad",
+                                                                               virtual=True)})
+    couch._pads_changed(["Steam Virtual Gamepad"])                   # 28DE:11FF
+    assert shown == []
+    pad = "Wireless Controller"
+    monkeypatch.setattr(pads, "devices", {"/dev/input/event40": SimpleNamespace(name=pad, virtual=False)})
+    couch._pads_changed([pad])                                       # a real controller: news
+    assert shown == [pad]
+    couch._pads_changed([])
+    couch._pads_changed([pad])                                       # back a moment later (Bluetooth): quiet
+    assert shown == [pad]
+    couch._pad_gone[pad] -= couch.PAD_QUIET_S + 1
+    couch._pads_changed([])
+    couch._pad_gone[pad] -= couch.PAD_QUIET_S + 1
+    couch._pads_changed([pad])                                       # back after a long while: news again
+    assert shown == [pad, pad]
+    monkeypatch.undo()
+    couch.force_close()

@@ -558,6 +558,7 @@ class _Couch:
         self.sounds = CouchSounds(self, lambda: bool(self.actions.settings.get("couch_sounds", True)),
                                   lambda: int(self.actions.settings.get("couch_sounds_volume", 15)) / 100)
         self._known_pads: set[str] = set()
+        self._pad_gone: dict[str, float] = {}    # controller name → when it disconnected (reconnects are quiet)
         self._opened = False
         self.intro: CouchIntro | None = None      # the intro video while it plays (couch_intro.py)
         self.pads = Gamepads(self)
@@ -1209,6 +1210,20 @@ class _Couch:
                     self._size_tries = 2
         elif self.isFullScreen() or moved:
             self.place_window(self, self.wc)
+        elif self.wc.kwin and self._size_tries < 2 and (self.width() < want.width() * 0.92 or
+                                                         self.height() < want.height() * 0.92):
+            # borderless / custom: place_window asks KWin to size the window right after show() — before KWin has
+            # mapped it, so the request found no window (a friend's borderless couch mode stayed 1811×1075, the
+            # desktop window's size). By now it is mapped: ask again, then check.
+            self._size_tries += 1
+            log.warning("couch mode: %s window only %dx%d of %dx%d — asking KWin to size it", mode, self.width(),
+                        self.height(), want.width(), want.height())
+            px = self.custom_pixels() if mode == "custom" else None
+            if px is not None:
+                self.wc.place_pixels(px[0], px[1], target.name())
+            else:
+                self.wc.fill_screen(target.name())
+            QTimer.singleShot(500, self, self._fit_screen)
         self._dirty = True
         self._request()
 
@@ -1362,13 +1377,33 @@ class _Couch:
             self._request(QRect(0, 0, 1, 1))            # nothing moved: a one-pixel frame keeps the rate steady
 
     def _pads_changed(self, names: list) -> None:
-        new = [n for n in names if n not in self._known_pads]
+        now = time.monotonic()
+        for n in self._known_pads - set(names):
+            self._pad_gone[n] = now
+        new = [n for n in names if n not in self._known_pads and self._announce_pad(n, now)]
         self._known_pads = set(names)
         if new and self._opened:
             self.toasts.show("Controller connected", ", ".join(new), "success")
         elif self.pad_family != self.pads.family:
             self.pad_family = self.pads.family            # (a Steam controller's keys keep its buttons)
             self.update()
+
+    PAD_QUIET_S = 60
+
+    def _announce_pad(self, name: str, now: float) -> bool:
+        """Whether "Controller connected" is news. Not when the same controller was there a moment ago (Bluetooth,
+        or Steam taking its virtual pad away and back), and never for Steam's virtual pad: a friend's Steam
+        Controller showed "Controller connected — Microsoft X-Box 360 pad 0" again and again (that is the pad Steam
+        makes for it, coming and going)."""
+        gone = self._pad_gone.get(name)
+        if gone is not None and now - gone < self.PAD_QUIET_S:
+            return False
+        devs = [d for d in self.pads.devices.values() if d.name == name]
+        if devs and all(getattr(d, "virtual", False) for d in devs):
+            return False
+        if self.pads.steam_hw and name.lower().startswith("microsoft x-box 360 pad"):
+            return False                                  # (Steam's virtual pad, also when it uses Microsoft's ids)
+        return True
 
     def _family_changed(self, family: str) -> None:
         self.pad_family = family

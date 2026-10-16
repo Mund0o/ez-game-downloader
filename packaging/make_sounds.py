@@ -72,10 +72,10 @@ def write(name: str, samples: list[float]) -> None:
     for i, s in enumerate(samples):
         if i >= len(samples) - fade:
             s *= (len(samples) - i) / fade
-        data += struct.pack("<h", round(max(-1.0, min(1.0, s / peak * PEAK)) * 32767))
+        data += struct.pack("<h", round(max(-1.0, min(1.0, s / peak * PEAK)) * 32767)) * 2   # left, right
     OUT.mkdir(parents=True, exist_ok=True)
     with wave.open(str(OUT / f"{name}.wav"), "wb") as w:
-        w.setnchannels(1)
+        w.setnchannels(2)                                          # stereo: a mono file can play in one ear only
         w.setsampwidth(2)
         w.setframerate(RATE)
         w.writeframes(bytes(data))

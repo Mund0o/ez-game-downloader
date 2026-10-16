@@ -12,7 +12,7 @@ from ezgd.ui import couch_intro, couch_sounds
 def test_sound_files_are_short_and_quiet():
     for name in couch_sounds.NAMES:
         with wave.open(str(couch_sounds.SOUNDS / f"{name}.wav")) as w:
-            assert w.getnchannels() == 1 and w.getsampwidth() == 2
+            assert w.getnchannels() == 2 and w.getsampwidth() == 2          # both ears (mono: left only)
             assert w.getnframes() / w.getframerate() < 0.2          # never in the way of the next press
             frames = w.readframes(w.getnframes())
         peak = max(abs(int.from_bytes(frames[i:i + 2], "little", signed=True)) for i in range(0, len(frames), 2))
@@ -60,3 +60,16 @@ def test_sounds_are_mixed_into_one_stream():
     voices = [[array("h", [30000, 5]), 0], [array("h", [30000, 5, 7]), 0]]
     assert array("h", mix(voices, 3)).tolist() == [32767, 10, 7]      # overlapping sounds add up (clipped)
     assert voices == []
+
+
+def test_sounds_play_in_both_ears():
+    """A one-channel stream reached PipeWire as "aux0" and was heard in the left ear only (a friend's headset): the
+    stream is stereo, every sound the same on the left and the right, and reads always end on a whole frame."""
+    from array import array
+    mono = couch_sounds.load("select")
+    both = couch_sounds.stereo(mono)
+    assert len(both) == 2 * len(mono) and both[0::2] == mono and both[1::2] == mono
+    s = couch_sounds._Stream(None, 2)
+    s.add(array("h", [1, 1, 2, 2, 3, 3]))
+    assert array("h", s.readData(6)).tolist() == [1, 1]              # 3 samples asked: one whole frame
+    assert array("h", s.readData(8)).tolist() == [2, 2, 3, 3]

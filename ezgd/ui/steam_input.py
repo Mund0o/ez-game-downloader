@@ -99,6 +99,13 @@ def _first(node: list, key: str, default=None):
     return v[0] if v else default
 
 
+def binding(value: str) -> str:
+    """A binding without the label Steam's configurator adds to layouts saved by the user: ``key_press TAB, , `` and
+    ``key_press LEFT_CONTROL, Left Control, , `` are ``key_press TAB`` / ``key_press LEFT_CONTROL`` (Steam's own
+    default files have no label)."""
+    return value.split(",", 1)[0].strip()
+
+
 def _bindings(node) -> list[str]:
     """Every "binding" below ``node`` (v3: activators → Full_Press → bindings → binding)."""
     out = []
@@ -106,7 +113,7 @@ def _bindings(node) -> list[str]:
         return out
     for k, v in node:
         if k.lower() == "binding" and isinstance(v, str):
-            out.append(v)
+            out.append(binding(v))
         elif isinstance(v, list):
             out += _bindings(v)
     return out
@@ -135,7 +142,7 @@ def bindings_of(text: str, modes: dict | None = None) -> dict[str, list[str]]:
         if isinstance(flat, list):
             for k, v in flat:
                 if isinstance(v, str):
-                    out.setdefault(f"{source}.{k.lower()}", []).append(v)
+                    out.setdefault(f"{source}.{k.lower()}", []).append(binding(v))
         inputs = _first(group, "inputs")                 # version 3: input → activators → … → binding
         if isinstance(inputs, list):
             for k, v in inputs:

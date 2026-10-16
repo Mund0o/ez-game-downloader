@@ -472,13 +472,16 @@ def test_repo_names():
         with pytest.raises(selfupdate.UpdateError):
             selfupdate.parse_repo(bad)
     assert selfupdate.relaunch_args(["--home", "/x", "--page", "games", "--quit-after", "3"]) == ["--home", "/x"]
+    assert selfupdate.relaunch_args(["--home", "rel"]) == ["--home", os.path.abspath("rel")]   # (started elsewhere)
+    assert selfupdate.relaunch_args(["--home=rel"]) == ["--home=" + os.path.abspath("rel")]
 
 
 def release_tarball(version: str, marker: Path | None = None) -> bytes:
     script = f"#!/bin/sh\necho ezgd {version}\n"
     if marker is not None:
         script = f"#!/bin/sh\nif [ \"$1\" = --version ]; then echo ezgd {version}; exit 0; fi\n" \
-                 f"echo started \"$@\" > '{marker}'\n"
+                 f"echo started \"$@\" > '{marker}'\n" \
+                 f"pwd -P > '{marker}.cwd'\n"
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
         data = script.encode()
@@ -492,7 +495,7 @@ def release_tarball(version: str, marker: Path | None = None) -> bytes:
 
 
 @linux_only
-async def test_app_update_check_download_verify_stage_and_swap(routes, tmp_path):
+async def test_app_update_check_download_verify_stage_and_swap(routes, tmp_path, monkeypatch):
     import hashlib
     from ezgd.core import selfupdate
     from ezgd.net.client import SafeHttpClient
@@ -526,12 +529,20 @@ async def test_app_update_check_download_verify_stage_and_swap(routes, tmp_path)
     new = selfupdate.stage(archive, app, "9.9.9")
     assert (new / "ezgd").is_file() and selfupdate.staged_version(app)
     waiter = subprocess.Popen(["sleep", "1"])                    # stands in for the running app
+    monkeypatch.chdir(app)                                       # the app was started from its own folder
     selfupdate.schedule_swap(app, tmp_path, tmp_path, ["--home", "/somewhere"], pid=waiter.pid)
+    monkeypatch.chdir(tmp_path)
     waiter.wait()
     end = time.monotonic() + 15
     while time.monotonic() < end and not marker.exists():
         await asyncio.sleep(0.1)
     assert marker.read_text().strip() == "started --home /somewhere"
+    # started in the new app folder — not the old one it was started from, deleted a minute later (the new version's
+    # helper processes then failed with "No such file or directory")
+    end = time.monotonic() + 5
+    while time.monotonic() < end and not Path(f"{marker}.cwd").exists():
+        await asyncio.sleep(0.05)
+    assert Path(f"{marker}.cwd").read_text().strip() == str(app.resolve())
     assert "echo ezgd 9.9.9" in (app / "ezgd").read_text() or "9.9.9" in (app / "ezgd").read_text()
     assert (app / "_internal" / "lib.txt").read_text() == "ok"
     old = app.with_name(".EZGameDownloader.update-old")

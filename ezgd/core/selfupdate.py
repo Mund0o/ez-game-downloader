@@ -219,10 +219,14 @@ if ! mv "$app" "$old"; then echo "could not move the old version aside"; exit 1;
 if ! mv "$new" "$app"; then
     echo "could not move the new version in; restoring the old one"
     mv "$old" "$app"
+    cd "$app" || cd /
     setsid "$app/ezgd" "$@" </dev/null >/dev/null 2>&1 &
     exit 1
 fi
 echo "$(date) update: swapped; starting the new version"
+# (not from the folder the old app was started in: that folder is now the old version, deleted a minute later, and
+# the new app's helper processes could not start from a deleted folder — "[Errno 2] No such file or directory")
+cd "$app" || cd /
 setsid "$app/ezgd" "$@" </dev/null >/dev/null 2>&1 &
 exit 0
 """
@@ -271,7 +275,7 @@ def relaunch_args(argv: list[str]) -> list[str]:
         if a == "--home":
             nxt = next(it, None)
             if nxt:
-                out += ["--home", nxt]
+                out += ["--home", os.path.abspath(nxt)]       # (the new version starts in another folder)
         elif a.startswith("--home="):
-            out.append(a)
+            out.append("--home=" + os.path.abspath(a.split("=", 1)[1]))
     return out

@@ -42,6 +42,45 @@ def test_wayland_full_screen_is_never_left_to_fix_its_size(ui, qtbot, monkeypatc
     couch.force_close()
 
 
+def test_a_borderless_window_kwin_left_small_is_sized_once_it_is_mapped(ui, qtbot, monkeypatch):
+    """A friend's borderless couch mode came up 1811×1075 (the desktop window's size): the KWin request made right
+    after show() ran before KWin had the window. The check after opening asks KWin again — at most twice."""
+    win, core, _ = ui
+    couch = _open_couch(win, qtbot)
+    monkeypatch.setitem(couch.actions.settings, "couch_window", "borderless")
+    monkeypatch.setattr(couch.wc, "kwin", True)
+    monkeypatch.setattr(couch, "isFullScreen", lambda: False)
+    asked = []
+    monkeypatch.setattr(couch.wc, "fill_screen", lambda name="": asked.append(("fill", name)))
+    monkeypatch.setattr(couch.wc, "place_pixels", lambda w, h, name="": asked.append(("pixels", w, h)))
+    got = _calls(couch, monkeypatch, "place_window", "showFullScreen")
+    screen, want, mode = couch.display_target()
+    assert mode == "borderless"
+    monkeypatch.setattr(couch, "width", lambda: int(want.width() * 0.7))
+    monkeypatch.setattr(couch, "height", lambda: int(want.height() * 0.75))
+    couch._size_tries = 0
+    for _ in range(4):
+        couch._fit_screen()
+    assert asked == [("fill", screen.name())] * 2 and got == []      # asked twice, never left for full screen
+    monkeypatch.setitem(couch.actions.settings, "couch_window", "custom")    # a custom size: KWin places the pixels
+    monkeypatch.setitem(couch.actions.settings, "couch_resolution", "1280x720")
+    monkeypatch.setattr(couch, "width", lambda: 100)
+    monkeypatch.setattr(couch, "height", lambda: 100)
+    asked.clear()
+    couch._size_tries = 0
+    couch._fit_screen()
+    assert asked == [("pixels", 1280, 720)]
+    asked.clear()
+    monkeypatch.setitem(couch.actions.settings, "couch_window", "borderless")  # the right size: nothing to do
+    monkeypatch.setattr(couch, "width", lambda: want.width())
+    monkeypatch.setattr(couch, "height", lambda: want.height())
+    couch._size_tries = 0
+    couch._fit_screen()
+    assert asked == []
+    monkeypatch.undo()
+    couch.force_close()
+
+
 def test_moving_to_another_screen_on_wayland_reopens_instead_of_leaving_full_screen(ui, qtbot, monkeypatch):
     win, core, _ = ui
     couch = _open_couch(win, qtbot)
