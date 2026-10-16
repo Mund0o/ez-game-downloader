@@ -158,6 +158,7 @@ def test_gpu_setting_chooses_the_window_and_falls_back_when_opengl_does_not_star
     win._couch_gpu_failed = False
     couch = _open_couch(win, qtbot)
     assert type(couch) is C.CouchWindow
+    assert not getattr(couch, "gpu", False)                     # … nor its frames through OpenGL: one switch
     couch.force_close()
 
 
@@ -177,7 +178,7 @@ def test_desktop_gpu_switches_at_start_up(tmp_path):
     c.commit()
     c.close()
     assert gpu.apply_at_startup(data, db, env) == "on"
-    assert env["QT_WIDGETS_RHI"] == "1" and env["QT_WIDGETS_RHI_BACKEND"] == "opengl"
+    assert "QT_WIDGETS_RHI" not in env           # desktop windows stay as they are (menus drew garbled through it)
     flags = env["QTWEBENGINE_CHROMIUM_FLAGS"].split()
     assert flags[0] == "--foo" and "--enable-gpu-rasterization" in flags and "--ignore-gpu-blocklist" in flags
     assert (data / gpu.MARKER).exists()

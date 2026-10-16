@@ -1,7 +1,7 @@
 """GPU acceleration (Settings → GPU acceleration): the parts that must be chosen before the QApplication exists.
 
-Couch mode reads the setting itself each time it opens (see couch.make_couch). The desktop window and the in-app
-browser can only be switched when the app starts, so this runs first and reads the setting straight from the
+Couch mode reads the setting itself each time it opens (see couch.make_couch). The in-app browser can only be
+switched when the app starts, so this runs first and reads the setting straight from the
 database (read-only: the core has not opened it yet).
 
 If a start with GPU acceleration does not get as far as showing the window (a driver crash), the next start
@@ -56,11 +56,12 @@ def apply_at_startup(data: Path, database: Path, env=os.environ) -> str:
         marker.write_text(str(os.getpid()))
     except OSError:
         pass
-    env.setdefault("QT_WIDGETS_RHI", "1")                 # widget windows composed by the GPU
-    env.setdefault("QT_WIDGETS_RHI_BACKEND", "opengl")
+    # (Not QT_WIDGETS_RHI for every desktop window: those are painted by the CPU anyway, and composed through
+    # OpenGL on Wayland a menu's first frame could show one item blown up across the whole menu until the mouse
+    # moved. Couch mode's OpenGL window and the browser use the GPU without it.)
     flags = env.get("QTWEBENGINE_CHROMIUM_FLAGS", "").split()
     env["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(flags + [f for f in CHROMIUM_FLAGS if f not in flags])
-    log.info("GPU acceleration on: desktop windows (Qt RHI, OpenGL) and the in-app browser use the graphics card")
+    log.info("GPU acceleration on: couch mode and the in-app browser use the graphics card")
     return "on"
 
 

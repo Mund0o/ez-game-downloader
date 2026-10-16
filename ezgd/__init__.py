@@ -1,5 +1,5 @@
 """EZ Game Downloader."""
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 APP_NAME = "EZGameDownloader"
 APP_DISPLAY_NAME = "EZ Game Downloader"

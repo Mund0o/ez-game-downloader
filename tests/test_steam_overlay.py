@@ -197,6 +197,34 @@ def test_overlay_without_shortcut_or_restart(library, tmp_path, monkeypatch, app
     assert library.overlay_available() == "switched off"
 
 
+def test_a_steam_controller_keeps_the_steam_button_for_the_quick_menu(library, tmp_path, monkeypatch):
+    """A friend's Steam Controller: in a game the Steam button opened Steam's overlay *and* the quick menu. While a
+    Valve controller is connected, games start without the overlay and not through Steam."""
+    root = fake_steam(tmp_path, monkeypatch, running=True)
+    library.settings.set("steam_root", str(root))
+    monkeypatch.delenv("LD_PRELOAD", raising=False)
+    e = script_game(library, tmp_path, "true")
+    hid = tmp_path / "hid"
+    hid.mkdir()
+    real = steam.valve_controllers
+    monkeypatch.setattr(steam, "valve_controllers", lambda base=None: real(hid))
+    (hid / "0003:28DE:11FF.0001").mkdir()                            # only Steam Input's virtual pad
+    assert library.overlay_available() is None
+    plan = library.launch(e.id, confirmed=True)
+    assert "Steam overlay (friends list only)" in plan.description
+    deadline = time.time() + 10
+    while library.is_running(e.id) and time.time() < deadline:
+        time.sleep(0.05)
+    library.reap()
+    (hid / "0005:28DE:1106.0002").mkdir()                            # a Steam Controller (Bluetooth)
+    assert "Steam Controller" in library.overlay_available()
+    assert library.steam_overlay_status(e.id)["use"] is False         # not started through Steam either
+    assert "quick menu" in library.steam_overlay_status(e.id)["reason"]
+    plan = library.launch(e.id, confirmed=True)
+    assert "Steam overlay" not in plan.description and "LD_PRELOAD" not in plan.env
+    assert "Steam Controller" in library.preview(e.id)["description"]
+
+
 def test_overlay_env_keeps_other_preloads(tmp_path):
     root = tmp_path / "Steam"
     for arch in ("ubuntu12_32", "ubuntu12_64"):

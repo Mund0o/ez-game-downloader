@@ -60,26 +60,15 @@ def family_of(vendor: int, product: int, name: str) -> str:
     return "generic"
 
 
-def steam_products(base: Path = Path("/sys/bus/hid/devices")) -> set[int]:
+def steam_products(base: Path | None = None) -> set[int]:
     """Product ids of the connected Valve controllers (Steam Controller, Steam Deck, the new Steam Controller).
     While Steam runs it takes them over and, outside games, turns them into keyboard and mouse input — couch mode
-    then only sees keys. (HID devices are named BUS:VENDOR:PRODUCT.N.)"""
-    out = set()
-    try:
-        for d in base.iterdir():
-            parts = d.name.upper().split(":")
-            if len(parts) >= 3 and parts[1] == "28DE":
-                try:
-                    out.add(int(parts[2].split(".")[0], 16))
-                except ValueError:
-                    pass
-    except OSError:
-        pass
-    from ezgd.ui.steam_input import VIRTUAL
-    return out - VIRTUAL                                   # (not Steam Input's virtual pads)
+    then only sees keys."""
+    from ezgd.platform.steam import valve_controllers
+    return valve_controllers(base)
 
 
-def steam_hardware(base: Path = Path("/sys/bus/hid/devices")) -> bool:
+def steam_hardware(base: Path | None = None) -> bool:
     return bool(steam_products(base))
 
 

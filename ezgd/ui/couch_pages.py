@@ -2177,9 +2177,8 @@ TOGGLES = [
     ("App", [("couch_intro", "Intro video when couch mode opens"),
              ("couch_intro_sound", "Intro sound"),
              ("couch_sounds", "Sounds (moving, pressing, browser clicks)"),
-             ("gpu_acceleration", "GPU acceleration (recommended): couch mode next time it opens, the desktop "
+             ("gpu_acceleration", "GPU acceleration (recommended): couch mode next time it opens, the browser "
                                   "after a restart"),
-             ("couch_gpu", "Without GPU acceleration: frames shown through the graphics card"),
              ("mangohud_live", "MangoHud ready in every game (switch it on from the quick menu)"),
              ("reduce_motion", "Reduce animations"),
              ("notifications_enabled", "Desktop notifications when downloads finish"),

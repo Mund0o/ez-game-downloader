@@ -454,11 +454,11 @@ class SettingsPage(QWidget):
         self._combo(f, "card_size", "Game cards", [("compact", "Compact"), ("comfortable", "Comfortable"),
                                                    ("large", "Large")])
         self._check(f, "gpu_acceleration", "GPU acceleration (recommended) — couch mode uses it the next time it "
-                                           "opens, the desktop and the in-app browser after a restart",
+                                           "opens, the in-app browser after a restart",
                     "Couch mode is drawn by the graphics card (OpenGL) instead of the processor: smoother, especially "
-                    "at 4K. The desktop window is composed on the graphics card and the in-app browser draws pages "
-                    "and decodes video on it. If the graphics driver has a problem with it, the app falls back to "
-                    "the processor by itself.")
+                    "at 4K. The in-app browser draws pages and decodes video on it. Off: the processor does all of "
+                    "it. If the graphics driver has a problem with it, the app falls back to the processor by "
+                    "itself.")
         self._check(f, "mangohud_live", "MangoHud ready in every game — switch it on or off over a running game "
                                         "(quick menu, Game settings)",
                     "Games start with MangoHud loaded but hidden (when MangoHud is installed), so it can be shown "
@@ -494,8 +494,6 @@ class SettingsPage(QWidget):
                                        "clicking in the browser)")
         self._volume(f, "couch_sounds_volume", "Sound volume", sample=True)
         self._check(f, "couch_steady_frames", "Steady frame rate (stops flicker on VRR / FreeSync / G-Sync screens)")
-        self._check(f, "couch_gpu", "Without GPU acceleration: show couch mode's frames through the graphics card "
-                                    "(applies the next time couch mode opens)")
         self._check(f, "couch_controller_only", "Couch mode's Store: only games that work with a controller "
                                                 "(full or partial controller support on Steam)")
 

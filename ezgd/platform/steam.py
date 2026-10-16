@@ -214,6 +214,31 @@ def shortcut_rungameid(appid: int) -> int:
     return (appid << 32) | 0x02000000
 
 
+VIRTUAL_PADS = {0x11FF, 0x11FC}    # Steam Input's virtual pads (not hardware)
+
+
+def valve_controllers(base: Path | None = None) -> set[int]:
+    """Product ids of the connected Valve controllers (Steam Controller, Steam Deck, the new Steam Controller).
+    While Steam runs it takes them over: their Steam button goes to Steam. (HID devices are named
+    BUS:VENDOR:PRODUCT.N.)"""
+    if base is None:
+        if os.environ.get("EZGD_NO_GAMEPADS") == "1":       # (tests: never the real controllers)
+            return set()
+        base = Path("/sys/bus/hid/devices")
+    out = set()
+    try:
+        for d in base.iterdir():
+            parts = d.name.upper().split(":")
+            if len(parts) >= 3 and parts[1] == "28DE":
+                try:
+                    out.add(int(parts[2].split(".")[0], 16))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return out - VIRTUAL_PADS
+
+
 def is_steam_running() -> bool:
     try:
         if IS_WINDOWS:

@@ -489,6 +489,10 @@ class LibraryManager:
             return "switched off"
         if not IS_LINUX:
             return "only on Linux"
+        if steam.valve_controllers():
+            # Steam owns the controller: its Steam button opened Steam's overlay in the game *and* the quick menu
+            # (a friend's Steam Controller). Without the overlay, the button is the quick menu's alone.
+            return "a Steam Controller is connected: its Steam button opens the quick menu"
         if steam.overlay_env(self.steam_root()) is None:
             return "Steam is not installed"
         if not steam.is_steam_running():
@@ -2158,6 +2162,9 @@ class LibraryManager:
             return out
         if "no_steam_overlay" in e.compat_config.fixes:
             out["reason"] = "the Steam overlay is off for this game"
+            return out
+        if steam.valve_controllers():                 # (started by Steam, Steam would add its overlay itself)
+            out["reason"] = "a Steam Controller is connected: its Steam button opens the quick menu, not Steam's overlay"
             return out
         root = self.steam_root()
         if root is None or steam.steam_command() is None:

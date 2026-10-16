@@ -4672,10 +4672,12 @@ class _Presenter(QOpenGLWidget):
 
 
 def make_couch(actions, entries: list, running: set[int], gpu_drawing: bool = True):
-    """Couch mode's window: drawn by the GPU with GPU acceleration on (Settings; falls back to the CPU when OpenGL
-    is not available, or ``gpu_drawing`` is False after it failed), else drawn by the CPU and shown through the GPU
-    unless switched off."""
-    if gpu_drawing and actions.settings.get("gpu_acceleration", False) and gpu_available():
+    """Couch mode's window. One switch (Settings → GPU acceleration): on, it is drawn by the GPU — and if that
+    window cannot be made, drawn by the CPU with its frames still shown through the GPU; off (or ``gpu_drawing``
+    False after OpenGL failed this run), the CPU does everything. (A second switch for "frames through the GPU"
+    only mattered with GPU acceleration off, where it went against that choice — merged into this one.)"""
+    gpu = gpu_drawing and actions.settings.get("gpu_acceleration", False) and gpu_available()
+    if gpu:
         try:
             w = CouchGLWindow(actions, entries, running)
             log.info("couch mode: GPU acceleration on")
@@ -4683,7 +4685,7 @@ def make_couch(actions, entries: list, running: set[int], gpu_drawing: bool = Tr
         except Exception:
             log.exception("couch mode: GPU drawing unavailable; drawing with the CPU")
     w = CouchWindow(actions, entries, running)
-    if actions.settings.get("couch_gpu", True) and gpu_available():
+    if gpu:
         try:
             w._presenter = _Presenter(w)
             w._presenter.setGeometry(0, 0, 1, 1)
