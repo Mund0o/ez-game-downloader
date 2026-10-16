@@ -133,3 +133,46 @@ def test_the_display_trace_records_the_window(qtbot):
         logging.getLogger("ezgd.ui.display_trace").removeHandler(handler)
     assert lines[0].startswith("couch display trace: compositor")
     assert any("window 900x600" in x for x in lines)
+
+
+def test_the_desktop_window_comes_back_from_couch_mode_as_it_was(ui, qtbot, monkeypatch):
+    """A friend's KDE gave the desktop window couch mode's full-screen size when couch mode closed (no title bar,
+    over the taskbar). It is put back: out of full screen, its old size (or maximized again)."""
+    from ezgd.ui import window_control
+    win, core, _ = ui
+    win.showNormal()
+    win.resize(1100, 720)
+    qtbot.wait(50)
+    couch = _open_couch(win, qtbot)
+    assert win._before_couch[0].width() == win.width() and win._before_couch[1] is False
+    couch.force_close()
+    qtbot.waitUntil(lambda: win.isVisible() and win.couch is None, timeout=5000)
+    asked = []
+    monkeypatch.setattr(window_control, "restore_desktop_window", lambda *a: asked.append(a) or True)
+    win._before_couch = (win._before_couch or (win.size(), False, False))
+    size = win._before_couch[0]
+    monkeypatch.setattr(win, "isFullScreen", lambda: True)            # the window manager kept it full screen
+    calls = _calls(win, monkeypatch, "showNormal", "showMaximized")
+    win._check_after_couch(False)
+    assert calls == ["showNormal"] and asked == [(win.windowTitle(), size.width(), size.height(), False)]
+    monkeypatch.setattr(win, "isFullScreen", lambda: False)           # as it was: nothing is done
+    asked.clear()
+    calls.clear()
+    win._check_after_couch(True)
+    assert asked == [] and calls == [] and win._before_couch is None
+    win._before_couch = (size, True, False)                          # it was maximized: maximized again
+    monkeypatch.setattr(win, "isFullScreen", lambda: True)
+    win._check_after_couch(True)
+    assert calls == ["showNormal", "showMaximized"] and asked[-1][-1] is True
+    monkeypatch.undo()
+
+
+def test_borderless_is_full_screen_on_wayland(ui, qtbot, monkeypatch):
+    win, core, _ = ui
+    couch = _open_couch(win, qtbot)
+    monkeypatch.setitem(couch.actions.settings, "couch_window", "borderless")
+    assert couch.display_target()[2] == "borderless"                   # (X11: a borderless window of its own)
+    monkeypatch.setattr(C, "on_wayland", lambda: True)
+    assert couch.display_target()[2] == "fullscreen"
+    monkeypatch.undo()
+    couch.force_close()

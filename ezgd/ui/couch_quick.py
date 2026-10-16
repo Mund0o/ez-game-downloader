@@ -31,7 +31,7 @@ TITLE = "EZ Games — Quick menu"
 VOLUME_STEP = 10
 
 
-ICONS = ("resume", "switch", "couch", "volume", "mangohud", "settings", "quit")
+ICONS = ("resume", "switch", "couch", "friends", "volume", "mangohud", "settings", "quit")
 
 
 def draw_icon(p: QPainter, key: str, r: QRectF, color: QColor, s: float) -> None:
@@ -60,6 +60,11 @@ def draw_icon(p: QPainter, key: str, r: QRectF, color: QColor, s: float) -> None
         for cx in (0.05, 0.55):
             for cy in (0.05, 0.55):
                 p.drawRoundedRect(QRectF(x + w * cx, y + h * cy, q, q), 2.5 * s, 2.5 * s)
+    elif key == "friends":                                 # two people
+        p.drawEllipse(QRectF(x + w * 0.12, y + h * 0.1, w * 0.32, h * 0.32))
+        p.drawArc(QRectF(x + w * 0.0, y + h * 0.5, w * 0.56, h * 0.62), 0, 180 * 16)
+        p.drawEllipse(QRectF(x + w * 0.58, y + h * 0.18, w * 0.26, h * 0.26))
+        p.drawArc(QRectF(x + w * 0.5, y + h * 0.54, w * 0.46, h * 0.5), 0, 180 * 16)
     elif key == "volume":                                  # a speaker and two waves
         path = QPainterPath()
         path.moveTo(x + w * 0.05, y + h * 0.36)
@@ -109,7 +114,7 @@ class Row:
     key: str
     label: str
     note: str = ""
-    kind: str = "row"                 # row | primary | danger | choice | header | game
+    kind: str = "row"                 # row | primary | danger | choice | header | game | friend
     value: str = ""
     action: Callable[[], None] | None = None
     left: Callable[[], None] | None = None
@@ -135,7 +140,7 @@ class QuickMenu(QWidget):
         self.setMouseTracking(True)
         self.wc = WindowControl(self, "Quick menu")
         self.game = None                   # the library entry the menu was opened for (None: only suspended ones)
-        self.view = "main"                 # main | switch | confirm (Play X?) | starting
+        self.view = "main"                 # main | switch | confirm (Play X?) | starting | friends | friend
         self.target = None                 # confirm / starting: the game to switch to
         self.start_error = ""
         self.rows: list[Row] = []
@@ -145,6 +150,10 @@ class QuickMenu(QWidget):
         self.volume: int | None = None
         self.session: int | None = None
         self.busy = ""                     # "Suspending…" while an action is under way
+        self.friends: dict | None = None   # Steam friends (core.steam_friends), asked for when the menu opens
+        self.friends_error = ""
+        self.friend: dict | None = None    # friend view: the friend chosen
+        self._row_top = 0                  # long lists: the first row shown
         self._confirm_quit = 0.0           # Quit pressed once: press again before this time
         self._hits: list[tuple[QRectF, str, int]] = []
         self._shown = 0.0                  # 0 → 1: sliding in (and back out when closing)
@@ -166,6 +175,10 @@ class QuickMenu(QWidget):
         self._tick = QTimer(self)                        # the clock and the session time
         self._tick.setInterval(15_000)
         self._tick.timeout.connect(self._refresh)
+        self._friends_tick = QTimer(self)                # friends' status while the friends list is open
+        self._friends_tick.setInterval(30_000)
+        self._friends_tick.timeout.connect(lambda: self._load_friends() if self.view in ("friends", "friend")
+                                           and self.isVisible() else self._friends_tick.stop())
 
     # ================================================================= open / close
     def open_for(self, game) -> None:
@@ -178,9 +191,12 @@ class QuickMenu(QWidget):
         self._confirm_quit = 0.0
         self.volume = None
         self.session = None
+        self.friend = None
+        self._row_top = 0
         self._build()
         self.focus = self._first()
         self._refresh()
+        self._load_friends()
         screen = self.couch._target_screen or self.couch.screen() or QApplication.primaryScreen()
         if self.windowHandle() is None:
             self.create()
@@ -223,6 +239,7 @@ class QuickMenu(QWidget):
             return
         self._art.stop()
         self._tick.stop()
+        self._friends_tick.stop()
         self.wc.keep_above(False)
         self.hide()
         then, self._closing_then = self._closing_then, None
@@ -263,6 +280,12 @@ class QuickMenu(QWidget):
         return e is not None and e.id in self.couch.suspended
 
     def _build(self) -> None:
+        if self.view in ("friends", "friend"):
+            self.rows = self._friends_rows() if self.view == "friends" else self._friend_rows()
+            self.focus = min(self.focus, max(0, len(self.rows) - 1))
+            if self.rows and not self.rows[self.focus].focusable:
+                self.focus = self._first()
+            return
         if self.view in ("confirm", "starting"):
             self.rows = self._target_rows()
             self.focus = min(self.focus, max(0, len(self.rows) - 1))
@@ -280,6 +303,7 @@ class QuickMenu(QWidget):
                             action=self.open_switch))
             rows.append(Row("couch", "Go to couch mode", "Suspends the game while you look around",
                             action=self.to_couch))
+            rows.append(self._friends_row())
             if self.volume is not None:
                 rows.append(Row("volume", "Game volume", "", "choice", f"{self.volume} %",
                                 action=lambda: self._step_volume(VOLUME_STEP),
@@ -304,10 +328,98 @@ class QuickMenu(QWidget):
         if g is None:
             rows.append(Row("couch", "Back to couch mode", "", "primary" if not others else "row",
                             action=lambda: self.close_menu(self.couch._come_back)))
+            rows.append(self._friends_row())
         self.rows = rows
         self.focus = min(self.focus, max(0, len(rows) - 1))
         if rows and not rows[self.focus].focusable:
             self.focus = self._first()
+
+    # ----------------------------------------------------------------- Steam friends
+    def _friends_row(self) -> Row:
+        from ezgd.ui.couch_friends import summary
+        return Row("friends", "Friends", self.friends_error or summary(self.friends), action=self.open_friends)
+
+    def _load_friends(self, force: bool = False) -> None:
+        b = self.couch.bridge
+
+        def got(data: dict) -> None:
+            self.friends, self.friends_error = data, ""
+            if self.friend is not None:                  # (the friend view keeps showing the fresh status)
+                self.friend = next((f for f in data.get("friends") or [] if f["steamid"] == self.friend["steamid"]),
+                                   self.friend)
+            self._build()
+            self.update()
+
+        def failed(err) -> None:
+            self.friends_error = str(err)
+            self._build()
+            self.update()
+        b.call(b.core.steam_friends(force), got, failed, owner=self)
+
+    def open_friends(self) -> None:
+        self.view = "friends"
+        self.friend = None
+        self.focus = 0
+        self._row_top = 0
+        self._build()
+        self.focus = self._first()
+        self._load_friends()
+        self._friends_tick.start()
+        self.update()
+
+    def _friends_rows(self) -> list[Row]:
+        d = self.friends or {}
+        rows: list[Row] = []
+        note = self.friends_error or d.get("error") or ("Your friends list is private on Steam — showing the friends "
+                                                        "Steam keeps here" if d.get("private") else "")
+        if note:
+            rows.append(Row("h-note", note, kind="header", extra={"note": True}))
+        if self.friends is None and not self.friends_error:
+            rows.append(Row("h-wait", "Asking Steam…", kind="header", extra={"note": True}))
+        for k, f in enumerate(d.get("friends") or []):
+            rows.append(Row(f"friend-{k}", f.get("name", ""), f.get("status") or "", "friend",
+                            action=lambda f=f: self.open_friend(f), extra={"friend": f}))
+        return rows
+
+    def open_friend(self, f: dict) -> None:
+        self.friend = f
+        self.view = "friend"
+        self.focus = 0
+        self._row_top = 0
+        self._build()
+        self.update()
+
+    def _friend_rows(self) -> list[Row]:
+        from ezgd.ui.couch_friends import actions
+        f = self.friend or {}
+        return [Row(f"fa-{a}", label, note, "primary" if a == "chat" else "row",
+                    action=lambda a=a: self.friend_action(a)) for a, label, note in actions(f)]
+
+    def friend_action(self, action: str) -> None:
+        """Chat / profile: Steam's window comes up over the game (which keeps running). Join / play their game:
+        the game being played is suspended first, like switching games."""
+        from ezgd.ui.couch_friends import open_action
+        f = self.friend
+        if f is None or self.busy:
+            return
+        if action in ("join", "launch"):
+            self._then_suspend(lambda: self.close_menu(lambda: open_action(self.couch, action, f)))
+        else:
+            self.close_menu(lambda: open_action(self.couch, action, f))
+
+    def _back_from_friends(self) -> None:
+        if self.view == "friend":
+            keep = self.friend
+            self.view = "friends"
+            self._build()
+            self.focus = next((k for k, r in enumerate(self.rows) if r.extra.get("friend") is not None and keep and
+                               r.extra["friend"].get("steamid") == keep.get("steamid")), self._first())
+        else:
+            self.view = "main"
+            self._friends_tick.stop()
+            self._row_top = 0
+            self._build()
+            self.focus = next((k for k, r in enumerate(self.rows) if r.key == "friends"), self._first())
 
     def _target_rows(self) -> list[Row]:
         e, g = self.target, self.game
@@ -542,6 +654,8 @@ class QuickMenu(QWidget):
         before = (self.view, self.focus, self.grid_focus)
         if self.view == "switch":
             self._grid_command(name)
+        elif self.view in ("friends", "friend") and name in ("b", "start"):
+            self._back_from_friends()
         elif self.view in ("confirm", "starting") and name == "b":
             if self.view == "confirm":
                 self._cancel_confirm()
@@ -627,7 +741,7 @@ class QuickMenu(QWidget):
         if h is None:
             return
         kind, idx = h
-        if kind == "row" and idx != self.focus and self.view == "main":
+        if kind == "row" and idx != self.focus and self.view in ("main", "friends", "friend"):
             self.focus = idx
             self.couch.sounds.play("move")
             self.update()
@@ -726,6 +840,11 @@ class QuickMenu(QWidget):
         elif self.view in ("confirm", "starting") and self.target is not None:
             y = self._paint_now_playing(p, inner, y + 18 * s, self.target)
             self._paint_target_text(p, inner, y + 22 * s)
+        elif self.view == "friend" and self.friend is not None:
+            y = self._paint_friend_card(p, inner, y + 18 * s)
+            self._paint_rows(p, inner, y + 24 * s)
+        elif self.view == "friends":
+            self._paint_rows(p, inner, y + 14 * s)
         else:
             if self.game is not None:                     # (the card gives way when the rows need the room)
                 room = self.height() - 96 * s - (y + 18 * s + 24 * s) - self._rows_height()
@@ -753,8 +872,8 @@ class QuickMenu(QWidget):
         p.setFont(self.couch._font(15 * s, 800))
         p.setPen(QColor(255, 255, 255, 120))
         p.drawText(QRectF(r.left(), y + 38 * s, r.width(), 22 * s), Qt.AlignLeft | Qt.AlignVCenter,
-                   {"switch": "SWITCH GAME", "confirm": "SWITCH GAME", "starting": "STARTING"}.get(self.view,
-                                                                                               "QUICK MENU"))
+                   {"switch": "SWITCH GAME", "confirm": "SWITCH GAME", "starting": "STARTING", "friends": "FRIENDS",
+                    "friend": "FRIENDS"}.get(self.view, "QUICK MENU"))
         return y + 66 * s
 
     def _paint_target_text(self, p: QPainter, r: QRectF, y: float) -> None:
@@ -847,7 +966,28 @@ class QuickMenu(QWidget):
         return card.bottom()
 
     def _row_height(self, row: Row) -> float:
-        return (44 if row.kind == "header" else (92 if row.kind == "game" else 78 if row.note else 62) + 10) * self._s()
+        if row.kind == "header" and row.extra.get("note"):
+            return 64 * self._s()
+        return (44 if row.kind == "header" else (92 if row.kind in ("game", "friend") else 78 if row.note else 62) + 10
+                ) * self._s()
+
+    def _paint_friend_card(self, p: QPainter, r: QRectF, y: float) -> float:
+        """The friend view's top: their picture, name and what they are doing."""
+        from ezgd.ui.couch_friends import paint_avatar, state_color
+        s, f = self._s(), self.friend
+        a = 116 * s
+        if not paint_avatar(p, self.couch, f, QRectF(r.left() + 4 * s, y + 4 * s, a, a), s):
+            self._pending_art = True
+        x = r.left() + a + 30 * s
+        p.setFont(self.couch._font(30 * s, 900))
+        p.setPen(QColor("white"))
+        p.drawText(QRectF(x, y + 16 * s, r.right() - x, 44 * s), Qt.AlignLeft | Qt.AlignVCenter,
+                   QFontMetrics(p.font()).elidedText(f.get("name", ""), Qt.ElideRight, int(r.right() - x)))
+        p.setFont(self.couch._font(18 * s, 700))
+        p.setPen(state_color(f))
+        p.drawText(QRectF(x, y + 64 * s, r.right() - x, 30 * s), Qt.AlignLeft | Qt.AlignVCenter,
+                   QFontMetrics(p.font()).elidedText(f.get("status") or "", Qt.ElideRight, int(r.right() - x)))
+        return y + a + 12 * s
 
     def _rows_height(self) -> float:
         return sum(self._row_height(row) for row in self.rows)
@@ -855,7 +995,22 @@ class QuickMenu(QWidget):
     def _paint_rows(self, p: QPainter, r: QRectF, y: float) -> None:
         s = self._s()
         bottom = self.height() - 96 * s + 0.5              # (+ rounding)
+        # a list longer than the panel (friends): it starts at the row that keeps the focus in view
+        heights = [self._row_height(row) for row in self.rows]
+        top = min(getattr(self, "_row_top", 0), self.focus) if self.focus < len(self.rows) else 0
+        while top < self.focus and y + sum(heights[top:self.focus + 1]) - 10 * s > bottom:
+            top += 1
+        self._row_top = top if y + sum(heights) - 10 * s > bottom else 0
         for k, row in enumerate(self.rows):
+            if k < self._row_top:
+                continue
+            if row.kind == "header" and row.extra.get("note"):
+                p.setFont(self.couch._font(16 * s, 700))
+                p.setPen(QColor(theme.CURRENT.warning))
+                p.drawText(QRectF(r.left() + 4 * s, y + 4 * s, r.width(), 50 * s),
+                           Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap, row.label)
+                y += self._row_height(row)
+                continue
             if row.kind == "header":
                 nxt = self.rows[k + 1] if k + 1 < len(self.rows) else None
                 if nxt is None or y + self._row_height(row) + self._row_height(nxt) - 10 * s > bottom:
@@ -907,6 +1062,12 @@ class QuickMenu(QWidget):
             p.fillPath(ip, QColor(0, 0, 0, 34) if light else QColor(255, 255, 255, 30 if kind_color is None else 44))
             draw_icon(p, row.key, ir.adjusted(9 * s, 9 * s, -9 * s, -9 * s), fg, s)
             x = ir.right() + 18 * s
+        if row.kind == "friend":
+            from ezgd.ui.couch_friends import paint_avatar
+            d = r.height() - 22 * s
+            if not paint_avatar(p, self.couch, row.extra["friend"], QRectF(x - 6 * s, r.top() + 11 * s, d, d), s):
+                self._pending_art = True
+            x = x - 6 * s + d + 18 * s
         if row.kind == "game" and row.entry is not None:
             th = r.height() - 16 * s
             tw = th * 2 / 3
@@ -960,7 +1121,11 @@ class QuickMenu(QWidget):
             p.drawText(QRectF(x, r.top() + r.height() / 2 - 30 * s, inner_w, 30 * s), Qt.AlignLeft | Qt.AlignVCenter,
                        QFontMetrics(p.font()).elidedText(row.label, Qt.ElideRight, int(inner_w)))
             p.setFont(self.couch._font(15 * s, 600))
-            p.setPen(sub)
+            if row.kind == "friend" and not light:
+                from ezgd.ui.couch_friends import state_color
+                p.setPen(state_color(row.extra["friend"]))
+            else:
+                p.setPen(sub)
             p.drawText(QRectF(x, r.top() + r.height() / 2 + 2 * s, inner_w, 26 * s), Qt.AlignLeft | Qt.AlignVCenter,
                        QFontMetrics(p.font()).elidedText(row.note, Qt.ElideRight, int(inner_w)))
         else:
@@ -1073,6 +1238,9 @@ class QuickMenu(QWidget):
             hints = [("a", "Select"), ("b", "Back")]
         elif self.view == "starting":
             hints = [] if not self.start_error else [("a", "Select")]
+        elif self.view in ("friends", "friend"):
+            hints = ([("a", "Options")] if self.view == "friends" and any(r.kind == "friend" for r in self.rows) else
+                     [("a", "Select")] if self.view == "friend" else []) + [("b", "Back")]
         else:
             row = self.rows[self.focus] if 0 <= self.focus < len(self.rows) else None
             hints = [("a", "Select")]

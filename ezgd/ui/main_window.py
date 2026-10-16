@@ -610,6 +610,10 @@ class MainWindow(QMainWindow):
         log.info("couch mode opens from the desktop window: %dx%d%s on %s", self.width(), self.height(),
                  " (maximized)" if self.isMaximized() else " (full screen)" if self.isFullScreen() else "",
                  screen.name() if screen is not None else "?")
+        # how the desktop window was, so it comes back that way (a friend's KDE gave it couch mode's full-screen
+        # size when it came back: no title bar, over the taskbar)
+        self._before_couch = (self.normalGeometry().size() if self.isMaximized() or self.isFullScreen()
+                              else self.size(), self.isMaximized(), self.isFullScreen())
         try:
             couch.open(screen)
             self.hide()
@@ -728,10 +732,38 @@ class MainWindow(QMainWindow):
             self.raise_()
             self.activateWindow()
             self._reload_library()
+            for ms in (300, 1200):                       # (the window manager answers a moment after showing)
+                QTimer.singleShot(ms, self, lambda last=ms == 1200: self._check_after_couch(last))
         QApplication.instance().setQuitOnLastWindowClosed(True)
         self._watch_quick_button()
         from ezgd.ui import gcguard                        # couch mode's pictures (hundreds of MB) go back now
         QTimer.singleShot(1500, self, gcguard.release)
+
+    def _check_after_couch(self, last: bool) -> None:
+        """Back from couch mode: the desktop window as it was before — not full screen, not covering the whole
+        screen (some window managers hand it the size couch mode had), maximized if it was."""
+        saved = getattr(self, "_before_couch", None)
+        if saved is None or not self.isVisible() or self.couch is not None:
+            return
+        size, was_max, was_fs = saved
+        screen = self.screen()
+        full = screen.geometry() if screen is not None else None
+        covers = full is not None and self.width() >= full.width() * 0.97 and self.height() >= full.height() * 0.97
+        wrong = not was_fs and (self.isFullScreen() or (covers and not was_max))
+        log.info("desktop window back from couch mode: %dx%d%s (before: %dx%d%s)%s", self.width(), self.height(),
+                 " full screen" if self.isFullScreen() else " maximized" if self.isMaximized() else "",
+                 size.width(), size.height(), " maximized" if was_max else " full screen" if was_fs else "",
+                 " — putting it back" if wrong else "")
+        if wrong:
+            self.showNormal()
+            if was_max:
+                self.showMaximized()
+            else:
+                self.resize(size)
+            from ezgd.ui.window_control import restore_desktop_window
+            restore_desktop_window(self.windowTitle(), size.width(), size.height(), was_max)
+        if last or not wrong:
+            self._before_couch = None if last else saved
 
     def _launch_requested(self, entry_id: int) -> None:
         """The user starts a game: it is not the one couch mode was left to close (that one was still starting)."""

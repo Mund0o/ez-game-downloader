@@ -91,6 +91,84 @@ STEAM_GUARD_SCRIPT = """
 """
 
 
+STEAM_SHOW_SCRIPT = """
+(function () {
+    var hint = %(hint)s, main = %(main)s, best = null;
+    var list = workspace.windowList ? workspace.windowList() : workspace.clientList();
+    for (var i = 0; i < list.length; i++) {
+        var w = list[i], cls = String(w.resourceClass).toLowerCase(), name = String(w.resourceName).toLowerCase();
+        if (!(cls === "steam" || cls === "steamwebhelper" || name === "steamwebhelper") || !w.normalWindow) continue;
+        var cap = String(w.caption).toLowerCase();
+        if (cap.indexOf("big picture") !== -1) continue;
+        if (hint && cap.indexOf(hint) !== -1) { best = w; break; }
+        if (best === null && (cap.indexOf("friends") !== -1 || cap.indexOf("chat") !== -1 || (main && cap === "steam")))
+            best = w;
+    }
+    if (best !== null) {
+        if (best.minimized) best.minimized = false;
+        if (workspace.activeWindow !== undefined) workspace.activeWindow = best; else workspace.activeClient = best;
+    }
+})();
+"""
+
+DESKTOP_RESTORE_SCRIPT = """
+(function () {
+    var pid = %(pid)d, title = %(title)s, max = %(max)s, cw = %(w)d, ch = %(h)d;
+    var list = workspace.windowList ? workspace.windowList() : workspace.clientList();
+    for (var i = 0; i < list.length; i++) {
+        var w = list[i];
+        if (w.pid !== pid || String(w.caption) !== title) continue;
+        if (w.fullScreen) w.fullScreen = false;
+        if (w.noBorder) w.noBorder = false;
+        if (max) { w.setMaximize(true, true); continue; }
+        if (w.maximizeMode !== undefined && w.maximizeMode !== 0) w.setMaximize(false, false);
+        var a = workspace.clientArea(KWin.PlacementArea, w);
+        var ww = Math.min(cw, a.width), hh = Math.min(ch, a.height);
+        w.frameGeometry = {x: a.x + Math.round((a.width - ww) / 2), y: a.y + Math.round((a.height - hh) / 2),
+                           width: ww, height: hh};
+    }
+})();
+"""
+
+
+def restore_desktop_window(title: str, width: int, height: int, maximized: bool) -> bool:
+    """The desktop window back the way it was before couch mode (its title is exactly ``title``): out of full screen,
+    with its title bar, maximized again or its old size, centred. False without KWin."""
+    if not WindowControl._kwin_available():
+        return False
+    import json
+    return _run_kwin(DESKTOP_RESTORE_SCRIPT % {"pid": os.getpid(), "title": json.dumps(title), "max": "true" if
+                                              maximized else "false", "w": int(width), "h": int(height)},
+                     "desktop window back to its size")
+
+
+_guards: list[str] = []                 # the running guard_steam scripts (by name), so they can be called off
+
+
+def release_steam_guard() -> None:
+    """Call off guard_steam: a Steam window is wanted now (a friend's chat opened from the quick menu)."""
+    names, _guards[:] = list(_guards), []
+    for name in names:
+        try:
+            from PySide6.QtDBus import QDBus, QDBusConnection, QDBusMessage
+            msg = QDBusMessage.createMethodCall("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "unloadScript")
+            msg.setArguments([name])
+            QDBusConnection.sessionBus().call(msg, QDBus.Block, 1500)
+        except Exception:
+            pass
+
+
+def show_steam_window(hint: str = "", main: bool = False) -> bool:
+    """Bring Steam's chat window up (the one whose title has ``hint`` — a friend's name — else Steam's friends / chat
+    window; ``main``: Steam's main window too, e.g. for a profile). Only Steam's own client windows. False without
+    KWin."""
+    if not WindowControl._kwin_available():
+        return False
+    import json
+    return _run_kwin(STEAM_SHOW_SCRIPT % {"hint": json.dumps((hint or "").lower()), "main": "true" if main else "false"},
+                     "show Steam's window")
+
+
 def guard_steam(ms: int = 3000) -> bool:
     """The guide button was pressed: for the next ``ms``, the moment Steam answers it with a window of its own
     (Steam Input), KWin puts it away — Big Picture closed, Steam's window minimized — and gives the screen straight
@@ -98,7 +176,8 @@ def guard_steam(ms: int = 3000) -> bool:
     polling). Only Steam's client windows; never a game. False without KWin."""
     if not WindowControl._kwin_available():
         return False
-    return _run_kwin(STEAM_GUARD_SCRIPT % {"ms": int(ms)}, "guard against Steam's window", keep_ms=ms + 500)
+    return _run_kwin(STEAM_GUARD_SCRIPT % {"ms": int(ms)}, "guard against Steam's window", keep_ms=ms + 500,
+                     names=_guards)
 
 
 def hide_steam_windows(only_active: bool = True) -> bool:
@@ -270,9 +349,10 @@ class WindowControl:
 _kwin_n = 0
 
 
-def _run_kwin(script: str, what: str, keep_ms: int = 0) -> bool:
+def _run_kwin(script: str, what: str, keep_ms: int = 0, names: list | None = None) -> bool:
     """Load, run and unload a one-shot KWin script (over D-Bus, never waiting more than 1.5 s per call).
-    ``keep_ms``: the script keeps listening (to KWin's signals) that long before it is unloaded."""
+    ``keep_ms``: the script keeps listening (to KWin's signals) that long before it is unloaded (``names`` gets its
+    name meanwhile, so it can be unloaded sooner)."""
     global _kwin_n
     _kwin_n += 1
     name = f"ezgd-couch-{os.getpid()}-{_kwin_n}"
@@ -297,10 +377,16 @@ def _run_kwin(script: str, what: str, keep_ms: int = 0) -> bool:
             from PySide6.QtCore import QTimer
 
             def unload() -> None:
+                if names is not None:
+                    if name not in names:
+                        return                      # (called off already)
+                    names.remove(name)
                 try:
                     call("/Scripting", "org.kde.kwin.Scripting", "unloadScript", name)
                 except Exception:
                     pass
+            if names is not None:
+                names.append(name)
             QTimer.singleShot(keep_ms, unload)
         else:
             call("/Scripting", "org.kde.kwin.Scripting", "unloadScript", name)

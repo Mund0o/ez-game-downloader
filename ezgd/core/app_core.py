@@ -170,6 +170,7 @@ class AppCore:
                 log.exception("torrent engine failed to start")
 
         self.library = LibraryManager(self.library_repo, self.games, self.settings, self.paths, self.emit)
+        self._friends_cache: tuple[str, dict] | None = None     # (key, steam_friends answer)
         self.post = PostProcessor(self.library_repo, self.extraction_repo, self.games, self.settings, self.emit,
                                   created=self.created_paths)
         self.post.choose_executable = self.library.auto_executable
@@ -2302,6 +2303,34 @@ class AppCore:
         for r in res:
             r["wishlisted"] = r["appid"] in keys["apps"]
         return res
+
+    # ------------------------------------------------------------ Steam friends (quick menu, couch mode)
+    FRIENDS_TTL = 25.0                       # seconds a fetched friends list is reused (both views ask often)
+
+    async def steam_friends(self, force: bool = False) -> dict:
+        """Steam friends with their live status (see platform.steamfriends)."""
+        from ezgd.platform import steamfriends
+        key = self.settings.settings.steam_web_api_key
+        cached = self._friends_cache
+        if cached is not None and not force and cached[0] == key and time.time() - cached[1]["at"] < self.FRIENDS_TTL:
+            return cached[1]
+        try:
+            data = await steamfriends.load(self.client, self.library.steam_root(), key)
+        except steamfriends.FriendsError as exc:
+            raise RuntimeError(str(exc)) from None
+        self._friends_cache = (key, data)
+        return data
+
+    async def steam_friend_open(self, action: str, friend: dict) -> str:
+        """chat | join | launch | profile: hand the friend's Steam link to Steam."""
+        from ezgd.platform import steam as steam_mod, steamfriends
+        url = {"chat": lambda f: steamfriends.chat_url(f["steamid"]), "profile": lambda f: steamfriends.profile_url(
+            f["steamid"]), "join": steamfriends.join_url, "launch": steamfriends.launch_url}[action](friend)
+        if not url:
+            raise RuntimeError("Nothing to join right now." if action == "join" else "Steam has no game to start.")
+        await asyncio.to_thread(steam_mod.open_steam_url, url)
+        log.info("Steam friends: %s %s", action, friend.get("name", ""))
+        return url
 
     async def wishlist_add(self, steam_app_id: int | None = None, title: str | None = None,
                            game_id: str | None = None) -> dict:

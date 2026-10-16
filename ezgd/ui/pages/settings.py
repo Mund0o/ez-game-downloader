@@ -404,6 +404,7 @@ class SettingsPage(QWidget):
         steam_root.editingFinished.connect(lambda: self._save("steam_root", steam_root.text().strip()))
         f.addRow("Steam folder", folder_row(steam_root, self, "Steam folder"))
         self.widgets["steam_root"] = steam_root
+        self._steam_friends_row(f)
         self.env_label = label("", "small", wrap=True)
         f.addRow("", self.env_label)
         grow = QHBoxLayout()
@@ -599,6 +600,50 @@ class SettingsPage(QWidget):
             self._loading = False
         if info:
             self.refresh_info()
+
+    # ----------------------------------------------------------- Steam friends
+    def _steam_friends_row(self, f: QFormLayout) -> None:
+        """The user's own Steam Web API key: friends' live status in the quick menu and couch mode's Friends tab."""
+        from ezgd.platform.steamfriends import KEY_PAGE
+        key = QLineEdit()
+        key.setEchoMode(QLineEdit.Password)
+        key.setPlaceholderText("Your Steam Web API key")
+        key.editingFinished.connect(lambda: (self._save("steam_web_api_key", key.text().strip()),
+                                             self._check_friends()))
+        self.widgets["steam_web_api_key"] = key
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(key, 1)
+        from ezgd.ui.dialogs.misc import open_url
+        row.addWidget(button("Get a key", "external", "ghost", tooltip=KEY_PAGE, on_click=lambda: open_url(KEY_PAGE)))
+        row.addWidget(button("Check", "refresh", "ghost", on_click=self._check_friends))
+        w = QWidget()
+        w.setLayout(row)
+        f.addRow("Steam friends", w)
+        self.friends_info = label("Who is online and what they play — in the quick menu and couch mode's Friends tab. "
+                                  "Steam gives every account one key: sign in at steamcommunity.com/dev/apikey, enter "
+                                  "any domain name (e.g. localhost) and paste the key here. It stays on this computer "
+                                  "and is only sent to Steam.", "small", wrap=True)
+        f.addRow("", self.friends_info)
+
+    def _check_friends(self) -> None:
+        if self._loading:
+            return
+        self.friends_info.setText("Asking Steam…")
+
+        def got(d: dict) -> None:
+            fr = d.get("friends") or []
+            if d.get("live"):
+                online = sum(1 for x in fr if x.get("state") not in ("offline", "unknown"))
+                text = f"Working: {len(fr)} friends, {online} online now."
+                if d.get("private"):
+                    text += " (Your friends list is private on Steam: the friends Steam keeps here are used.)"
+            else:
+                text = d.get("error") or "No live status."
+            self.friends_info.setText(text)
+
+        self.bridge.call(self.bridge.core.steam_friends(True), got,
+                         lambda e: self.friends_info.setText(str(e)), owner=self)
 
     # ----------------------------------------------------------- app updates
     def _save_repo(self) -> None:

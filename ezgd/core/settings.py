@@ -75,6 +75,7 @@ class Settings:
     steam_overlay: bool = True                   # load Steam's overlay into games (friends list only)
     proton_version: str = ""                     # "" = newest detected
     steam_root: str = ""                         # "" = auto-detect
+    steam_web_api_key: str = ""                  # the user's own key: friends' live status (never logged)
     check_game_updates: bool = True              # re-check installed games' pages for newer versions (every 6 h)
     auto_update_games: bool = False              # download and install new versions by themselves
     auto_backup_saves: bool = True               # back up saves after playing and before updates/uninstalls

@@ -123,7 +123,8 @@ def _running(win, core, tmp_path, qtbot, name):
     e = _install(core.library, tmp_path, name)
     win.bridge.run_sync(core.library_call("launch", e.id, True))
     win._reload_library()
-    qtbot.waitUntil(lambda: e.id in win.pages["library"].running, timeout=5000)
+    qtbot.waitUntil(lambda: e.id in win.pages["library"].running and e.id in win.pages["library"].entries,
+                    timeout=5000)                         # (running comes from an event, the entries from a reload)
     return e
 
 

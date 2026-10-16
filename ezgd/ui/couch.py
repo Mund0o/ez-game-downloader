@@ -42,8 +42,8 @@ from ezgd.ui.widgets.common import ToastHost, relative_time
 
 log = logging.getLogger(__name__)
 
-TABS = ["Home", "Library", "Store", "Wishlist", "Downloads", "Settings"]
-T_HOME, T_LIBRARY, T_STORE, T_WISHLIST, T_DOWNLOADS, T_SETTINGS = range(len(TABS))
+TABS = ["Home", "Library", "Store", "Wishlist", "Friends", "Downloads", "Settings"]
+T_HOME, T_LIBRARY, T_STORE, T_WISHLIST, T_FRIENDS, T_DOWNLOADS, T_SETTINGS = range(len(TABS))
 X_INDEX = len(TABS)                       # the ✕ is the last item of the top bar
 STATUS_TEXT = {"downloaded": "Not installed yet", "extracting": "Installing", "extracted": "Needs setup",
                "installed": "Ready to play", "broken": "Files missing"}
@@ -553,7 +553,9 @@ class _Couch:
         self._poll.timeout.connect(self._poll_downloads)
         self._poll.start()
 
-        self.pages = {T_STORE: StorePage(self), T_WISHLIST: WishlistPage(self), T_SETTINGS: SettingsPage(self)}
+        from ezgd.ui.couch_friends import FriendsPage
+        self.pages = {T_STORE: StorePage(self), T_WISHLIST: WishlistPage(self), T_FRIENDS: FriendsPage(self),
+                      T_SETTINGS: SettingsPage(self)}
         from ezgd.ui.couch_sounds import CouchSounds
         self.sounds = CouchSounds(self, lambda: bool(self.actions.settings.get("couch_sounds", True)),
                                   lambda: int(self.actions.settings.get("couch_sounds_volume", 15)) / 100)
@@ -1092,6 +1094,11 @@ class _Couch:
         screen = next((x for x in screens if x.name() == name), None) or getattr(self, "_target_screen", None) \
             or self.screen() or QApplication.primaryScreen()
         mode = st.get("couch_window") or "fullscreen"
+        if mode == "borderless" and on_wayland():
+            # Wayland's full screen *is* a borderless window over the whole monitor — and the only kind the window
+            # manager always sizes to it: on a friend's KDE a borderless window kept the desktop window's size
+            # (KWin answered 1811×1075 and ignored every request to fill the screen), full screen filled it
+            mode = "fullscreen"
         geo = QRect(screen.geometry())
         px = self.custom_pixels() if mode == "custom" else None
         if px is not None:
