@@ -124,7 +124,7 @@ class Row:
 
     @property
     def focusable(self) -> bool:
-        return self.kind != "header"
+        return self.kind not in ("header", "msg")
 
 
 class QuickMenu(QWidget):
@@ -153,6 +153,11 @@ class QuickMenu(QWidget):
         self.friends: dict | None = None   # Steam friends (core.steam_friends), asked for when the menu opens
         self.friends_error = ""
         self.friend: dict | None = None    # friend view: the friend chosen
+        self.chats: dict | None = None     # our overlay: Steam's chats through the client bridge (core.steam_chats)
+        self.chat_msgs: list[dict] = []    # chat view: the conversation with self.friend
+        self.keyboard = None               # chat view: the on-screen keyboard while writing
+        self.flash = ""                    # a short note at the bottom ("Invite sent")
+        self._flash_until = 0.0
         self._row_top = 0                  # long lists: the first row shown
         self._confirm_quit = 0.0           # Quit pressed once: press again before this time
         self._hits: list[tuple[QRectF, str, int]] = []
@@ -176,6 +181,9 @@ class QuickMenu(QWidget):
         self._tick = QTimer(self)                        # the clock and the session time
         self._tick.setInterval(15_000)
         self._tick.timeout.connect(self._refresh)
+        self._chat_tick = QTimer(self)                   # our overlay: new messages / invites while the menu is open
+        self._chat_tick.setInterval(3000)
+        self._chat_tick.timeout.connect(lambda: self._load_chats() if self.isVisible() else self._chat_tick.stop())
         self._friends_tick = QTimer(self)                # friends' status while the friends list is open
         self._friends_tick.setInterval(30_000)
         self._friends_tick.timeout.connect(lambda: self._load_friends() if self.view in ("friends", "friend")
@@ -199,6 +207,10 @@ class QuickMenu(QWidget):
         self.focus = self._first()
         self._refresh()
         self._load_friends()
+        self.keyboard = None
+        self._load_chats()
+        if self._own_overlay():
+            self._chat_tick.start()
         screen = self.couch._target_screen or self.couch.screen() or QApplication.primaryScreen()
         if self.windowHandle() is None:
             self.create()
@@ -254,6 +266,8 @@ class QuickMenu(QWidget):
         self._art.stop()
         self._tick.stop()
         self._friends_tick.stop()
+        self._chat_tick.stop()
+        self.keyboard = None
         self.wc.keep_above(False)
         self.hide()
         then, self._closing_then = self._closing_then, None
@@ -294,6 +308,12 @@ class QuickMenu(QWidget):
         return e is not None and e.id in self.couch.suspended
 
     def _build(self) -> None:
+        if self.view == "chat":
+            self.rows = self._chat_rows()
+            self.focus = min(self.focus, max(0, len(self.rows) - 1))
+            if self.rows and not self.rows[self.focus].focusable:
+                self.focus = len(self.rows) - 1
+            return
         if self.view in ("friends", "friend"):
             self.rows = self._friends_rows() if self.view == "friends" else self._friend_rows()
             self.focus = min(self.focus, max(0, len(self.rows) - 1))
@@ -309,6 +329,7 @@ class QuickMenu(QWidget):
         rows: list[Row] = []
         g = self.game
         others = [e for e in self.couch.entries if e.id in self.couch.suspended and (g is None or e.id != g.id)]
+        rows += self._invite_rows()
         if g is not None:
             if self._steam_tip:
                 guide = self.couch._pad_labels("steam")["home"]
@@ -355,7 +376,180 @@ class QuickMenu(QWidget):
     # ----------------------------------------------------------------- Steam friends
     def _friends_row(self) -> Row:
         from ezgd.ui.couch_friends import summary
-        return Row("friends", "Friends", self.friends_error or summary(self.friends), action=self.open_friends)
+        note = self.friends_error or summary(self.friends)
+        unread = sum(c.get("unread") or 0 for c in (self.chats or {}).get("chats") or [])
+        if unread:
+            note = f"{unread} new message{'s' if unread != 1 else ''} · {note}"
+        return Row("friends", "Friends", note, action=self.open_friends)
+
+    # ----------------------------------------------------------------- our overlay: Steam chats through the client
+    def _own_overlay(self) -> bool:
+        return bool(self.couch.actions.settings.get("own_overlay", False))
+
+    def _bridged(self) -> bool:
+        """Our overlay is on and the Steam client answers: chats, invites and joining go through it."""
+        return self._own_overlay() and self.chats is not None
+
+    def _load_chats(self) -> None:
+        if not self._own_overlay():
+            self.chats = None
+            return
+        b = self.couch.bridge
+
+        def got(data: dict) -> None:
+            before = self._chat_signature()
+            self.chats = data
+            if self.view == "chat" and self.friend is not None:
+                acct = self._acct(self.friend)
+                c = next((c for c in data.get("chats") or [] if c.get("accountid") == acct), None)
+                if c is not None and (c.get("unread") or c.get("time", 0) > (self.chat_msgs[-1]["time"] if
+                                                                            self.chat_msgs else 0)):
+                    self._load_history()
+            if self._chat_signature() != before and self.view in ("main", "friends", "friend"):
+                self._build()
+            self.update()
+
+        def failed(_err) -> None:
+            self.chats = None
+        b.call(b.core.steam_chats(), got, failed, owner=self)
+
+    def _chat_signature(self) -> tuple:
+        return tuple((c.get("accountid"), c.get("unread"), bool(c.get("invite"))) for c in
+                     (self.chats or {}).get("chats") or [])
+
+    @staticmethod
+    def _acct(f: dict) -> int:
+        from ezgd.platform.steamfriends import to_account_id
+        return int(f.get("accountid") or to_account_id(f["steamid"]))
+
+    def _chat_of(self, f: dict) -> dict | None:
+        acct = self._acct(f)
+        return next((c for c in (self.chats or {}).get("chats") or [] if c.get("accountid") == acct), None)
+
+    def _name_of(self, acct: int) -> str:
+        from ezgd.platform.steamfriends import to_steamid64
+        sid = to_steamid64(acct)
+        f = next((f for f in (self.friends or {}).get("friends") or [] if f.get("steamid") == sid), None)
+        c = next((c for c in (self.chats or {}).get("chats") or [] if c.get("accountid") == acct), None)
+        return (f or {}).get("name") or (c or {}).get("name") or "A friend"
+
+    def _invite_rows(self) -> list[Row]:
+        """An invite a friend sent you (their last message, unread or from the last 15 minutes): one press joins."""
+        if not self._bridged():
+            return []
+        out = []
+        from ezgd.platform import steambridge
+        now = time.time()
+        for c in (self.chats or {}).get("chats") or []:
+            inv = c.get("invite")
+            if not inv or not (c.get("unread") or now - (c.get("time") or 0) < 15 * 60):
+                continue
+            name = self._name_of(c["accountid"])
+            from ezgd.platform.steamfriends import to_steamid64
+            url = steambridge.join_url(inv, to_steamid64(c["accountid"]))
+            out.append(Row(f"inv-{c['accountid']}", f"Join {name}", f"{name} invited you to play — A joins",
+                           "primary", action=lambda u=url, n=name: self._join(u, n)))
+        return out
+
+    def _join(self, url: str, name: str) -> None:
+        """Join a friend's game through Steam (no window): the game being played is suspended first."""
+        b = self.couch.bridge
+
+        def go() -> None:
+            b.call(b.core.steam_open(url), lambda _r: None,
+                   lambda e: self.couch.actions.toasts.show("Could not join", str(e), "warning"), owner=self.couch)
+        log.info("our overlay: joining %s", name)
+        if self.game is not None and self.game.id in self.couch.running and not self._suspended(self.game):
+            self._then_suspend(lambda: self.close_menu(go))
+        else:
+            self.close_menu(go)
+
+    def _flash_note(self, text: str) -> None:
+        self.flash, self._flash_until = text, time.monotonic() + 3.0
+        QTimer.singleShot(3100, self, self.update)
+        self.update()
+
+    def open_chat(self, f: dict) -> None:
+        self.friend = f
+        self.view = "chat"
+        self.chat_msgs = []
+        self._row_top = 0
+        self._build()
+        self.focus = len(self.rows) - 1
+        self._load_history()
+        self.update()
+
+    def _load_history(self) -> None:
+        f = self.friend
+        if f is None:
+            return
+        b = self.couch.bridge
+
+        def got(msgs: list) -> None:
+            if self.view != "chat" or self.friend is not f:
+                return
+            self.chat_msgs = msgs
+            self._build()
+            self.focus = len(self.rows) - 1                 # (the newest is at the bottom, next to "Write")
+            self.update()
+        b.call(b.core.steam_chat_history(self._acct(f), 30), got,
+               lambda e: self._flash_note(str(e)), owner=self)
+
+    def _chat_rows(self) -> list[Row]:
+        from ezgd.platform import steambridge
+        from ezgd.platform.steamfriends import to_steamid64
+        f = self.friend or {}
+        rows: list[Row] = []
+        if not self.chat_msgs:
+            rows.append(Row("h-none", "No messages yet — say hi.", kind="header", extra={"note": True, "tip": True}))
+        now = time.time()
+        for k, m in enumerate(self.chat_msgs):
+            text = m["text"] if not m.get("invite") else ("You invited them to play" if m["mine"] else
+                                                          f"{f.get('name', 'They')} invited you to play")
+            rows.append(Row(f"msg-{k}", text, kind="msg", extra={"mine": m["mine"], "time": m["time"]}))
+            if m.get("invite") and not m["mine"] and now - m["time"] < 6 * 3600:
+                url = steambridge.join_url(m["invite"], to_steamid64(self._acct(f)))
+                rows.append(Row(f"join-{k}", "Join their game", "Steam joins you up", "primary",
+                                action=lambda u=url, n=f.get("name", ""): self._join(u, n)))
+        rows.append(Row("write", "Write a message", "The on-screen keyboard — Start sends", "primary",
+                        action=self._write))
+        return rows
+
+    def _write(self) -> None:
+        from ezgd.ui.couch_pages import Keyboard
+        f = self.friend or {}
+        self.keyboard = Keyboard(self, f"Message {f.get('name', '')}", self._send, done_label="Send", symbols=True,
+                                 limit=400)
+        self.update()
+
+    def _send(self, text: str) -> None:
+        f = self.friend
+        if not text or f is None:
+            return
+        b = self.couch.bridge
+        self.chat_msgs = self.chat_msgs + [{"mine": True, "time": int(time.time()), "text": text, "invite": None}]
+        self._build()
+        self.focus = len(self.rows) - 1
+        b.call(b.core.steam_chat_send(self._acct(f), text), lambda _r: self._load_history(),
+               lambda e: self._flash_note(f"Not sent: {e}"), owner=self)
+        self.update()
+
+    def _invite(self, f: dict) -> None:
+        b = self.couch.bridge
+        b.call(b.core.steam_invite(self._acct(f)),
+               lambda _how: self._flash_note(f"Invite sent to {f.get('name', 'your friend')}"),
+               lambda e: self._flash_note(str(e)), owner=self)
+
+    # (the on-screen keyboard draws itself with these, as on couch mode's window)
+    def _font(self, size: float, weight: int = 600):
+        return self.couch._font(size, weight)
+
+    def _schedule_frame(self, ms: int) -> None:
+        QTimer.singleShot(ms, self, self.update)
+
+    @property
+    def _hit(self) -> list:
+        return self._hits
 
     def _load_friends(self, force: bool = False) -> None:
         b = self.couch.bridge
@@ -395,7 +589,11 @@ class QuickMenu(QWidget):
         if self.friends is None and not self.friends_error:
             rows.append(Row("h-wait", "Asking Steam…", kind="header", extra={"note": True}))
         for k, f in enumerate(d.get("friends") or []):
-            rows.append(Row(f"friend-{k}", f.get("name", ""), f.get("status") or "", "friend",
+            note = f.get("status") or ""
+            c = self._chat_of(f) if self._bridged() else None
+            if c and c.get("unread"):
+                note = f"● {c['unread']} new" + (f" · {note}" if note else "")
+            rows.append(Row(f"friend-{k}", f.get("name", ""), note, "friend",
                             action=lambda f=f: self.open_friend(f), extra={"friend": f}))
         return rows
 
@@ -411,6 +609,20 @@ class QuickMenu(QWidget):
         from ezgd.ui.couch_friends import actions, invite_game
         f = self.friend or {}
         playing = self.game.title if self.game is not None and not self._suspended(self.game) else ""
+        if self._bridged():
+            me = (self.chats or {}).get("self") or {}
+            game = (playing or "your game") if me.get("appid") else ""
+            out = []
+            for a, label, note in actions(f, game):
+                if a == "chat":
+                    c = self._chat_of(f)
+                    label, note = "Message", (f"{c['unread']} new — " if c and c.get("unread") else "") + \
+                        "Your chat with them, right here"
+                elif a == "invite":
+                    note = "One press — Steam sends it"
+                out.append(Row(f"fa-{a}", label, note, "primary" if a == "chat" else "row",
+                               action=lambda a=a: self.friend_action(a)))
+            return out
         return [Row(f"fa-{a}", label, note, "primary" if a == "chat" else "row",
                     action=lambda a=a: self.friend_action(a))
                 for a, label, note in actions(f, invite_game(self.friends, playing))]
@@ -422,12 +634,31 @@ class QuickMenu(QWidget):
         f = self.friend
         if f is None or self.busy:
             return
+        if self._bridged() and action in ("chat", "invite", "join", "launch"):
+            from ezgd.platform import steamfriends
+            if action == "chat":
+                self.open_chat(f)
+            elif action == "invite":
+                self._invite(f)
+            else:
+                url = steamfriends.join_url(f) if action == "join" else steamfriends.launch_url(f)
+                if url:
+                    self._join(url, f.get("name", ""))
+            return
         if action in ("join", "launch"):
             self._then_suspend(lambda: self.close_menu(lambda: open_action(self.couch, action, f)))
         else:
             self.close_menu(lambda: open_action(self.couch, action, f))
 
     def _back_from_friends(self) -> None:
+        if self.view == "chat":
+            self.view = "friend"
+            self.chat_msgs = []
+            self._row_top = 0
+            self._build()
+            self.focus = self._first()
+            self._load_chats()
+            return
         if self.view == "friend":
             keep = self.friend
             self.view = "friends"
@@ -671,10 +902,14 @@ class QuickMenu(QWidget):
             if time.monotonic() - self.opened_at > 0.4:
                 self.resume() if self.game is not None else self.close_menu()
             return
+        if self.keyboard is not None:
+            self.keyboard.command(name)
+            self.update()
+            return
         before = (self.view, self.focus, self.grid_focus)
         if self.view == "switch":
             self._grid_command(name)
-        elif self.view in ("friends", "friend") and name in ("b", "start"):
+        elif self.view in ("friends", "friend", "chat") and name in ("b", "start"):
             self._back_from_friends()
         elif self.view in ("confirm", "starting") and name == "b":
             if self.view == "confirm":
@@ -728,6 +963,21 @@ class QuickMenu(QWidget):
             self.close_switch()
 
     def keyPressEvent(self, e) -> None:                       # noqa: N802
+        kb = self.keyboard
+        if kb is not None and e.text() and e.text().isprintable() and e.key() not in (Qt.Key_Escape,):
+            kb.typed = True
+            kb.type(e.text())                            # a real keyboard types into it
+            self.update()
+            return
+        if kb is not None and e.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Escape, Qt.Key_Backspace):
+            if e.key() == Qt.Key_Backspace:
+                kb.text = kb.text[:-1]
+            elif e.key() == Qt.Key_Escape:
+                kb.cancel()
+            else:
+                kb.done()
+            self.update()
+            return
         name = self.couch.key_action(e.key()) or {      # (a Steam controller's buttons, sent as keys by Steam)
             Qt.Key_Up: "up", Qt.Key_Down: "down", Qt.Key_Left: "left", Qt.Key_Right: "right",
             Qt.Key_Return: "a", Qt.Key_Enter: "a", Qt.Key_Space: "a", Qt.Key_Escape: "b",
@@ -782,7 +1032,10 @@ class QuickMenu(QWidget):
                 self.command("b")
             return
         kind, idx = h
-        if kind == "row":
+        if kind == "key" and self.keyboard is not None:
+            self.keyboard.hit(idx, True)
+            self.update()
+        elif kind == "row":
             self.focus = idx
             self.command("a")
         elif kind == "tile":
@@ -865,6 +1118,9 @@ class QuickMenu(QWidget):
             self._paint_rows(p, inner, y + 24 * s)
         elif self.view == "friends":
             self._paint_rows(p, inner, y + 14 * s)
+        elif self.view == "chat" and self.friend is not None:
+            y = self._paint_chat_head(p, inner, y + 14 * s)
+            self._paint_rows(p, inner, y + 12 * s)
         else:
             if self.game is not None:                     # (the card gives way when the rows need the room)
                 room = self.height() - 96 * s - (y + 18 * s + 24 * s) - self._rows_height()
@@ -872,9 +1128,13 @@ class QuickMenu(QWidget):
                 y = self._paint_now_playing(p, inner, y + 18 * s, height=h)
             self._paint_rows(p, inner, y + 24 * s)
         self._paint_hints(p, inner)
+        if self.flash and time.monotonic() < self._flash_until:
+            self._paint_flash(p, inner)
         if self.busy:
             self._paint_busy(p, panel)
         p.restore()
+        if self.keyboard is not None:
+            self.keyboard.paint(p)                      # (over everything, like on couch mode)
 
     def _paint_header(self, p: QPainter, r: QRectF, y: float) -> float:
         from ezgd.ui.couch import clock_text
@@ -986,6 +1246,12 @@ class QuickMenu(QWidget):
         return card.bottom()
 
     def _row_height(self, row: Row) -> float:
+        if row.kind == "msg":
+            s = self._s()
+            fm = QFontMetrics(self.couch._font(17 * s, 600))
+            w = int(self._bubble_width() - 32 * s)
+            h = fm.boundingRect(0, 0, max(40, w), 100000, int(Qt.TextWordWrap), row.label).height()
+            return h + 30 * s + 10 * s
         if row.kind == "header" and row.extra.get("note"):
             return 64 * self._s()
         return (44 if row.kind == "header" else (92 if row.kind in ("game", "friend") else 78 if row.note else 62) + 10
@@ -1023,6 +1289,13 @@ class QuickMenu(QWidget):
         self._row_top = top if y + sum(heights) - 10 * s > bottom else 0
         for k, row in enumerate(self.rows):
             if k < self._row_top:
+                continue
+            if row.kind == "msg":
+                h = self._row_height(row) - 10 * s
+                if y + h > bottom:
+                    break
+                self._bubble(p, row, QRectF(r.left(), y, r.width(), h))
+                y += h + 10 * s
                 continue
             if row.kind == "header" and row.extra.get("note"):
                 p.setFont(self.couch._font(16 * s, 700))
@@ -1259,6 +1532,8 @@ class QuickMenu(QWidget):
             hints = [("a", "Select"), ("b", "Back")]
         elif self.view == "starting":
             hints = [] if not self.start_error else [("a", "Select")]
+        elif self.view == "chat":
+            hints = [("a", "Select"), ("b", "Back")]
         elif self.view in ("friends", "friend"):
             hints = ([("a", "Options")] if self.view == "friends" and any(r.kind == "friend" for r in self.rows) else
                      [("a", "Select")] if self.view == "friend" else []) + [("b", "Back")]
@@ -1271,6 +1546,58 @@ class QuickMenu(QWidget):
         x = r.left()
         for action, text in self.couch.usable_hints(hints):
             x = self.couch._glyph(p, x, y, action, text) + 26 * s
+
+    def _bubble_width(self) -> float:
+        s = self._s()
+        return (self._panel_rect(1.0).width() - 88 * s) * 0.8
+
+    def _bubble(self, p: QPainter, row: Row, r: QRectF) -> None:
+        """A chat message: yours on the right in the accent colour, theirs on the left."""
+        s = self._s()
+        mine = row.extra.get("mine")
+        p.setFont(self.couch._font(17 * s, 600))
+        fm = QFontMetrics(p.font())
+        maxw = self._bubble_width()
+        tr = fm.boundingRect(0, 0, int(maxw - 32 * s), 100000, int(Qt.TextWordWrap), row.label)
+        bw = min(maxw, tr.width() + 34 * s)
+        box = QRectF(r.right() - bw if mine else r.left(), r.top(), bw, r.height())
+        path = QPainterPath()
+        path.addRoundedRect(box, 16 * s, 16 * s)
+        c = QColor(theme.CURRENT.accent) if mine else QColor(255, 255, 255, 30)
+        if mine:
+            c.setAlpha(210)
+        p.fillPath(path, c)
+        p.setPen(QColor("white"))
+        p.drawText(box.adjusted(16 * s, 14 * s, -16 * s, -12 * s), int(Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop),
+                   row.label)
+
+    def _paint_chat_head(self, p: QPainter, r: QRectF, y: float) -> float:
+        from ezgd.ui.couch_friends import paint_avatar
+        s, f = self._s(), self.friend or {}
+        a = 52 * s
+        if not paint_avatar(p, self.couch, f, QRectF(r.left() + 4 * s, y, a, a), s):
+            self._pending_art = True
+        x = r.left() + a + 22 * s
+        p.setFont(self.couch._font(22 * s, 800))
+        p.setPen(QColor("white"))
+        p.drawText(QRectF(x, y, r.right() - x, 30 * s), Qt.AlignLeft | Qt.AlignVCenter, f.get("name", ""))
+        p.setFont(self.couch._font(15 * s, 700))
+        from ezgd.ui.couch_friends import state_color
+        p.setPen(state_color(f))
+        p.drawText(QRectF(x, y + 28 * s, r.right() - x, 24 * s), Qt.AlignLeft | Qt.AlignVCenter,
+                   f.get("status") or "")
+        return y + a + 6 * s
+
+    def _paint_flash(self, p: QPainter, r: QRectF) -> None:
+        s = self._s()
+        box = QRectF(r.left(), self.height() - 150 * s, r.width(), 46 * s)
+        path = QPainterPath()
+        path.addRoundedRect(box, 14 * s, 14 * s)
+        p.fillPath(path, QColor(0, 0, 0, 200))
+        p.setFont(self.couch._font(17 * s, 700))
+        p.setPen(QColor("white"))
+        p.drawText(box, Qt.AlignCenter, QFontMetrics(p.font()).elidedText(self.flash, Qt.ElideRight,
+                                                                           int(box.width() - 30 * s)))
 
     def _paint_busy(self, p: QPainter, panel: QRectF) -> None:
         s = self._s()

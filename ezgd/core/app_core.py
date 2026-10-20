@@ -262,6 +262,12 @@ class AppCore:
             set_level(value)
         elif key == "sources_enabled":
             self.registry.set_enabled(value)
+        elif key == "own_overlay" and not value:
+            from ezgd.platform import steambridge                  # off: Steam's debugging interface goes too
+            try:
+                steambridge.switch_off(self.library.steam_root())
+            except OSError:
+                pass
         elif key == "hide_withdrawn_games":
             self.registry.hide_withdrawn = bool(value)
         elif key == "hide_adult_games":
@@ -2356,6 +2362,93 @@ class AppCore:
             raise RuntimeError(str(exc)) from None
         self._friends_cache = (key, data)
         return data
+
+    # ------------------------------------------------------------ our overlay: the Steam client bridge
+    def _bridge(self):
+        if getattr(self, "_steam_bridge", None) is None:
+            from ezgd.platform.steambridge import Bridge
+            self._steam_bridge = Bridge()
+        return self._steam_bridge
+
+    async def steam_bridge_status(self) -> dict:
+        """Is the Steam client bridge set up (debugging switched on) and answering?"""
+        from ezgd.platform import steam as steam_mod, steambridge
+        root = self.library.steam_root()
+        running = await asyncio.to_thread(steam_mod.is_steam_running)
+        ready = await self._bridge().ready() if running else False
+        return {"set_up": steambridge.switched_on(root), "steam_running": running, "ready": ready}
+
+    async def steam_bridge_setup(self) -> dict:
+        """The player agreed (Settings → Our overlay): switch Steam's debugging interface on and restart Steam once
+        so it takes effect — never while a game is running."""
+        from ezgd.platform import steam as steam_mod, steambridge
+        root = self.library.steam_root()
+        if root is None:
+            raise SourceError("Steam was not found on this computer.")
+        running = await asyncio.to_thread(steam_mod.is_steam_running)
+        if running and await self._bridge().ready():
+            steambridge.switch_on(root)                  # (already answering: nothing to restart)
+            return await self.steam_bridge_status()
+        if running and self.library.running_ids():
+            raise SourceError("Close your game first — Steam has to restart once.")
+        steambridge.switch_on(root)
+        if running:
+            log.info("our overlay: restarting Steam once to switch its debugging interface on")
+            if not await asyncio.to_thread(steam_mod.shutdown_steam):
+                raise SourceError("Steam did not close. Close it yourself (Steam → Exit) and start it again.")
+        await asyncio.to_thread(self.library.start_steam)
+        for _ in range(60):                              # (Steam's friends page is up a little after Steam)
+            if await self._bridge().ready():
+                break
+            await asyncio.sleep(1)
+        return await self.steam_bridge_status()
+
+    async def steam_bridge_off(self) -> None:
+        from ezgd.platform import steambridge
+        steambridge.switch_off(self.library.steam_root())
+        await self._bridge().close()
+
+    async def steam_chats(self) -> dict:
+        """Your game and every Steam chat (unread, last message, an invite you got) — for our overlay."""
+        from ezgd.platform.steambridge import BridgeError
+        try:
+            return await self._bridge().state()
+        except BridgeError as exc:
+            raise RuntimeError(str(exc)) from None
+
+    async def steam_chat_history(self, accountid: int, limit: int = 40) -> list[dict]:
+        from ezgd.platform.steambridge import BridgeError
+        try:
+            return await self._bridge().history(accountid, limit)
+        except BridgeError as exc:
+            raise RuntimeError(str(exc)) from None
+
+    async def steam_chat_send(self, accountid: int, text: str) -> None:
+        from ezgd.platform.steambridge import BridgeError
+        try:
+            await self._bridge().send(accountid, text)
+        except BridgeError as exc:
+            raise RuntimeError(str(exc)) from None
+        log.info("our overlay: message sent")
+
+    async def steam_invite(self, accountid: int) -> str:
+        """One click: Steam's own "Invite to Game" for the game you are in (lobby or connect string)."""
+        from ezgd.platform.steambridge import BridgeError
+        try:
+            how = await self._bridge().invite(accountid)
+        except BridgeError as exc:
+            raise RuntimeError(str(exc)) from None
+        log.info("our overlay: invite sent (%s)", how)
+        return how
+
+    async def steam_open(self, url: str) -> None:
+        """A steam:// link (join a lobby, accept an invite) handed to Steam inside the client — no window."""
+        from ezgd.platform.steambridge import BridgeError
+        try:
+            await self._bridge().open_url(url)
+        except BridgeError:
+            from ezgd.platform import steam as steam_mod
+            await asyncio.to_thread(steam_mod.open_steam_url, url)
 
     async def steam_friend_open(self, action: str, friend: dict) -> str:
         """chat | invite | join | launch | profile: hand the friend's Steam link to Steam (invite: their chat — Steam

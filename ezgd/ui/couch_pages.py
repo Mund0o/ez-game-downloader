@@ -2228,6 +2228,9 @@ class SettingsPage(Page):
         return self.w.actions.settings.get(key)
 
     def _set(self, key: str, value) -> None:
+        if key == "own_overlay" and value:
+            self._own_overlay_on()
+            return
         self.w.actions.settings[key] = value
         b = self.w.bridge
         b.call(b.core.set_setting(key, value), lambda _v: None, lambda e: self.w.actions.fail("Settings", e),
@@ -2235,6 +2238,36 @@ class SettingsPage(Page):
         if key == "reduce_motion":
             self.w.reduce_motion = bool(value)
         self._build()
+
+    def _own_overlay_on(self) -> None:
+        """Our overlay, switched on here: the first time, two lines on what it does, then the Steam client bridge is
+        set up (Steam restarts once)."""
+        w, b = self.w, self.w.bridge
+
+        def turned_on(st: dict) -> None:
+            w.close_overlay()
+            if not st.get("ready"):
+                w.message("Our overlay", "Steam did not come back with it — start Steam and try again.")
+                return
+            w.actions.settings["own_overlay"] = True
+            b.call(b.core.set_setting("own_overlay", True), lambda _v: None, lambda e: w.actions.fail("Settings", e),
+                   owner=w)
+            w.toasts.show("Our overlay is on", "Chats and invites are in the quick menu.", "success")
+            self._build()
+
+        def go() -> None:
+            w.busy("Setting up our overlay…", "Steam restarts once.")
+            b.call(b.core.steam_bridge_setup(), turned_on,
+                   lambda e: (w.close_overlay(), w.message("Our overlay could not be switched on", str(e))), owner=w)
+
+        def checked(st: dict) -> None:
+            if st.get("set_up") and st.get("ready"):
+                turned_on(st)
+                return
+            from ezgd.platform.steambridge import FIRST_TIME
+            w.show_overlay("Our overlay", "\n".join(FIRST_TIME), [("Turn on", go, "primary"),
+                                                                 ("Cancel", w.close_overlay, "ghost")])
+        b.call(b.core.steam_bridge_status(), checked, lambda e: w.message("Our overlay", str(e)), owner=w)
 
     def _build(self) -> None:
         items: list[Item] = []

@@ -159,3 +159,111 @@ def test_invite_from_the_quick_menu(ui, qtbot, tmp_path, monkeypatch):
     qtbot.waitUntil(lambda: not q.isVisible(), timeout=3000)
     win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
     couch.force_close()
+
+
+@linux_only
+def test_our_overlay_chats_invites_and_joins_without_steam_windows(ui, qtbot, tmp_path, monkeypatch):
+    """Our overlay in the middle: a friend's invite is a Join row, unread messages show, Invite is one press (Steam's
+    own Invite to Game), Message opens the chat in the quick menu and the on-screen keyboard sends — Steam's chat
+    window is never opened."""
+    win, core, _ = ui
+    opened = _fake_steam(core, monkeypatch)
+    bob = sf.to_account_id(B)
+    calls = []
+
+    async def chats():
+        return {"self": {"accountid": 1, "appid": 480, "lobby": "77", "connect": "", "game": ""},
+                "chats": [{"accountid": bob, "name": "Bob", "unread": 2, "time": 1, "last": "Invited you to play",
+                           "last_from": bob, "invite": {"kind": "lobbyinvite", "appid": "480", "lobby": "99",
+                                                        "connect": ""}}]}
+
+    async def history(acct, limit=40):
+        calls.append(("history", acct))
+        return [{"mine": False, "time": 1, "text": "you up?", "invite": None},
+                {"mine": True, "time": 2, "text": "yep", "invite": None}]
+
+    async def send(acct, text):
+        calls.append(("send", acct, text))
+
+    async def invite(acct):
+        calls.append(("invite", acct))
+        return "lobby"
+
+    async def open_url(url):
+        calls.append(("open", url))
+    for name, fn in (("steam_chats", chats), ("steam_chat_history", history), ("steam_chat_send", send),
+                     ("steam_invite", invite), ("steam_open", open_url)):
+        monkeypatch.setattr(core, name, fn)
+    a = _running(win, core, tmp_path, qtbot, "Overlay Game")
+    couch = _open_couch(win, qtbot)
+    monkeypatch.setitem(couch.actions.settings, "own_overlay", True)
+    qtbot.waitUntil(lambda: a.id in couch.running, timeout=5000)
+    couch._home_held()
+    qtbot.waitUntil(lambda: couch.quick is not None and couch.quick._shown >= 1.0, timeout=5000)
+    q = couch.quick
+    qtbot.waitUntil(lambda: q.chats is not None and q.friends is not None, timeout=3000)
+    q._build()
+    assert q.rows[0].key == f"inv-{bob}" and q.rows[0].label == "Join Bob"
+    assert next(r for r in q.rows if r.key == "friends").note.startswith("2 new messages")
+    q.grab()
+    q.open_friends()
+    assert next(r for r in q.rows if r.label == "Bob").note.startswith("● 2 new")
+    q.open_friend(next(f for f in FRIENDS["friends"] if f["name"] == "Bob"))
+    assert [r.label for r in q.rows][:2] == ["Message", "Invite to Overlay Game"]
+    q.focus = 1
+    q.command("a")                                                    # one press: Steam sends the invite
+    qtbot.waitUntil(lambda: ("invite", bob) in calls and "Invite sent to Bob" in q.flash, timeout=3000)
+    q.grab()
+    q.focus = 0
+    q.command("a")                                                    # Message: the chat, in the quick menu
+    assert q.view == "chat"
+    qtbot.waitUntil(lambda: len(q.chat_msgs) == 2, timeout=3000)
+    assert [r.kind for r in q.rows] == ["msg", "msg", "primary"] and q.rows[q.focus].key == "write"
+    q.grab()
+    q.command("a")                                                    # Write → the on-screen keyboard
+    assert q.keyboard is not None
+    for ch in "gg":
+        q.keyboard.type(ch)
+    q.grab()
+    q.command("start")                                                # Start sends
+    qtbot.waitUntil(lambda: ("send", bob, "gg") in calls, timeout=3000)
+    assert q.keyboard is None and ("history", bob) in calls          # (reloaded from Steam after sending)
+    q.command("b")
+    assert q.view == "friend"
+    q.command("b")
+    q.command("b")
+    assert q.view == "main"
+    q.focus = 0
+    q.command("a")                                                    # Join Bob: the game waits, Steam joins
+    qtbot.waitUntil(lambda: any(c[0] == "open" for c in calls), timeout=8000)
+    assert ("open", f"steam://joinlobby/480/99/{B}") in calls
+    assert opened == []                                               # Steam's chat window: never
+    win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
+    couch.force_close()
+
+
+def test_switching_our_overlay_on_asks_once_in_two_lines(ui, qtbot, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    win, core, _ = ui
+    page = win.pages["settings"]
+    asked, setups = [], []
+
+    async def status():
+        return {"set_up": False, "steam_running": True, "ready": False}
+
+    async def setup():
+        setups.append(1)
+        return {"set_up": True, "steam_running": True, "ready": True}
+    monkeypatch.setattr(core, "steam_bridge_status", status)
+    monkeypatch.setattr(core, "steam_bridge_setup", setup)
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: asked.append(a[2]) or QMessageBox.Cancel)
+    box = page.widgets["own_overlay"]
+    box.setChecked(True)
+    qtbot.waitUntil(lambda: bool(asked) and not box.isChecked(), timeout=3000)   # cancelled: unticked again
+    assert asked[0].count("\n") == 1 and not setups                                # two lines
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: asked.append(a[2]) or QMessageBox.Ok)
+    box.setChecked(True)
+    qtbot.waitUntil(lambda: bool(setups) and core.settings.settings.own_overlay, timeout=3000)
+    assert box.isChecked()
+    box.setChecked(False)
+    qtbot.waitUntil(lambda: not core.settings.settings.own_overlay, timeout=3000)

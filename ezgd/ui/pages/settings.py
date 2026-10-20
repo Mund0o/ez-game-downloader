@@ -120,6 +120,42 @@ class SettingsPage(QWidget):
         self.bridge.call(self.bridge.core.set_setting(key, value), None,
                          lambda e: self.actions.fail(f"Invalid value for {key}", e))
 
+    def _own_overlay_toggled(self, on: bool) -> None:
+        """Our overlay: the first time it is switched on, say in two lines what it does, then set the Steam client
+        bridge up (Steam restarts once) — the box only stays ticked when that worked."""
+        if self._loading:
+            return
+        box = self.widgets["own_overlay"]
+        if not on:
+            self._save("own_overlay", False)
+            return
+
+        def undo(err=None) -> None:
+            box.blockSignals(True)
+            box.setChecked(False)
+            box.blockSignals(False)
+            if err is not None:
+                self.actions.fail("Our overlay could not be switched on", err)
+
+        def go() -> None:
+            self.actions.toasts.show("Our overlay", "Setting it up — Steam restarts once…")
+            self.bridge.call(self.bridge.core.steam_bridge_setup(),
+                             lambda st: (self._save("own_overlay", True),
+                                         self.actions.toasts.show("Our overlay is on", "Chats and invites are in the "
+                                                                  "quick menu.", "success")) if st.get("ready") else
+                             undo(RuntimeError("Steam did not come back with it — start Steam and try again.")),
+                             undo, owner=self)
+
+        def checked(st: dict) -> None:
+            if st.get("set_up") and st.get("ready"):
+                self._save("own_overlay", True)             # set up before: no questions
+                return
+            from ezgd.platform.steambridge import FIRST_TIME
+            r = QMessageBox.question(self, "Our overlay", "\n".join(FIRST_TIME),
+                                     QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Ok)
+            go() if r == QMessageBox.Ok else undo()
+        self.bridge.call(self.bridge.core.steam_bridge_status(), checked, undo, owner=self)
+
     def _check(self, form, key: str, text: str, tip: str = "") -> QCheckBox:
         w = QCheckBox(text)
         if tip:
@@ -381,12 +417,14 @@ class SettingsPage(QWidget):
         sync.setToolTip("Save backups are written into “EZ Game saves” in this folder, so another computer with the "
                         "same folder (and this app) can restore them. Backups made before stay here too. Leave it "
                         "empty to keep backups on this computer only.")
-        own = self._check(f, "own_overlay", "Our overlay instead of Steam's: friends, chat and invites in the quick menu",
-                          "On: games start without Steam's overlay, and the PS / Xbox / Steam button (tap or hold) "
-                          "opens the app's quick menu over the game — your Steam friends, chat with them, invite them "
-                          "to your game, join theirs. Steam itself carries it out (its chat window, its friends "
-                          "list's “Invite to Game”). Off: Steam's overlay as usual — a tap of the Steam button opens "
-                          "it, a hold opens the quick menu.")
+        own = QCheckBox("Our overlay instead of Steam's: chat, invites and joining in the quick menu")
+        own.setToolTip("On: games start without Steam's overlay, and the PS / Xbox / Steam button (tap or hold) opens "
+                       "the app's quick menu over the game — your Steam chats, one-click invites to your game, "
+                       "joining theirs — through the Steam client itself, without Steam's windows. Off: Steam's "
+                       "overlay as usual.")
+        own.toggled.connect(self._own_overlay_toggled)
+        f.addRow("", own)
+        self.widgets["own_overlay"] = own
         self._check(f, "steam_overlay", "Steam overlay in games while Steam is running (friends list)",
                     "Loads Steam's overlay into games started here, without changing anything in Steam. Steam only "
                     "shows the friends list there, and Shift+Tab may not open it again once closed.")

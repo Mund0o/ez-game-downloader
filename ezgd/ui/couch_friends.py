@@ -209,18 +209,75 @@ class FriendsPage(Page):
         if f is None:
             return
         rows = []
+        bridged = bool(self.w.actions.settings.get("own_overlay", False))
         for action, label, note in actions(f, invite_game(self.data, playing_title(self.w))):
+            if bridged and action == "chat":
+                label, note = "Message", "Your chat with them, right here"
+            elif bridged and action == "invite":
+                note = "One press — Steam sends it"
             rows.append((label, lambda a=action: self._do(a, f), "primary" if action == "chat" else "ghost", note))
         rows.append(("Close", self.w.close_overlay, "ghost", ""))
         self.w.menu(f.get("name", ""), rows, text=f.get("status") or "")
 
     def _do(self, action: str, f: dict) -> None:
         self.w.close_overlay()
+        if self.w.actions.settings.get("own_overlay", False) and action in ("chat", "invite", "join", "launch"):
+            self._bridged(action, f)                     # our overlay: through the Steam client, no Steam window
+            return
 
         def done() -> None:
             if action in ("chat", "invite", "profile"):
                 self.w.step_away("steam")                # Steam's window needs the screen (the guide button
         open_action(self.w, action, f, done)             # brings couch mode back)
+
+    def _bridged(self, action: str, f: dict) -> None:
+        from ezgd.platform import steamfriends
+        w, b = self.w, self.w.bridge
+        acct = steamfriends.to_account_id(f["steamid"])
+        if action == "chat":
+            self._chat(f)
+        elif action == "invite":
+            b.call(b.core.steam_invite(acct), lambda _h: w.toasts.show("Invite sent", f.get("name", ""), "success"),
+                   lambda e: w.toasts.show("No invite sent", str(e), "warning"), owner=w)
+        else:
+            url = steamfriends.join_url(f) if action == "join" else steamfriends.launch_url(f)
+            if url:
+                b.call(b.core.steam_open(url), lambda _r: w.toasts.show("Steam is starting it", f.get("game") or "",
+                                                                       "info"),
+                       lambda e: w.toasts.show("Could not join", str(e), "warning"), owner=w)
+
+    def _chat(self, f: dict) -> None:
+        """The last messages with a friend, and Write (the on-screen keyboard) — all through the Steam client."""
+        from ezgd.platform import steamfriends
+        from ezgd.ui.couch_pages import Keyboard
+        w, b = self.w, self.w.bridge
+        acct = steamfriends.to_account_id(f["steamid"])
+        name = f.get("name", "")
+
+        def send(text: str) -> None:
+            if text:
+                b.call(b.core.steam_chat_send(acct, text), lambda _r: self._chat(f),
+                       lambda e: w.toasts.show("Not sent", str(e), "warning"), owner=w)
+
+        def write() -> None:
+            w.close_overlay()
+            w.keyboard = Keyboard(w, f"Message {name}", send, done_label="Send", symbols=True, limit=400)
+            w.update()
+
+        def show(msgs: list) -> None:
+            lines = [("You" if m["mine"] else name,
+                      ("Invite to play" if m.get("invite") else m["text"])[:160]) for m in msgs[-7:]]
+            invite = next((m for m in reversed(msgs) if m.get("invite") and not m["mine"]), None)
+            buttons = [("Write", write, "primary")]
+            if invite is not None:
+                from ezgd.platform.steambridge import join_url
+                url = join_url(invite["invite"], f["steamid"])
+                buttons.append(("Join their game", lambda: (w.close_overlay(), b.call(
+                    b.core.steam_open(url), lambda _r: None, lambda e: w.toasts.show("Could not join", str(e),
+                                                                                    "warning"), owner=w)), "play"))
+            buttons.append(("Close", w.close_overlay, "ghost"))
+            w.show_overlay(name, "" if lines else "No messages yet — say hi.", buttons, lines=lines)
+        b.call(b.core.steam_chat_history(acct, 20), show, lambda e: w.message("Steam chat", str(e)), owner=w)
 
     def paint(self, p: QPainter) -> None:
         w = self.w
