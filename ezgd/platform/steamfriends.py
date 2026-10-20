@@ -191,6 +191,32 @@ def from_summary(p: dict, known: Friend | None = None) -> Friend:
         last_online=int(p.get("lastlogoff") or 0))
 
 
+def from_client(c: dict) -> Friend:
+    """A friend as the Steam client's own friends list has them (steambridge.Bridge.friends)."""
+    gid = str(c.get("gameid") or "0")
+    if gid == "0" and c.get("appid"):
+        gid = str(c["appid"])
+    ip, port = int(c.get("ip") or 0), int(c.get("port") or 0)
+    server = f"{ip >> 24 & 255}.{ip >> 16 & 255}.{ip >> 8 & 255}.{ip & 255}:{port}" if ip and port and gid != "0" \
+        else ""
+    lobby = str(c.get("lobby") or "")
+    return Friend(to_steamid64(c["accountid"]), str(c.get("name") or ""), STATES.get(int(c.get("state") or 0),
+                                                                                     "online"),
+                  game=str(c.get("game") or "") if gid != "0" else "", gameid=gid if gid != "0" else "",
+                  lobby=lobby if lobby != "0" else "", server=server, avatar=str(c.get("avatar") or ""),
+                  last_online=int(c.get("last") or 0))
+
+
+def from_client_list(data: dict, me: str) -> dict:
+    """What load() returns, from the Steam client's friends list (live, no Web API key)."""
+    friends = [from_client(c) for c in data.get("friends") or [] if c.get("accountid")]
+    mine = from_client(data["self"]) if (data.get("self") or {}).get("accountid") else None
+    return {"me": me, "live": True, "private": False, "error": "", "at": time.time(), "client": True,
+            "friends": [f.as_dict() for f in order(friends)],
+            "self": {"playing": bool(mine and mine.playing), "game": mine.game if mine else "",
+                     "gameid": mine.gameid if mine else ""}}
+
+
 def order(friends: list[Friend]) -> list[Friend]:
     """In a game first, then online, busy / away / snooze, then offline (most recently online first); by name."""
     rank = {"online": 1, "busy": 2, "away": 3, "snooze": 4, "unknown": 5, "offline": 6}

@@ -45,6 +45,19 @@ def summary(data: dict | None) -> str:
     return f"{len(online)} online" + (f" · {len(playing)} playing" if playing else "")
 
 
+def matching(friends: list[dict], query: str) -> list[dict]:
+    """The friends whose name has ``query`` in it (any case), in the list's order (in a game, online, offline)."""
+    q = (query or "").strip().casefold()
+    return [f for f in friends if q in (f.get("name") or "").casefold()] if q else list(friends)
+
+
+def search_note(query: str, found: int) -> str:
+    q = query.strip()
+    if not found:
+        return f"No friend called “{q}”"
+    return f"“{q}” — {found} friend{'s' if found != 1 else ''}"
+
+
 INVITE_HOW = "Opens Steam's chat — choose “Invite to Game” in the menu by their name"
 
 
@@ -142,13 +155,31 @@ class FriendsPage(Page):
         self.error = ""
         self.focus = 0
         self.loaded = False
+        self.query = ""                         # the search (X): only the friends whose name has it
         self._timer = QTimer(w)
         self._timer.setInterval(REFRESH_MS)
         self._timer.timeout.connect(self._tick)
 
     @property
     def friends(self) -> list[dict]:
-        return (self.data or {}).get("friends") or []
+        return matching((self.data or {}).get("friends") or [], self.query)
+
+    def open_search(self, first: str = "") -> None:
+        from ezgd.ui.couch_pages import Keyboard
+        self.w.keyboard = Keyboard(self.w, "Find a friend", self.search, text=(self.query + first) if first else
+                                   self.query, done_label="Find", symbols=True, limit=40)
+
+    def search(self, text: str) -> None:
+        self.query = text.strip()
+        self.focus = 0
+        self._fr_t = 0.0
+        self.w.update()
+
+    def type_text(self, text: str) -> bool:
+        if text.isprintable() and text.strip():
+            self.open_search(text)                 # typing on a real keyboard starts a search
+            return True
+        return False
 
     def activate(self) -> None:
         self.reload()
@@ -189,9 +220,11 @@ class FriendsPage(Page):
         elif name == "a":
             self.activate_row()
         elif name == "x":
-            self.reload(force=True)
-            self.w.toasts.show("Friends", "Asking Steam again…")
+            self.open_search()
         elif name == "b":
+            if self.query:                          # B: the search goes first, then the page
+                self.search("")
+                return None
             return "back"
         return None
 
@@ -201,8 +234,8 @@ class FriendsPage(Page):
             self.activate_row()
 
     def hints(self) -> list[tuple[str, str]]:
-        return [("a", "Options"), ("x", "Refresh"), ("b", "Back")] if self.friends else [("x", "Refresh"),
-                                                                                           ("b", "Back")]
+        back = ("b", "Clear search" if self.query else "Back")
+        return [("a", "Options"), ("x", "Search"), back] if self.friends else [("x", "Search"), back]
 
     def activate_row(self) -> None:
         f = self._friend()
@@ -287,6 +320,8 @@ class FriendsPage(Page):
             sub = "Asking Steam…"
         elif self.error:
             sub = self.error
+        elif self.query:
+            sub = search_note(self.query, len(self.friends))
         else:
             sub = summary(d)
         y = self._heading(p, "Friends", sub)
@@ -327,7 +362,7 @@ class FriendsPage(Page):
         p.restore()
         if pending:
             QTimer.singleShot(150, w, w.update)
-        if self.loaded and not n and not self.error:
+        if self.loaded and not n and not self.error and not self.query:
             p.setFont(w._font(20 * s))
             p.setPen(QColor(255, 255, 255, 160))
             p.drawText(QRectF(left, rect.top() + 20 * s, W - 2 * left, 40 * s), Qt.AlignLeft | Qt.AlignVCenter,

@@ -40,6 +40,20 @@ BUTTONS = {BTN_SOUTH: "a", BTN_EAST: "b", BTN_NORTH: "x", BTN_WEST: "x", BTN_C: 
 EVENT = struct.Struct("llHHi")                      # struct input_event (64-bit: timeval, type, code, value)
 ABSINFO = struct.Struct("iiiiii")                   # value, minimum, maximum, fuzz, flat, resolution
 REPEAT_DELAY, REPEAT_EVERY, REPEAT_FAST, FAST_AFTER = 0.36, 0.11, 0.055, 1.4
+
+_pad_logged: dict[tuple[str, str], float] = {}     # (event, controller) → when it was last written to the log
+PAD_LOG_QUIET = 300.0
+
+
+def _log_pad(fmt: str, name: str, *args) -> None:
+    """Controllers coming and going, in the log — once per controller and event every five minutes: Steam's
+    virtual pad comes and goes every few seconds during a game, and a friend's log was mostly those lines."""
+    now = time.monotonic()
+    key = (fmt, name)
+    quiet = now - _pad_logged.get(key, -PAD_LOG_QUIET) < PAD_LOG_QUIET
+    if not quiet:
+        _pad_logged[key] = now
+    (log.debug if quiet else log.info)(fmt, name, *args)
 HOME_HOLD = 0.8                                     # seconds the guide button is held for the quick menu
 DUPLICATE_WINDOW = 0.25                             # the same press from two devices (Steam's virtual pad + the real):
 #                                                     Steam's copy can come late — even after the real button is up
@@ -329,7 +343,7 @@ class Gamepads(QObject):
             # every press of every controller before 2026-10-13)
             dev.notifier.activated.connect(lambda *_args, p=path: self._read(p))
             self.devices[path] = dev
-            log.info("controller connected: %s (%s)", name, path)
+            _log_pad("controller connected: %s (%s)", name, path)
             changed = True
         if changed:
             if self.devices and (not self.family or not any(self._family_for(d) == self.family
@@ -356,7 +370,7 @@ class Gamepads(QObject):
             os.close(dev.fd)
         except OSError:
             pass
-        log.info("controller disconnected: %s", dev.name)
+        _log_pad("controller disconnected: %s", dev.name)
 
     # --------------------------------------------------------------- input
     def _read(self, path: str) -> None:

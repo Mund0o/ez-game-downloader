@@ -153,7 +153,7 @@ def test_in_app_browser_downloads_show_in_couch_downloads(ui, qtbot, monkeypatch
     win, _core, _ = ui
     couch = _open(win, qtbot)
     fake = _FakeBrowserDownloads()
-    monkeypatch.setattr(couch, "_browser_manager", lambda: fake)
+    monkeypatch.setattr(couch, "_browser_manager", lambda start=True: fake)
     from ezgd.ui.couch import T_DOWNLOADS
     couch._switch_tab(T_DOWNLOADS, force=True)
     couch._poll_browser()

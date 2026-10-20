@@ -113,3 +113,60 @@ async def test_steam_friend_links_go_to_steam(core, monkeypatch):
                       f"steam://url/SteamIDPage/{A}", f"steam://friends/message/{A}"]    # invite: Steam's chat
     with pytest.raises(RuntimeError, match="Nothing to join"):
         await core.steam_friend_open("join", {"steamid": B, "name": "Bob"})
+
+
+CLIENT = {"self": {"accountid": 9, "name": "me", "state": 1, "appid": 480, "gameid": "480", "game": "Spacewar",
+                   "lobby": "0", "ip": 0, "port": 0, "avatar": "", "last": 0},
+          "friends": [
+              {"accountid": 3, "name": "zed", "state": 0, "appid": 0, "gameid": "0", "game": "", "lobby": "0",
+               "ip": 0, "port": 0, "avatar": "", "last": 100},
+              {"accountid": 4, "name": "Amy", "state": 4, "appid": 0, "gameid": "0", "game": "", "lobby": "0",
+               "ip": 0, "port": 0, "avatar": "https://avatars.steamstatic.com/x_medium.jpg", "last": 0},
+              {"accountid": 5, "name": "Jinx", "state": 1, "appid": 2868840, "gameid": "2868840",
+               "game": "Slay the Spire 2", "lobby": "109775241", "ip": 0, "port": 0, "avatar": "", "last": 0},
+              {"accountid": 6, "name": "bo", "state": 1, "appid": 0, "gameid": "0", "game": "", "lobby": "0",
+               "ip": 16909060, "port": 27015, "avatar": "", "last": 0},
+              {"accountid": 7, "name": "Old", "state": 0, "appid": 0, "gameid": "0", "game": "", "lobby": "0",
+               "ip": 0, "port": 0, "avatar": "", "last": 900}]}
+
+
+def test_the_steam_clients_own_list_is_live_and_in_steams_order():
+    """Our overlay on: the friends list comes from the Steam client itself — live, no Web API key — in a game first,
+    then online, away / snooze, then offline (most recently online first)."""
+    d = sf.from_client_list(CLIENT, "x")
+    assert d["live"] and not d["error"]
+    assert [f["name"] for f in d["friends"]] == ["Jinx", "bo", "Amy", "Old", "zed"]
+    jinx = d["friends"][0]
+    assert jinx["status"] == "Playing Slay the Spire 2" and jinx["joinable"]
+    assert jinx["steamid"] == sf.to_steamid64(5) and sf.join_url(jinx) == \
+        f"steam://joinlobby/2868840/109775241/{sf.to_steamid64(5)}"
+    assert d["friends"][1]["server"] == "" and d["friends"][1]["status"] == "Online"   # (no game: no server)
+    assert d["friends"][2]["state"] == "snooze" and d["friends"][2]["avatar"].startswith("https://")
+    assert d["self"] == {"playing": True, "game": "Spacewar", "gameid": "480"}
+
+
+async def test_core_reads_the_steam_client_with_our_overlay_on(core, monkeypatch):
+    from ezgd.platform.steambridge import BridgeError
+    calls = []
+
+    class FakeBridge:
+        async def friends(self):
+            calls.append("client")
+            return CLIENT
+
+    async def web(*_a, **_k):
+        calls.append("web")
+        return {"me": "x", "live": False, "private": False, "error": "no key", "at": 0, "friends": []}
+    monkeypatch.setattr(sf, "load", web)
+    monkeypatch.setattr(sf, "my_steamid", lambda root: "x")
+    core._steam_bridge = FakeBridge()
+    assert (await core.steam_friends())["error"] == "no key" and calls == ["web"]      # off: the Web API as before
+    core.settings.set("own_overlay", True)
+    d = await core.steam_friends(force=True)
+    assert d["live"] and d["friends"][0]["name"] == "Jinx" and calls == ["web", "client"]
+
+    class Down:
+        async def friends(self):
+            raise BridgeError("Steam is not running.")
+    core._steam_bridge = Down()
+    assert (await core.steam_friends(force=True))["error"] == "no key"                 # the client away: Web API

@@ -271,8 +271,12 @@ SYMBOL_SPECIAL = [("⇧", 2), ("SPACE", 3), ("⌫", 1), ("CLEAR", 2), ("DONE", 2
 
 
 class Keyboard:
-    """On-screen keyboard: D-pad to move, A types, B deletes (closes when empty), Start is Done. A real keyboard
-    types into it too."""
+    """On-screen keyboard: D-pad to move, A types the key, and on every controller B is Backspace (closes it when
+    empty), X / Y (□ / △) is Space and Start is Enter (Done / Send) — written along the keyboard's bottom. A real
+    keyboard types into it too."""
+
+    # the controller's shortcuts, as drawn along the keyboard (the last one is Enter: done_label)
+    SHORTCUTS = (("b", "Backspace"), ("x", "Space"))
 
     def __init__(self, w, title: str, on_done: Callable[[str], None], text: str = "", done_label: str = "Search",
                  on_cancel: Callable[[], None] | None = None, symbols: bool = False, limit: int = 80):
@@ -306,14 +310,50 @@ class Keyboard:
             self.col = (self.col + 1) % self._row_len(self.row)
         elif name == "a":
             self.press(self.row, self.col)
-        elif name in ("b", "x"):
+        elif name == "b":
             if self.text:
                 self.text = self.text[:-1]
-            elif name == "b":
+            else:
                 self.cancel()
+        elif name == "x":
+            self.type(" ")
         elif name == "start":
             self.done()
-        # lt / rt / select / home: nothing while typing
+        # lb / rb / lt / rt / select / home: nothing while typing
+
+    NAV_KEYS = {Qt.Key_Up: "up", Qt.Key_Down: "down", Qt.Key_Left: "left", Qt.Key_Right: "right"}
+
+    def key(self, key: int, text: str, steam: str | None, from_pad: bool, repeat: bool = False) -> str | None:
+        """A key pressed while the keyboard is up (the windows that show it send every key here). ``steam``: the
+        Steam controller button the key stands for (Steam sends its controller as keys outside games — its A is
+        Enter, B Esc); ``from_pad``: the keys come from a controller. A held key repeats only moving and deleting.
+        Returns the controller action it was (for the sounds), None when it typed or did nothing."""
+        nav = self.NAV_KEYS.get(key)
+        name = nav or steam
+        if name is None and from_pad and key in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Escape):
+            # Enter is a pad's A (press the key in focus), Esc its B: Enter used to finish at once with an empty
+            # box and Esc to close it, so not one letter could be typed (the Store, then the quick menu's chat)
+            name = "b" if key == Qt.Key_Escape else "a"
+        if name is not None:
+            if repeat and name not in ("up", "down", "left", "right", "b"):
+                return None
+            if name in ("up", "down", "left", "right", "a", "b", "x", "start"):
+                self.command(name)
+                return name
+            return None
+        if key in (Qt.Key_Return, Qt.Key_Enter):
+            if not repeat:
+                self.done()
+                return "start"
+        elif key == Qt.Key_Escape:
+            if not repeat:
+                self.cancel()
+        elif key == Qt.Key_Backspace:
+            self.text = self.text[:-1]
+        elif text and text.isprintable():
+            self.typed = True                            # letters from a real keyboard
+            self.type(text)
+        return None
 
     def _map_col(self, frm: int, to: int) -> int:
         """Keep the column roughly where it was when moving between the letter rows and the wide bottom row."""
@@ -365,13 +405,13 @@ class Keyboard:
         W, H = w.width(), w.height()
         nrows = len(self.rows) + 1
         ws = w._s()
-        s = min(ws, (H - 202 * ws) / (250 + nrows * 96))   # the whole keyboard fits between the bars at any size
+        s = min(ws, (H - 202 * ws) / (290 + nrows * 96))   # the whole keyboard fits between the bars at any size
         p.fillRect(w.rect(), QColor(0, 0, 0, 165))
         unit = min(96 * s, (W - 160 * s) / 10.6)
         gap = unit * 0.12
         kw = unit - gap
         pw = 10 * unit + 80 * s
-        ph = nrows * unit + 250 * s
+        ph = nrows * unit + 290 * s                          # (40 of it: the controller's shortcuts)
         panel = QRectF((W - pw) / 2, max(100 * ws, H - 76 * ws - ph - 20 * s), pw, ph)
         path = QPainterPath()
         path.addRoundedRect(panel, 26 * s, 26 * s)
@@ -416,6 +456,22 @@ class Keyboard:
             self._key(p, kr, text, r == self.row and c == self.col, r * 100 + c, primary=lbl == "DONE",
                       lit=lbl == "⇧" and self.shift)
             x += wdt * unit
+        self._paint_shortcuts(p, x0, y + nrows * unit + 42 * s, pw - 80 * s)
+
+    def _paint_shortcuts(self, p: QPainter, x: float, y: float, width: float) -> None:
+        """Along the bottom: the controller's buttons for Backspace, Space and Enter, drawn the way the controller in
+        use shows them (○ △ Options on a PlayStation pad, B X Menu on an Xbox one, a Steam controller's own)."""
+        couch = self.w if hasattr(self.w, "pad_family") else getattr(self.w, "couch", None)
+        if couch is None or not getattr(couch, "pad_family", ""):
+            return                                      # a real keyboard: its own keys do it
+        hints = [*self.SHORTCUTS, ("start", "Enter" if self.done_label.lower() in ("search", "enter") else
+                                   f"Enter ({self.done_label})")]
+        hints = couch.usable_hints(hints)
+        p.save()
+        p.setClipRect(QRectF(x, y - 30 * couch._s(), width, 60 * couch._s()))
+        for action, text in hints:
+            x = couch._glyph(p, x, y, action, text)
+        p.restore()
 
     def _key(self, p: QPainter, r: QRectF, text: str, focused: bool, idx: int, primary: bool = False,
              lit: bool = False) -> None:
@@ -2358,8 +2414,12 @@ class SettingsPage(Page):
                           right=lambda: self._cycle_display("couch_screen", screens, 1)))
         modes = [("fullscreen", "Full screen"), ("borderless", "Borderless window"), ("custom", "Custom size")]
         mode = str(st.get("couch_window") or "fullscreen")
-        items.append(Item("Window", lambda: self._cycle_display("couch_window", modes, 1),
-                          "Try “Borderless window” or a custom size if couch mode does not fill your screen",
+        from ezgd.ui.couch import on_wayland
+        # (on Wayland a borderless window is full screen — the same picture — so only a custom size is a different
+        # try; a friend's KDE kept a full-screen couch mode small while a custom size filled it every time)
+        tip = ("Try “Custom size” at your screen's resolution if couch mode does not fill your screen"
+               if on_wayland() else "Try “Borderless window” or a custom size if couch mode does not fill your screen")
+        items.append(Item("Window", lambda: self._cycle_display("couch_window", modes, 1), tip,
                           "choice", dict(modes).get(mode, "Full screen"),
                           left=lambda: self._cycle_display("couch_window", modes, -1),
                           right=lambda: self._cycle_display("couch_window", modes, 1)))

@@ -388,6 +388,7 @@ def test_the_ps_button_still_opens_the_menu_when_running_came_before_started(ui,
     a = _running(win, core, tmp_path, qtbot, "Order Game")
     couch = _open_couch(win, qtbot)
     qtbot.waitUntil(lambda: a.id in couch.running, timeout=5000)
+    qtbot.wait(600)                                                    # (opening: activated, size checked)
     couch.running.discard(a.id)
     couch._launching = True                                        # Play pressed in couch mode …
     couch._launch_at[a.id] = __import__("time").monotonic()

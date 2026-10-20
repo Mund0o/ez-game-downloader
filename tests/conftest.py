@@ -17,6 +17,9 @@ import pytest
 # no test may ever see (or change) this computer's real Steam: 2026-10-12 a test found the user's real Steam game
 # and unpacked a dummy fix into it. Tests that need Steam build a fake one and point "steam_root" at it.
 os.environ["EZGD_STEAM_ROOT"] = "/nonexistent/ezgd-test-steam"
+# nor talk to it: 2026-10-20 a quick-menu test reached the real Steam client's debugging port (our overlay's bridge)
+# and listed the user's real chats. Port 1: nothing listens; bridge tests start a fake Steam on a port of their own.
+os.environ["EZGD_STEAM_BRIDGE_PORT"] = "1"
 os.environ["EZGD_NO_GAMEPADS"] = "1"       # never the real controllers (a game played meanwhile pressed buttons in tests)
 os.environ["EZGD_NO_INTRO"] = "1"          # couch mode opens straight away (tests of the intro switch it back on)
 os.environ["EZGD_NO_SOUNDS"] = "1"         # couch mode's sounds are only counted, never played through the speakers

@@ -31,7 +31,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-HOST, PORT = "127.0.0.1", 8080
+HOST, PORT = "127.0.0.1", int(os.environ.get("EZGD_STEAM_BRIDGE_PORT") or 8080)   # (tests: never the real Steam)
 MARKER = ".cef-enable-remote-debugging"
 TARGET = "SharedJSContext"
 _INVITE = re.compile(r"\[(lobbyinvite|gameinvite)\b([^\]]*)\]", re.I)
@@ -71,6 +71,40 @@ def switch_off(steam_root: Path | None) -> None:
     if m is not None and m.is_file():
         m.unlink()
         log.info("Steam client bridge: debugging interface switched off (from the next Steam start)")
+
+
+# ------------------------------------------------------------------ invite cool-down
+class InviteLimiter:
+    """A cool-down on invites to the same friend that grows while they keep coming. One invite, and another a
+    minute later because the first did not arrive, is never held up (only a press within ``BASE`` seconds — a
+    double press or a held button — is). An invite sent before the last cool-down has been over for ``CALM``
+    seconds counts as spam: each one doubles the wait (``STEP``, 2×, 4× … up to ``MAX``). Seen on a friend's PC: a
+    held button sent 230 invites in 40 seconds."""
+
+    BASE, STEP, CALM, MAX = 3.0, 15.0, 30.0, 300.0
+
+    def __init__(self) -> None:
+        self._last: dict[int, tuple[float, int, float]] = {}       # friend → (sent at, strikes, cool-down)
+
+    def wait(self, friend: int, now: float) -> float:
+        """Seconds until ``friend`` may be invited again (0: now)."""
+        at, _strikes, cool = self._last.get(friend, (0.0, 0, 0.0))
+        return max(0.0, at + cool - now) if friend in self._last else 0.0
+
+    def refusal(self, friend: int, now: float) -> str:
+        """Why an invite now is held back ("" when it is not)."""
+        left = self.wait(friend, now)
+        if left <= 0:
+            return ""
+        if self._last[friend][1] == 0:
+            return "Invite already sent."
+        return f"Too many invites in a row — wait {max(1, round(left))} s before inviting them again."
+
+    def sent(self, friend: int, now: float) -> None:
+        at, strikes, cool = self._last.get(friend, (0.0, 0, 0.0))
+        strikes = strikes + 1 if friend in self._last and now - at < cool + self.CALM else 0
+        cool = self.BASE if strikes == 0 else min(self.MAX, self.STEP * 2 ** (strikes - 1))
+        self._last[friend] = (now, strikes, cool)
 
 
 # ------------------------------------------------------------------ messages
@@ -120,6 +154,16 @@ let connect='';try{connect=me.connect_string||(me.m_mapRichPresence&&me.m_mapRic
 return {self:{accountid:fs.self.accountid,appid:me.m_unGamePlayedAppID||0,lobby:String(me.m_game_lobby_id||'0'),
  connect:String(connect||''),game:me.m_strGameExtraInfo||''},chats:chats}})()"""
 
+# every friend as Steam's own friends list has them: live status, game, lobby, picture — no Web API key needed
+_JS_FRIENDS = """(()=>{const fs=g_FriendsUIApp.m_FriendStore;
+const one=p=>{const r=p.persona;const g=k=>{try{return p[k]}catch(e){return undefined}};let av='';try{av=r.avatar_url_medium||''}catch(e){}
+return {accountid:p.accountid,name:g('display_name')||r.m_strPlayerName||'',state:r.m_ePersonaState||0,
+ appid:r.m_unGamePlayedAppID||0,gameid:String(r.m_gameid||'0'),game:g('current_game_name')||r.m_strGameExtraInfo||'',
+ lobby:String(r.m_game_lobby_id||'0'),ip:r.m_unGameServerIP||0,port:r.m_unGameServerPort||0,avatar:av,
+ last:r.m_rtLastSeenOnline||0}};
+const out=[];for(const id of fs.m_setFriendAccountIDs){const p=fs.m_mapPlayerCache.get(id);if(p&&p.is_friend!==false)out.push(one(p))}
+return {self:one(fs.self),friends:out}})()"""
+
 _JS_HISTORY = """(async(acct,limit,read)=>{const a=g_FriendsUIApp,c=a.m_ChatStore.GetFriendChat(acct,true);
 if(!c)return null;try{await c.LoadChatLogs()}catch(e){}
 const m=(c.m_rgChatMessages||[]).slice(-limit).map(x=>({from:x.unAccountID,time:x.rtTimestamp,text:x.strMessage||''}));
@@ -168,6 +212,14 @@ class Bridge:
             inv = parse_invite(c.get("last") or "")
             c["invite"] = inv if inv and c.get("last_from") == c.get("accountid") else None
             c["last"] = clean_text(c.get("last") or "")
+        return out
+
+    async def friends(self) -> dict:
+        """{"self": {…}, "friends": [{accountid, name, state (Steam's persona state number), appid, gameid, game,
+        lobby, ip, port, avatar, last}]} — the Steam client's own friends list, live."""
+        out = await self.eval(_JS_FRIENDS, timeout=15)
+        if not isinstance(out, dict) or not isinstance(out.get("friends"), list):
+            raise BridgeError("Steam did not answer.")
         return out
 
     async def history(self, accountid: int, limit: int = 40, mark_read: bool = True) -> list[dict]:

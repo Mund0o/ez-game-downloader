@@ -994,6 +994,15 @@ class BrowserDownloadDialog(QDialog):
         self.close()
 
 
+def existing_manager(actions) -> BrowserDownloads | None:
+    """The browser's downloads if the browser has been used this run, else None — without starting the web
+    engine (that took 150–200 ms on the UI thread: couch mode asked for it a second after opening, mid-intro)."""
+    if not AVAILABLE or _MANAGER is None:
+        return None
+    import shiboken6
+    return _MANAGER if shiboken6.isValid(_MANAGER) and _MANAGER.actions is actions else None
+
+
 def active_count() -> int:
     """Running in-app browser transfers (for the quit prompt)."""
     if not AVAILABLE or _MANAGER is None:

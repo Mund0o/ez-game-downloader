@@ -152,6 +152,7 @@ class QuickMenu(QWidget):
         self.busy = ""                     # "Suspending…" while an action is under way
         self.friends: dict | None = None   # Steam friends (core.steam_friends), asked for when the menu opens
         self.friends_error = ""
+        self.friend_query = ""             # the friends list's search: only the friends whose name has it
         self.friend: dict | None = None    # friend view: the friend chosen
         self.chats: dict | None = None     # our overlay: Steam's chats through the client bridge (core.steam_chats)
         self.chat_msgs: list[dict] = []    # chat view: the conversation with self.friend
@@ -448,19 +449,28 @@ class QuickMenu(QWidget):
             from ezgd.platform.steamfriends import to_steamid64
             url = steambridge.join_url(inv, to_steamid64(c["accountid"]))
             out.append(Row(f"inv-{c['accountid']}", f"Join {name}", f"{name} invited you to play — A joins",
-                           "primary", action=lambda u=url, n=name: self._join(u, n)))
+                           "primary", action=lambda u=url, n=name, a=inv["appid"]: self._join(u, n, a)))
         return out
 
-    def _join(self, url: str, name: str) -> None:
-        """Join a friend's game through Steam (no window): the game being played is suspended first."""
+    def _join(self, url: str, name: str, appid: str = "") -> None:
+        """Join a friend's game through Steam (no window). An invite to the game being played goes to that game —
+        Steam hands the running game the lobby, so it must keep running (suspending it first froze Slay the Spire 2
+        on the invite). Only a different game suspends the one being played, like switching games."""
         b = self.couch.bridge
+        g = self.game
 
         def go() -> None:
             b.call(b.core.steam_open(url), lambda _r: None,
                    lambda e: self.couch.actions.toasts.show("Could not join", str(e), "warning"), owner=self.couch)
-        log.info("our overlay: joining %s", name)
-        if self.game is not None and self.game.id in self.couch.running and not self._suspended(self.game):
+        playing = g is not None and g.id in self.couch.running and not self._suspended(g)
+        mine = str(((self.chats or {}).get("self") or {}).get("appid") or "")
+        other = bool(appid) and mine not in ("", "0") and str(appid) != mine
+        log.info("our overlay: joining %s (%s)", name, "another game" if other else "the game being played"
+                 if playing else "no game running")
+        if playing and other:
             self._then_suspend(lambda: self.close_menu(go))
+        elif playing:
+            self.close_menu(lambda: (self.couch.go_to_game(g), go()))
         else:
             self.close_menu(go)
 
@@ -510,8 +520,9 @@ class QuickMenu(QWidget):
             if m.get("invite") and not m["mine"] and now - m["time"] < 6 * 3600:
                 url = steambridge.join_url(m["invite"], to_steamid64(self._acct(f)))
                 rows.append(Row(f"join-{k}", "Join their game", "Steam joins you up", "primary",
-                                action=lambda u=url, n=f.get("name", ""): self._join(u, n)))
-        rows.append(Row("write", "Write a message", "The on-screen keyboard — Start sends", "primary",
+                                action=lambda u=url, n=f.get("name", ""), a=m["invite"]["appid"]:
+                                self._join(u, n, a)))
+        rows.append(Row("write", "Write a message", "The on-screen keyboard — Start sends it", "primary",
                         action=self._write))
         return rows
 
@@ -555,11 +566,21 @@ class QuickMenu(QWidget):
         b = self.couch.bridge
 
         def got(data: dict) -> None:
+            fresh = self.friends is None
+            row = self.rows[self.focus] if 0 <= self.focus < len(self.rows) else None
+            kept = (row.extra.get("friend") or {}).get("steamid") if row is not None else None
             self.friends, self.friends_error = data, ""
             if self.friend is not None:                  # (the friend view keeps showing the fresh status)
                 self.friend = next((f for f in data.get("friends") or [] if f["steamid"] == self.friend["steamid"]),
                                    self.friend)
             self._build()
+            if self.view == "friends":
+                # the list opens on the first friend (in a game / online come first; the search is one up), and a
+                # refresh that reorders it (someone came online) keeps the selection on the same friend
+                at = next((k for k, r in enumerate(self.rows) if r.kind == "friend" and
+                           (fresh or r.extra["friend"].get("steamid") == kept)), None)
+                if at is not None and (fresh or kept):
+                    self.focus = at
             self.update()
 
         def failed(err) -> None:
@@ -574,7 +595,7 @@ class QuickMenu(QWidget):
         self.focus = 0
         self._row_top = 0
         self._build()
-        self.focus = self._first()
+        self.focus = next((k for k, r in enumerate(self.rows) if r.kind == "friend"), self._first())
         self._load_friends()
         self._friends_tick.start()
         self.update()
@@ -588,7 +609,14 @@ class QuickMenu(QWidget):
             rows.append(Row("h-note", note, kind="header", extra={"note": True}))
         if self.friends is None and not self.friends_error:
             rows.append(Row("h-wait", "Asking Steam…", kind="header", extra={"note": True}))
-        for k, f in enumerate(d.get("friends") or []):
+        from ezgd.ui.couch_friends import matching, search_note
+        found = matching(d.get("friends") or [], self.friend_query)
+        if self.friend_query:
+            rows.append(Row("f-search", search_note(self.friend_query, len(found)), "A searches again · B shows "
+                            "everyone", action=self.find_friend))
+        elif d.get("friends"):
+            rows.append(Row("f-search", "Find a friend", "Search your friends by name", action=self.find_friend))
+        for k, f in enumerate(found):
             note = f.get("status") or ""
             c = self._chat_of(f) if self._bridged() else None
             if c and c.get("unread"):
@@ -596,6 +624,19 @@ class QuickMenu(QWidget):
             rows.append(Row(f"friend-{k}", f.get("name", ""), note, "friend",
                             action=lambda f=f: self.open_friend(f), extra={"friend": f}))
         return rows
+
+    def find_friend(self) -> None:
+        from ezgd.ui.couch_pages import Keyboard
+        self.keyboard = Keyboard(self, "Find a friend", self._found, text=self.friend_query, done_label="Find",
+                                 symbols=True, limit=40)
+        self.update()
+
+    def _found(self, text: str) -> None:
+        self.friend_query = text.strip()
+        self._row_top = 0
+        self._build()
+        self.focus = next((k for k, r in enumerate(self.rows) if r.kind == "friend"), self._first())
+        self.update()
 
     def open_friend(self, f: dict) -> None:
         self.friend = f
@@ -643,7 +684,7 @@ class QuickMenu(QWidget):
             else:
                 url = steamfriends.join_url(f) if action == "join" else steamfriends.launch_url(f)
                 if url:
-                    self._join(url, f.get("name", ""))
+                    self._join(url, f.get("name", ""), str(f.get("gameid") or ""))
             return
         if action in ("join", "launch"):
             self._then_suspend(lambda: self.close_menu(lambda: open_action(self.couch, action, f)))
@@ -667,6 +708,7 @@ class QuickMenu(QWidget):
                                r.extra["friend"].get("steamid") == keep.get("steamid")), self._first())
         else:
             self.view = "main"
+            self.friend_query = ""
             self._friends_tick.stop()
             self._row_top = 0
             self._build()
@@ -909,6 +951,10 @@ class QuickMenu(QWidget):
         before = (self.view, self.focus, self.grid_focus)
         if self.view == "switch":
             self._grid_command(name)
+        elif self.view == "friends" and name == "x":
+            self.find_friend()
+        elif self.view == "friends" and name == "b" and self.friend_query:
+            self._found("")                              # B: the search goes first, then the list
         elif self.view in ("friends", "friend", "chat") and name in ("b", "start"):
             self._back_from_friends()
         elif self.view in ("confirm", "starting") and name == "b":
@@ -964,24 +1010,30 @@ class QuickMenu(QWidget):
 
     def keyPressEvent(self, e) -> None:                       # noqa: N802
         kb = self.keyboard
-        if kb is not None and e.text() and e.text().isprintable() and e.key() not in (Qt.Key_Escape,):
-            kb.typed = True
-            kb.type(e.text())                            # a real keyboard types into it
+        steam = self.couch.key_action(e.key())          # (a Steam controller's buttons, sent as keys by Steam)
+        if kb is not None:
+            # the same typing as couch mode's keyboard: a Steam controller's A arrives as Enter, which finished
+            # (sent) the message at once, so nothing could be typed with it
+            from_pad = bool(self.couch.pads.steam_hw) or not kb.typed
+            done = kb.key(e.key(), e.text(), steam, from_pad, e.isAutoRepeat())
+            if done == "a":
+                self.couch.sounds.play("select")
+            elif done in ("up", "down", "left", "right"):
+                self.couch.sounds.play("move")
             self.update()
             return
-        if kb is not None and e.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Escape, Qt.Key_Backspace):
-            if e.key() == Qt.Key_Backspace:
-                kb.text = kb.text[:-1]
-            elif e.key() == Qt.Key_Escape:
-                kb.cancel()
-            else:
-                kb.done()
-            self.update()
-            return
-        name = self.couch.key_action(e.key()) or {      # (a Steam controller's buttons, sent as keys by Steam)
+        name = steam or {
             Qt.Key_Up: "up", Qt.Key_Down: "down", Qt.Key_Left: "left", Qt.Key_Right: "right",
             Qt.Key_Return: "a", Qt.Key_Enter: "a", Qt.Key_Space: "a", Qt.Key_Escape: "b",
             Qt.Key_Backspace: "b"}.get(e.key())
+        if name is None and self.view == "friends" and e.text().strip() and e.text().isprintable():
+            self.find_friend()                           # a name typed on a real keyboard: the search
+            self.keyboard.typed = True
+            self.keyboard.type(e.text())
+            self.update()
+            return
+        if name and e.isAutoRepeat() and name not in ("up", "down", "left", "right"):
+            return                                       # a held button presses once (it sent 230 invites)
         if name:
             self.command(name)
 
@@ -1526,7 +1578,9 @@ class QuickMenu(QWidget):
         line = QColor(255, 255, 255, 30)
         p.setPen(QPen(line, 1 * s))
         p.drawLine(r.left(), y - 34 * s, r.right(), y - 34 * s)
-        if self.view == "switch":
+        if self.keyboard is not None:
+            hints = [("a", "Type"), ("b", "Backspace"), ("x", "Space"), ("start", self.keyboard.done_label)]
+        elif self.view == "switch":
             hints = [("a", "Play"), ("dpad", "Choose"), ("b", "Back")]
         elif self.view == "confirm":
             hints = [("a", "Select"), ("b", "Back")]
@@ -1534,9 +1588,11 @@ class QuickMenu(QWidget):
             hints = [] if not self.start_error else [("a", "Select")]
         elif self.view == "chat":
             hints = [("a", "Select"), ("b", "Back")]
-        elif self.view in ("friends", "friend"):
-            hints = ([("a", "Options")] if self.view == "friends" and any(r.kind == "friend" for r in self.rows) else
-                     [("a", "Select")] if self.view == "friend" else []) + [("b", "Back")]
+        elif self.view == "friends":
+            hints = ([("a", "Options")] if any(r.kind == "friend" for r in self.rows) else []) + \
+                [("x", "Search"), ("b", "Show everyone" if self.friend_query else "Back")]
+        elif self.view == "friend":
+            hints = [("a", "Select"), ("b", "Back")]
         else:
             row = self.rows[self.focus] if 0 <= self.focus < len(self.rows) else None
             hints = [("a", "Select")]

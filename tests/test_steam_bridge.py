@@ -133,3 +133,44 @@ def test_the_marker_switches_debugging_on_and_off(tmp_path):
     sb.switch_off(tmp_path)
     assert not sb.switched_on(tmp_path)
     assert len(sb.FIRST_TIME) == 2                           # (the first-time note: two lines, no more)
+
+
+def test_invite_cool_down_grows_only_with_spam():
+    """A held button / mashing: each invite before the last cool-down has calmed down doubles the wait. One invite
+    and another a minute later (the first did not arrive) never wait; only a double press within 3 s is held."""
+    lim = sb.InviteLimiter()
+    assert lim.refusal(7, 0) == ""
+    lim.sent(7, 0)
+    assert lim.refusal(7, 1) == "Invite already sent."
+    assert lim.refusal(8, 1) == ""                       # (another friend: no wait)
+    lim.sent(7, 3)                                       # spam: 15 s
+    assert "wait 15 s" in lim.refusal(7, 3)
+    lim.sent(7, 18)
+    assert "wait 30 s" in lim.refusal(7, 18)
+    t = 18
+    for want in (60, 120, 240, 300, 300):                # … up to five minutes
+        t += lim.wait(7, t)
+        lim.sent(7, t)
+        assert lim.wait(7, t) == want
+    calm = sb.InviteLimiter()                            # one a minute because the first failed: never held up
+    for k in range(5):
+        assert calm.refusal(9, k * 60) == ""
+        calm.sent(9, k * 60)
+    assert calm.wait(9, 4 * 60 + 4) == 0
+
+
+def test_core_holds_back_spammed_invites(monkeypatch):
+    import types
+    from ezgd.core.app_core import AppCore
+    sent = []
+
+    class FakeBridge:
+        async def invite(self, acct):
+            sent.append(acct)
+            return "lobby"
+    core = types.SimpleNamespace(_bridge=lambda: FakeBridge())
+    invite = AppCore.steam_invite.__get__(core)
+    assert asyncio.run(invite(5)) == "lobby"
+    with pytest.raises(RuntimeError, match="already sent"):
+        asyncio.run(invite(5))
+    assert sent == [5]

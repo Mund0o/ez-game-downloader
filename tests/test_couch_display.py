@@ -81,6 +81,49 @@ def test_a_borderless_window_kwin_left_small_is_sized_once_it_is_mapped(ui, qtbo
     couch.force_close()
 
 
+def test_full_screen_shrunk_back_by_kwin_fills_the_screen_again(ui, qtbot, monkeypatch):
+    """A friend's KWin (2026-10-20): full screen filled the monitor, then a second later KWin handed couch mode the
+    desktop window's size again (1711×989 of 2560×1440) and it stayed small until a game had been played. A window
+    that filled the screen and is shrunk back is filled again — a few times per showing, never in a loop."""
+    from PySide6.QtCore import QSize
+    win, core, _ = ui
+    couch = _open_couch(win, qtbot)
+    monkeypatch.setattr(couch.wc, "kwin", True)
+    monkeypatch.setattr(couch, "isFullScreen", lambda: True)
+    asked = []
+    monkeypatch.setattr(couch.wc, "force_fullscreen", lambda name="": asked.append(name))
+    g = couch.screen().geometry()
+    size = [g.width(), g.height()]
+    monkeypatch.setattr(couch, "width", lambda: size[0])
+    monkeypatch.setattr(couch, "height", lambda: size[1])
+    couch._size_tries = 2                                           # the checks after showing are over
+    couch._refits = 0
+    size[:] = [int(g.width() * 0.66), int(g.height() * 0.68)]       # KWin shrinks it back
+    couch._shrunk(QSize(g.width(), g.height()))
+    assert couch._refit.isActive()
+    qtbot.waitUntil(lambda: bool(asked), timeout=3000)
+    assert couch._refits == 1 and len(asked) == 1                   # filled again
+    size[:] = [g.width(), g.height()]
+    qtbot.wait(700)                                                 # (the check after it: right size, nothing more)
+    assert len(asked) == 1
+    for _ in range(5):                                              # KWin keeps shrinking it: three tries, no loop
+        size[:] = [int(g.width() * 0.66), int(g.height() * 0.68)]
+        couch._shrunk(QSize(g.width(), g.height()))
+        if couch._refit.isActive():
+            couch._refit.stop()
+            couch._refill()
+        couch._size_tries = 2
+    assert couch._refits == 3
+    couch._shrunk(QSize(g.width(), g.height()))
+    assert not couch._refit.isActive()
+    asked.clear()                                                   # a window that was never full: _fit_screen's job
+    couch._refits = 0
+    couch._shrunk(QSize(200, 200))
+    assert not couch._refit.isActive()
+    monkeypatch.undo()
+    couch.force_close()
+
+
 def test_moving_to_another_screen_on_wayland_reopens_instead_of_leaving_full_screen(ui, qtbot, monkeypatch):
     win, core, _ = ui
     couch = _open_couch(win, qtbot)
@@ -185,3 +228,12 @@ def test_borderless_is_full_screen_on_wayland(ui, qtbot, monkeypatch):
     assert couch.display_target()[2] == "fullscreen"
     monkeypatch.undo()
     couch.force_close()
+
+
+def test_the_frame_pump_runs_faster_when_the_gpu_draws():
+    """Frames go out at a whole fraction of the screen's rate: at most 75 Hz when the CPU draws, at most 144 Hz when
+    the GPU does (a 240 Hz screen: 120 frames — half the wait between a press and the screen)."""
+    pace = C.CouchWindow.pace_ms
+    assert pace(240, False) == 17 and pace(240, True) == 8              # 60 / 120 Hz
+    assert pace(144, True) == 7 and pace(144, False) == 14              # 144 / 72 Hz
+    assert pace(160, True) == 12 and pace(60, True) == 17 and pace(0, True) == 17

@@ -2353,14 +2353,26 @@ class AppCore:
         """Steam friends with their live status (see platform.steamfriends)."""
         from ezgd.platform import steamfriends
         key = self.settings.settings.steam_web_api_key
+        bridged = bool(self.settings.settings.own_overlay)
         cached = self._friends_cache
-        if cached is not None and not force and cached[0] == key and time.time() - cached[1]["at"] < self.FRIENDS_TTL:
+        if cached is not None and not force and cached[0] == (key, bridged) and \
+                time.time() - cached[1]["at"] < self.FRIENDS_TTL:
             return cached[1]
+        if bridged:                     # our overlay: the Steam client's own list — live, without a Web API key
+            from ezgd.platform.steambridge import BridgeError
+            try:
+                raw = await self._bridge().friends()
+                me = steamfriends.my_steamid(self.library.steam_root()) or ""
+                data = steamfriends.from_client_list(raw, me)
+                self._friends_cache = ((key, bridged), data)
+                return data
+            except BridgeError as exc:
+                log.info("Steam friends: the Steam client did not answer (%s) — the Web API instead", exc)
         try:
             data = await steamfriends.load(self.client, self.library.steam_root(), key)
         except steamfriends.FriendsError as exc:
             raise RuntimeError(str(exc)) from None
-        self._friends_cache = (key, data)
+        self._friends_cache = ((key, bridged), data)
         return data
 
     # ------------------------------------------------------------ our overlay: the Steam client bridge
@@ -2432,12 +2444,19 @@ class AppCore:
         log.info("our overlay: message sent")
 
     async def steam_invite(self, accountid: int) -> str:
-        """One click: Steam's own "Invite to Game" for the game you are in (lobby or connect string)."""
-        from ezgd.platform.steambridge import BridgeError
+        """One click: Steam's own "Invite to Game" for the game you are in (lobby or connect string). Invites that
+        keep coming to the same friend wait out a growing cool-down (steambridge.InviteLimiter)."""
+        from ezgd.platform.steambridge import BridgeError, InviteLimiter
+        if getattr(self, "_invite_limit", None) is None:
+            self._invite_limit = InviteLimiter()
+        no = self._invite_limit.refusal(int(accountid), time.monotonic())
+        if no:
+            raise RuntimeError(no)
         try:
             how = await self._bridge().invite(accountid)
         except BridgeError as exc:
             raise RuntimeError(str(exc)) from None
+        self._invite_limit.sent(int(accountid), time.monotonic())
         log.info("our overlay: invite sent (%s)", how)
         return how
 

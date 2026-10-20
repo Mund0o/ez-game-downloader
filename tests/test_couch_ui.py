@@ -899,3 +899,18 @@ def test_a_torrent_from_the_couch_browser_shows_once_on_the_desktop(ui, qtbot, s
     assert [r.snap["title"] for _i, r in page.rows.values()] == ["T Game"] and not page.browser_rows
     item, row = next(iter(page.rows.values()))
     qtbot.waitUntil(lambda: row.height() >= row.sizeHint().height(), timeout=3000)   # (not squashed)
+
+
+def test_couch_mode_never_starts_the_web_engine_to_look_for_browser_downloads(ui, qtbot, monkeypatch):
+    """Couch mode asked the in-app browser for its downloads a second after opening — which started the whole web
+    engine (150–200 ms frozen, mid-intro) when the browser had not been used at all."""
+    from ezgd.ui.dialogs import browser
+    win, core, _ = ui
+    monkeypatch.setattr(browser, "_MANAGER", None)
+    made = []
+    monkeypatch.setattr(browser, "BrowserDownloads", lambda actions: made.append(actions))
+    couch = _open_couch(win, qtbot)
+    couch._poll_downloads()
+    couch._poll_browser()
+    assert made == [] and browser._MANAGER is None and couch.browser_downloads == []
+    couch.force_close()

@@ -41,6 +41,10 @@ class _Overlay(QWidget):
         self.setAttribute(Qt.WA_NoSystemBackground)
 
     # the host interface the on-screen keyboard draws with (same as couch mode's window)
+    @property
+    def couch(self):
+        return self.cb.couch
+
     def _s(self) -> float:
         return self.cb.couch._s()
 
@@ -421,7 +425,7 @@ class CouchBrowser:
         x = 40 * s
         if self.overlay.keyboard is not None:
             hints = ([("start", "Enter"), ("b", "Close")] if couch.pad_family == ""
-                     else [("a", "Type"), ("b", "Delete"), ("start", "Enter")])
+                     else [("a", "Type"), ("b", "Backspace"), ("x", "Space"), ("start", "Enter")])
         elif self.menu is not None:
             hints = [("a", "Select"), ("b", "Back")]
         elif couch.pad_family == "steam" and couch.pads.steam_as_keys():

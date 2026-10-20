@@ -133,7 +133,11 @@ class Images:
         self.closed = False
         artwork.warm_up()
 
+    frame_dpr = 0.0                       # set by the window for the frame being drawn (0: ask the window)
+
     def dpr(self) -> float:
+        if self.frame_dpr:
+            return self.frame_dpr
         try:
             return max(1.0, float(self.owner.devicePixelRatioF()))
         except Exception:
@@ -523,6 +527,12 @@ class _Couch:
         self._waiting: dict[str, QRectF] = {}           # picture url → the tile waiting for it
         self._move_tries: dict[str, int] = {}           # screen name → attempts to move there (see _fit_screen)
         self._size_tries = 0                             # attempts to make a too-small "full screen" fill it
+        self._titled = False                             # the last tile drawn wrote the game's title on itself
+        self._refits = 0                                 # times it was shrunk back after filling (see _shrunk)
+        self._refit = QTimer(self)
+        self._refit.setSingleShot(True)
+        self._refit.setInterval(500)
+        self._refit.timeout.connect(self._refill)
         self._bands: OrderedDict = OrderedDict()       # see _copy_tile
         self._shown: dict[tuple, tuple] = {}     # tile → the picture it showed last
         self._tab_fit: dict[tuple, tuple[float, bool]] = {}
@@ -960,6 +970,7 @@ class _Couch:
             handle.requestActivate()
         self.wc.keep_above(True)
         self.wc.activate()                              # Wayland would not give the focus back by itself
+        self._refits = 0
         QTimer.singleShot(250, self, self._fit_screen)
 
     def _poll_downloads(self) -> None:
@@ -970,15 +981,19 @@ class _Couch:
         if self.tab == T_DOWNLOADS:
             self.bridge.call(self.bridge.core.downloads_snapshot(), self._downloads, owner=self)
 
-    def _browser_manager(self):
+    def _browser_manager(self, start: bool = True):
+        """The in-app browser's downloads. ``start`` False: only if the browser was used this run (looking must not
+        start the web engine — 150–200 ms frozen)."""
         from ezgd.ui.dialogs import browser
-        return browser.manager(self.actions) if browser.AVAILABLE else None
+        if not browser.AVAILABLE:
+            return None
+        return browser.manager(self.actions) if start else browser.existing_manager(self.actions)
 
     def _poll_browser(self) -> None:
         """Downloads of the in-app browser (most file hosts) live in the window, not in the core: without these the
         Downloads tab stayed empty while the desktop window listed them."""
         try:
-            m = self._browser_manager()
+            m = self._browser_manager(start=False)          # (never starts the web engine just to look)
             snaps = m.snapshots() if m is not None else []
         except RuntimeError:
             snaps = []
@@ -1023,6 +1038,7 @@ class _Couch:
         self._target_screen = screen or QApplication.primaryScreen()
         self._move_tries.clear()
         self._size_tries = 0
+        self._refits = 0
         if not self.background:
             from ezgd.ui.display_trace import DisplayTrace
             DisplayTrace(self).start()               # the compositor's answers, in the log (display_trace)
@@ -1037,9 +1053,13 @@ class _Couch:
         if screen is not None:
             screen.geometryChanged.connect(lambda _g: self._fit_screen())
         self._set_pace(screen)
-        QTimer.singleShot(250, self, self._fit_screen)    # the window manager has placed it: check it fills it
-        QTimer.singleShot(300, self, lambda: (self.wc.keep_above(True), self.wc.activate()) if not self._exiting
+        # kept above and activated first, its size checked after: in a friend's log KWin shrank a full-screen couch
+        # mode back to the desktop window's size together with activating it — when it was activated after the size
+        # had been fixed, it came back small a second later; coming back from a game (activated, then fixed) it
+        # stayed full. Same order here, and _shrunk fills it again if KWin still does it.
+        QTimer.singleShot(150, self, lambda: (self.wc.keep_above(True), self.wc.activate()) if not self._exiting
                           else None)
+        QTimer.singleShot(450, self, self._fit_screen)    # the window manager has placed it: check it fills it
         first = not self._opened
         self._opened = True
         st = self.actions.settings
@@ -1278,6 +1298,19 @@ class _Couch:
                           [("Keep", keep, "primary"), ("Go back", undo, "ghost")], cancel=undo, tag="display")
 
     # ------------------------------------------------------- steady frames
+    @staticmethod
+    def pace_ms(hz: float, gpu: bool) -> int:
+        """The frame interval: the screen's rate halved until it is at most 75 Hz with the CPU drawing — at most
+        144 Hz when the GPU draws (a frame there takes about a millisecond: a 240 Hz screen gets 120 frames, not
+        60 — half the wait between a press and the screen, and smoother scrolling). Always a whole fraction of the
+        screen's rate, so a VRR screen keeps one steady rate."""
+        if not hz or hz < 30:
+            hz = 60.0
+        cap = 144.5 if gpu else 75.0
+        while hz > cap:
+            hz /= 2
+        return max(6, round(1000 / hz))
+
     def _set_pace(self, screen) -> None:
         """Frames go out at one steady rate (60 Hz, or the screen's own rate when that is a multiple). On a VRR /
         FreeSync / G-Sync screen the refresh rate follows the app's frames: uneven frames made it jump around —
@@ -1285,12 +1318,8 @@ class _Couch:
         if not self.actions.settings.get("couch_steady_frames", True):
             self._pump.stop()                           # switched off in Settings: frames only when something moves
             return
-        hz = float(screen.refreshRate()) if screen is not None else 60.0
-        if not hz or hz < 30:
-            hz = 60.0
-        while hz > 75:
-            hz /= 2
-        self._pump.setInterval(max(8, round(1000 / hz)))
+        self._pump.setInterval(self.pace_ms(float(screen.refreshRate()) if screen is not None else 60.0,
+                                            self.gpu_paint))
         if not self._pump.isActive() and self.isVisible():
             self._pump.start()
 
@@ -1316,8 +1345,10 @@ class _Couch:
             self._request(r.toAlignedRect().adjusted(-2, -2, 2, 2))
 
     def _flush(self) -> None:
-        if (self._dirty or self._areas) and not self._meter.get("asked"):
-            self._meter["asked"] = time.perf_counter()      # (the meter: how long until it is on screen)
+        if (self._dirty or self._areas) and not self._meter.get("asked") and self.isActiveWindow():
+            # (the meter: how long until it is on screen — only while couch mode is in front: behind a game the
+            # compositor stops drawing it, and the friend's log read "wait before painting p50 147828 ms")
+            self._meter["asked"] = time.perf_counter()
         if self._dirty:
             self._dirty = False
             self._areas.clear()
@@ -1643,6 +1674,34 @@ class _Couch:
     def resizeEvent(self, e) -> None:                         # noqa: N802
         super().resizeEvent(e)
         self._drop_caches()
+        self._shrunk(e.oldSize())
+
+    def _short_of(self, w: int, h: int) -> bool:
+        """Is a w×h window short of what the display settings ask for (full screen: the monitor)?"""
+        _target, want, mode = self.display_target()
+        on = self.screen()
+        g = on.geometry() if mode == "fullscreen" and on is not None else want
+        return g is not None and g.width() > 0 and (w < g.width() * 0.92 or h < g.height() * 0.92)
+
+    def _shrunk(self, old) -> None:
+        """Seen on a friend's PC (KWin, 2026-10-20): couch mode filled the screen, then a second later KWin handed it
+        the desktop window's size again (1711×989 of 2560×1440) — and it stayed that small until a game had been
+        played. The checks after showing were over by then, so a window that had filled the screen and is shrunk
+        back is filled again (a few times per showing, never in a loop)."""
+        if self._exiting or not self.isVisible() or self.isMinimized() or self._refits >= 3 or not old.isValid():
+            return
+        if not self._short_of(old.width(), old.height()) and self._short_of(self.width(), self.height()):
+            self._refit.start()
+
+    def _refill(self) -> None:
+        if self._exiting or not self.isVisible() or self.isMinimized() or not self._short_of(self.width(),
+                                                                                              self.height()):
+            return
+        self._refits += 1
+        log.warning("couch mode: shrunk back to %dx%d after filling the screen — filling it again", self.width(),
+                    self.height())
+        self._size_tries = min(self._size_tries, 1)
+        self._fit_screen()
 
     def _drop_caches(self) -> None:
         """Everything drawn ahead (tiles, layers, text) goes: the size, the scale or the colours changed."""
@@ -1662,36 +1721,11 @@ class _Couch:
             return
         steam = self.key_action(k)                            # a Steam controller's button, sent by Steam as a key
         if self.keyboard is not None:                         # typing into the on-screen keyboard
-            nav = {Qt.Key_Up: "up", Qt.Key_Down: "down", Qt.Key_Left: "left", Qt.Key_Right: "right"}.get(k)
             try:
-                if steam is not None and not nav:
-                    if steam in ("a", "b", "x", "start"):    # A types the key, B / Y delete, Start is Done
-                        if steam == "a":
-                            self.sounds.play("select")
-                        self.keyboard.command("b" if steam == "x" else steam)
-                elif nav:
-                    before = self._focus_key()
-                    self.keyboard.command(nav)
-                    self._sound(nav, before)
-                elif k in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Escape) and self._keys_from_a_pad():
-                    # a controller that sends keys (Steam hands its controllers over as keyboard + mouse): Enter is
-                    # its A — press the key in focus — and Esc its B; Enter used to search at once with an empty
-                    # box and Esc to close it, so not one letter could be typed
-                    if k == Qt.Key_Escape:
-                        self.keyboard.command("b")
-                    else:
-                        self.sounds.play("select")
-                        self.keyboard.command("a")
-                elif k in (Qt.Key_Return, Qt.Key_Enter):
-                    self.sounds.play("select")
-                    self.keyboard.done()
-                elif k == Qt.Key_Escape:
-                    self.keyboard.cancel()
-                elif k == Qt.Key_Backspace:
-                    self.keyboard.text = self.keyboard.text[:-1]
-                elif e.text() and e.text().isprintable():
-                    self.keyboard.typed = True                # letters from a real keyboard
-                    self.keyboard.type(e.text())
+                before = self._focus_key()
+                done = self.keyboard.key(k, e.text(), steam, self._keys_from_a_pad(), e.isAutoRepeat())
+                if done:
+                    self._sound(done, before)
             except Exception:
                 log.exception("couch mode: typing failed")
             self.update()
@@ -3335,12 +3369,21 @@ class _Couch:
     # ============================================================== painting
     MIN_DESIGN_H = 600                    # the layouts need at least this many design units of height (1080 = 100 %)
 
+    _s_memo: tuple = (None, 1.0)
+
     def _s(self) -> float:
         """Couch mode's scale: 1.0 draws the 1080-unit design on a 1080-pixel-high window. The interface size
-        setting multiplies it — up to what still fits the screen (200 % on a 1440-high window: about 180 %)."""
-        scale = int(self.actions.settings.get("couch_ui_scale") or 100) / 100
-        s = max(0.55, min(2.2, self.height() / 1080)) * scale
-        return max(0.4, min(3.0, s, max(1.0, self.height() / self.MIN_DESIGN_H)))
+        setting multiplies it — up to what still fits the screen (200 % on a 1440-high window: about 180 %).
+        (Asked for a few dozen times per frame: worked out again only when the height or the setting changed.)"""
+        h, setting = self.height(), self.actions.settings.get("couch_ui_scale")
+        memo = self._s_memo
+        if memo[0] == (h, setting):
+            return memo[1]
+        scale = int(setting or 100) / 100
+        s = max(0.55, min(2.2, h / 1080)) * scale
+        s = max(0.4, min(3.0, s, max(1.0, h / self.MIN_DESIGN_H)))
+        self._s_memo = ((h, setting), s)
+        return s
 
     def _font(self, px: float, weight: int = 400) -> QFont:
         key = (max(9, int(px)), weight)
@@ -3366,6 +3409,7 @@ class _Couch:
             return                                      # the frame pump's keep-alive: the picture stays as it is
         t0 = time.perf_counter()
         p = QPainter(device if device is not None else self)
+        self.images.frame_dpr = max(1.0, float(self.devicePixelRatioF()))   # (one answer for every tile)
         try:
             if self.gpu_paint and rect != self.rect():
                 p.setClipRect(rect)                     # (Qt clips a widget's paint event itself; OpenGL does not)
@@ -3421,6 +3465,7 @@ class _Couch:
                 pass
         finally:
             p.end()
+            self.images.frame_dpr = 0.0
             self._meter_frame((time.perf_counter() - t0) * 1000, rect.width() * rect.height() < self.width() *
                               self.height() * 0.9)
 
@@ -3700,7 +3745,7 @@ class _Couch:
         if self.keyboard is not None:
             if not self.pad_family:                     # a real keyboard: letters type; Enter / Esc
                 return [("start", self.keyboard.done_label), ("b", "Close")]
-            return [("a", "Type"), ("b", "Delete"), ("start", self.keyboard.done_label)]
+            return [("a", "Type"), ("b", "Backspace"), ("x", "Space"), ("start", self.keyboard.done_label)]
         if self.overlay is not None:
             return [] if self.overlay.busy else [("a", "Select"), ("b", "Back")]
         page = self.current_page()
@@ -3716,8 +3761,8 @@ class _Couch:
                 act = "Play" if self.ready(e) else "Finish setup"
             out = [("a", act if self.zone == "main" else "Select"), ("x", "Manage"), ("b", "Exit…")]
         elif self.tab == T_DOWNLOADS:
-            out = ([("a", "Options")] if self._download_rows() else []) + [("x", "Pause / resume all"),
-                                                                          ("b", "Exit…")]
+            out = ([("a", "Options"), ("x", "Pause / resume all")] if self._download_rows() else []) + \
+                [("b", "Exit…")]
         else:
             out = ([("a", "Go to the Store")] if self.tab in (T_HOME, T_LIBRARY) else []) + [("b", "Exit…")]
         return out + [("lb", ""), ("rb", "Tabs")]
@@ -3926,6 +3971,7 @@ class _Couch:
                 else:
                     self._copy_tile(p, pos, pm, radius * dpr)
             p.setOpacity(1.0)
+        self._titled = bool(needs_title)                 # (a caption under the tile would say it twice)
         if needs_title:                                  # above the site tags, at most two lines
             f = self._font(max(12, r.width() * 0.075), 800)
             lift = self.tag_height(tags) + 8 * s if tags else 0.0
@@ -4248,12 +4294,15 @@ class _Couch:
                 continue
             self._tile(p, e, r, False, k)
         if focused_draw is not None:
+            self._titled = False
             self._tile(p, *focused_draw[:2], True, focused_draw[2])
             e, r, _k = focused_draw
-            p.setFont(self._font(17 * s, 700))
-            p.setPen(QColor("white"))
-            p.drawText(QRectF(r.left() - 30 * s, r.bottom() + 16 * s, r.width() + 60 * s, 26 * s), Qt.AlignCenter,
-                       QFontMetrics(p.font()).elidedText(e.title, Qt.ElideRight, int(r.width() + 60 * s)))
+            if not self._titled:                         # (a tile showing its title itself: not twice)
+                p.setFont(self._font(17 * s, 700))
+                p.setPen(QColor("white"))
+                p.drawText(QRectF(r.left() - 30 * s, r.bottom() + 16 * s, r.width() + 60 * s, 26 * s),
+                           Qt.AlignCenter,
+                           QFontMetrics(p.font()).elidedText(e.title, Qt.ElideRight, int(r.width() + 60 * s)))
         p.restore()
 
     # ------------------------------------------------------------- downloads
