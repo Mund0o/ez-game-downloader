@@ -161,6 +161,7 @@ class QuickMenu(QWidget):
         self._closing_then: Callable[[], None] | None = None
         self._pending_art = False
         self.opened_at = 0.0
+        self._steam_tip = False            # this time the menu shows the one-time Steam-button tip
         self._anim = QVariantAnimation(self)
         self._anim.setEasingCurve(QEasingCurve.OutCubic)
         self._anim.valueChanged.connect(self._shown_step)
@@ -193,6 +194,7 @@ class QuickMenu(QWidget):
         self.session = None
         self.friend = None
         self._row_top = 0
+        self._steam_tip = self._first_steam_tip()
         self._build()
         self.focus = self._first()
         self._refresh()
@@ -220,6 +222,18 @@ class QuickMenu(QWidget):
         self._tick.start()
         self.couch.sounds.play("select")
         log.info("quick menu opened for %s", game.title if game else "the suspended games")
+
+    def _first_steam_tip(self) -> bool:
+        """Once ever, with a Steam-held Steam Controller: say that a tap of its Steam button is Steam's overlay
+        (friends, invites) and a hold this menu — it used to be the menu alone (0.5.3)."""
+        settings = self.couch.actions.settings
+        if self.game is None or settings.get("steam_button_tip_seen", False) or settings.get("own_overlay", False) \
+                or not self.couch.pads.steam_as_keys():
+            return False
+        settings["steam_button_tip_seen"] = True
+        b = self.couch.bridge
+        b.call(b.core.set_setting("steam_button_tip_seen", True), None, lambda _e: None, owner=self)
+        return True
 
     def close_menu(self, then: Callable[[], None] | None = None) -> None:
         """Slide out, then hide, then ``then`` (runs even if the menu is already gone)."""
@@ -296,6 +310,10 @@ class QuickMenu(QWidget):
         g = self.game
         others = [e for e in self.couch.entries if e.id in self.couch.suspended and (g is None or e.id != g.id)]
         if g is not None:
+            if self._steam_tip:
+                guide = self.couch._pad_labels("steam")["home"]
+                rows.append(Row("h-tip", f"Tip: tap {guide} for Steam's overlay — friends, invites. Hold it for this "
+                                "menu.", kind="header", extra={"note": True, "tip": True}))
             sus = self._suspended(g)
             rows.append(Row("resume", "Resume game" if sus else "Back to the game", "It continues right where it was"
                             if sus else "", "primary", action=self.resume))
@@ -390,10 +408,12 @@ class QuickMenu(QWidget):
         self.update()
 
     def _friend_rows(self) -> list[Row]:
-        from ezgd.ui.couch_friends import actions
+        from ezgd.ui.couch_friends import actions, invite_game
         f = self.friend or {}
+        playing = self.game.title if self.game is not None and not self._suspended(self.game) else ""
         return [Row(f"fa-{a}", label, note, "primary" if a == "chat" else "row",
-                    action=lambda a=a: self.friend_action(a)) for a, label, note in actions(f)]
+                    action=lambda a=a: self.friend_action(a))
+                for a, label, note in actions(f, invite_game(self.friends, playing))]
 
     def friend_action(self, action: str) -> None:
         """Chat / profile: Steam's window comes up over the game (which keeps running). Join / play their game:
@@ -1006,7 +1026,8 @@ class QuickMenu(QWidget):
                 continue
             if row.kind == "header" and row.extra.get("note"):
                 p.setFont(self.couch._font(16 * s, 700))
-                p.setPen(QColor(theme.CURRENT.warning))
+                p.setPen(QColor(theme.CURRENT.accent).lighter(150) if row.extra.get("tip") else
+                         QColor(theme.CURRENT.warning))
                 p.drawText(QRectF(r.left() + 4 * s, y + 4 * s, r.width(), 50 * s),
                            Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap, row.label)
                 y += self._row_height(row)

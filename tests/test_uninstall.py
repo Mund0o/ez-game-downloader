@@ -69,7 +69,7 @@ async def test_uninstall_keeps_saves_when_unticked_and_never_touches_outside_or_
     r = await core.uninstall_game(e2.id, ["files"])
     assert outside.exists() and r["kept"] and core.library.repo.get(e2.id) is None
     plan = {i["key"]: i for i in (await core.uninstall_plan(e.id))["items"]}
-    assert not plan["files"]["paths"][0]["ok"] and "another game" in plan["files"]["paths"][0]["why"]
+    assert not plan["files"]["paths"][0]["ok"] and "“Same Folder” in your Library" in plan["files"]["paths"][0]["why"]
     await core.uninstall_game(e.id, ["files", "downloads"])           # prefix (saves) not ticked
     assert games.exists()                                              # still used by "Same Folder"
     assert core.library.prefix_dir(e.id).exists() and not any(p.exists() for p in parts)
@@ -156,3 +156,81 @@ async def test_a_never_started_game_uninstalls_with_save_backup_ticked(core, tmp
     assert "prefix" in plan                                           # (what used to need the backup)
     r = await core.uninstall_game(e.id, sorted(plan), backup_saves=True)
     assert not games.exists() and core.library.repo.get(e.id) is None and not r["kept"]
+
+
+async def test_a_folder_around_or_inside_another_games_folder_is_kept(core, tmp_path):
+    """Uninstalling a game whose folder holds another game's folder deleted that game too (only a game *inside*
+    was looked for); Remove + "delete files" did not look at other games at all."""
+    outer = tmp_path / "games" / "Pack"
+    inner = outer / "Extra"
+    inner.mkdir(parents=True)
+    (inner / "extra.exe").write_bytes(b"MZ")
+    (outer / "main.exe").write_bytes(b"MZ")
+    a = core.library.import_folder("Extra Game", inner)
+    b = core.library.import_folder("Pack Game", outer)
+    for game, other in ((b, "Extra Game"), (a, "Pack Game")):     # around it, and inside it
+        plan = {i["key"]: i for i in (await core.uninstall_plan(game.id))["items"]}
+        row = plan["files"]["paths"][0]
+        assert not row["ok"] and f"“{other}”" in row["why"]
+    from ezgd.library.manager import LibraryError
+    with pytest.raises(LibraryError, match="Extra Game"):
+        core.library.remove(b.id, delete_files=True)
+    assert (inner / "extra.exe").exists() and core.library.repo.get(b.id) is not None
+    core.library.remove(a.id, delete_files=False)                  # the other entry gone: now it may go
+    assert core.library.remove(b.id, delete_files=True) == [str(outer)] and not outer.exists()
+
+
+async def test_a_repack_waiting_for_its_installer_is_not_a_leftover(core, tmp_path):
+    games = tmp_path / "games"
+    repack = games / "Some Game [FitGirl Repack]"
+    repack.mkdir(parents=True)
+    (repack / "setup.exe").write_bytes(b"MZ")
+    core.created_paths.add(repack, "extract")                   # the app made it: would be pre-ticked
+    assert str(repack) in {r["path"] for r in await core.find_leftovers()}
+    from ezgd.library.models import LibraryEntry, LibraryStatus
+    core.library.repo.insert(LibraryEntry(title="Some Game", status=LibraryStatus.DOWNLOADED,
+                                          setup={"state": "pending", "root": str(repack),
+                                                 "target": str(games / "Some Game")}))
+    assert str(repack) not in {r["path"] for r in await core.find_leftovers()}
+
+
+def test_save_restore_never_follows_a_symlink_out_of_the_prefix(tmp_path):
+    """A folder in the prefix that is a symlink to somewhere else (Wine can link Documents to the real home), with
+    deeper folders not made yet: restoring must not create them — and write the file — out there."""
+    import os
+    import zipfile
+    from ezgd.library import saves
+    prefix = tmp_path / "pfx-game"
+    user = prefix / "pfx" / "drive_c" / "users" / "steamuser"
+    user.mkdir(parents=True)
+    outside = tmp_path / "home-documents"
+    outside.mkdir()
+    os.symlink(outside, user / "Documents")
+    z = tmp_path / "b.zip"
+    with zipfile.ZipFile(z, "w") as zf:
+        zf.writestr("steamuser/Documents/New Game/Saves/slot1.sav", b"evil")
+        zf.writestr("steamuser/AppData/Roaming/Game/ok.sav", b"fine")
+    assert saves.restore(z, prefix) == 1
+    assert not (outside / "New Game").exists()
+    assert (user / "AppData" / "Roaming" / "Game" / "ok.sav").read_bytes() == b"fine"
+
+
+async def test_deleting_a_downloads_files_never_deletes_a_game_installed_in_it(core, tmp_path, monkeypatch):
+    from ezgd.downloads.manager import DownloadCommandError
+    torrent = tmp_path / "dl" / "Some.Game-FitGirl.Repack"
+    (torrent / "Game").mkdir(parents=True)
+    (torrent / "Game" / "game.exe").write_bytes(b"MZ")
+    removed = []
+
+    async def remove(task_id, delete_files=False):
+        removed.append((task_id, delete_files))
+        return []
+    monkeypatch.setattr(core.downloads, "content_path", lambda task_id: torrent)
+    monkeypatch.setattr(core.downloads, "remove", remove)
+    e = core.library.import_folder("Some Game", torrent / "Game")      # installed inside the torrent's folder
+    with pytest.raises(DownloadCommandError, match="Some Game"):
+        await core.download_command("remove", 7, True)
+    await core.download_command("remove", 7, False)                     # the list entry alone: fine
+    core.library.remove(e.id)
+    await core.download_command("remove", 7, True)                      # no game in it any more
+    assert removed == [(7, False), (7, True)]

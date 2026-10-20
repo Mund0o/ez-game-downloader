@@ -330,7 +330,8 @@ def build_plan(exe: Path, *, method: LaunchMethod, args: str = "", protons: list
                steam_shortcut_appid: int | None = None, steam_app_id: int | None = None,
                compat: CompatConfig | None = None, game_root: Path | None = None,
                log_dir: Path | None = None, fix_env: dict | None = None, fix_wrappers: list[str] | None = None,
-               fix_args: list[str] | None = None, fix_notes: list[str] | None = None) -> LaunchPlan:
+               fix_args: list[str] | None = None, fix_notes: list[str] | None = None,
+               steam_client: bool = False) -> LaunchPlan:
     exe = Path(exe)
     if method is not LaunchMethod.STEAM and not exe.is_file():
         raise LaunchError(f"Executable not found: {exe}")
@@ -407,10 +408,10 @@ def build_plan(exe: Path, *, method: LaunchMethod, args: str = "", protons: list
                 # the exact chain Steam uses (or plain Proton when no runtime and no umu)
                 cmd = proton_command(exe, chosen, steam_root=steam_root, prefix_dir=prefix_dir,
                                      game_root=game_root, steam_app_id=steam_app_id, compat=compat,
-                                     log_dir=log_dir)
+                                     log_dir=log_dir, steam_client=steam_client)
             elif umu:
                 cmd = umu_command(exe, umu, prefix_dir=prefix_dir, proton=chosen, steam_app_id=steam_app_id,
-                                  compat=compat)
+                                  compat=compat, steam_client=steam_client)
             else:
                 raise LaunchError("No way to run Windows games was found. Install umu-launcher or Steam "
                                   "(Settings → System check → Install missing tools).")

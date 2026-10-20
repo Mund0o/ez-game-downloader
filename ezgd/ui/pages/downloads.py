@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (QButtonGroup, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QListWidget,
                                QListWidgetItem, QMenu, QMessageBox, QProgressBar, QPushButton, QSplitter,
@@ -230,6 +230,15 @@ class BrowserRow(QFrame):
         self.page.browser().cancel(self.did)
 
 
+def _row_height(row: QWidget) -> int:
+    """A list item's height for this row: the row itself plus the list's item padding (6 px above and below in the
+    theme) — without it every download row was 12 px short and its labels were cut off."""
+    return row.sizeHint().height() + 2 * ITEM_PADDING + 4
+
+
+ITEM_PADDING = 6                     # theme.py: QListWidget::item { padding: 6px }
+
+
 class DownloadsPage(QWidget):
     def __init__(self, actions, parent=None):
         super().__init__(parent)
@@ -396,7 +405,7 @@ class DownloadsPage(QWidget):
             self.rows[tid] = (item, row)
             if tid in self.extractions:
                 row.set_extraction(self.extractions[tid])
-        item.setSizeHint(QSize(100, row.sizeHint().height() + 4))
+        item.setSizeHint(QSize(100, _row_height(row)))
         item.setHidden(not matches_filter(snap, self.filter_key))
         if self.list.currentItem() is item:
             self._show_details(snap)
@@ -418,7 +427,7 @@ class DownloadsPage(QWidget):
         if did in self.rows:
             item, row = self.rows[did]
             row.set_extraction(state)
-            item.setSizeHint(QSize(100, row.sizeHint().height() + 4))
+            item.setSizeHint(QSize(100, _row_height(row)))
 
     def set_summary(self, summary: dict) -> None:
         text = f"{summary['active']} active · {summary['queued']} queued · ↓ {format_speed(summary['speed'])}"
@@ -433,6 +442,22 @@ class DownloadsPage(QWidget):
         for item, row in self.rows.values():
             item.setHidden(not matches_filter(row.snap, key))
         self._refresh_empty()
+
+    def showEvent(self, e) -> None:                          # noqa: N802
+        super().showEvent(e)
+        # rows added while the page was hidden (the desktop window is hidden in couch mode) were measured before
+        # they were styled: they came back squashed, title and labels cut off — measured again once shown
+        QTimer.singleShot(0, self, self._remeasure)
+
+    def _remeasure(self) -> None:
+        changed = False
+        for item, row in self.rows.values():
+            h = _row_height(row)
+            if item.sizeHint().height() != h:
+                item.setSizeHint(QSize(100, h))
+                changed = True
+        if changed:
+            self.list.doItemsLayout()                         # (the row widgets take their new height now)
 
     def _refresh_empty(self) -> None:
         visible = any(not item.isHidden() for item, _ in self.rows.values())

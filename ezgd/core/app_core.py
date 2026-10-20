@@ -213,6 +213,12 @@ class AppCore:
             if self.db:
                 self.db.close()
             return
+        # nothing new is started from here on, and "Fix my game" stops testing (a test start after "shutting down"
+        # left a game running; its next step then found the database closed)
+        self.library.closing = True
+        ev = getattr(self, "_trial_cancel", None)
+        if ev is not None:
+            ev.set()
         # a running install stops now (else the app would only exit once it is done — hours for a big game); it
         # stays marked as running, so the next start finishes it
         self.post.stop_all()
@@ -497,7 +503,23 @@ class AppCore:
                    "change_destination"}
         if command not in allowed:
             raise DownloadCommandError(f"unknown command {command}")
+        if command in ("remove", "cancel") and args and args[0]:
+            self._refuse_deleting_a_game(task_id)
         return await getattr(self.downloads, command)(task_id, *args)
+
+    def _refuse_deleting_a_game(self, task_id: int) -> None:
+        """Remove/cancel + "delete files" deletes the download's file or folder: never with a game installed in it
+        (a repack run from its torrent folder, a release extracted where it was downloaded) — that deleted the
+        game. Its own archive may go: that is what the button is for."""
+        content = self.downloads.content_path(task_id)
+        if content is None or not content.exists():
+            return
+        for e in self.library.all():
+            for p in (e.install_path, (e.setup or {}).get("root")):
+                if p and is_within(p, content):
+                    raise DownloadCommandError(
+                        f"“{e.title}” is installed in this download's folder, so deleting the files would delete the "
+                        "game. Remove the download without deleting files, or uninstall the game (Library).")
 
     async def pause_all(self) -> None:
         for t in list(self.downloads.tasks.values()):
@@ -649,7 +671,7 @@ class AppCore:
                    "remove_steam_shortcuts", "last_run_status", "start_steam", "stop_completely",
                    "backup_saves", "save_backups", "restore_save_backup", "delete_save_backup",
                    "suspend", "resume", "resume_all", "suspended_ids", "game_volume", "set_game_volume", "protons",
-                   "session_seconds", "game_processes", "auto_executable", "set_mangohud"}
+                   "session_seconds", "game_processes", "has_steam_overlay", "auto_executable", "set_mangohud"}
         if method not in allowed:
             raise ValueError(f"unknown library call {method}")
         fn = getattr(self.library, method)
@@ -664,16 +686,19 @@ class AppCore:
                 "tools": [s.__dict__ for s in statuses], "can_run_windows_games": proton_ok,
                 "missing_required": [s.name for s in statuses if s.importance == "required" and not s.installed]}
 
-    async def system_install_plan(self) -> dict:
+    async def system_install_plan(self, only: list[str] | None = None) -> dict:
+        """What installing would do; ``only``: just these tools (keys from system_status) — the ones ticked in the
+        System check (None: every missing one)."""
         from ezgd.platform import deps
-        p = await asyncio.to_thread(deps.plan)
+        p = await asyncio.to_thread(deps.plan, True, only)
         return {"family": p.family, "packages": p.install, "unavailable": p.unavailable, "notes": p.notes,
                 "command": p.shell}
 
-    async def system_install(self) -> int:
-        """Install missing tools with the system package manager behind a graphical password prompt."""
+    async def system_install(self, only: list[str] | None = None) -> int:
+        """Install missing tools (``only``: just these) with the system package manager behind a graphical password
+        prompt."""
         from ezgd.platform import deps
-        p = await asyncio.to_thread(deps.plan)
+        p = await asyncio.to_thread(deps.plan, True, only)
         if not p.command:
             return 0
         steps = ([["apt-get", "update"]] if p.family == "debian" else []) + [p.command]
@@ -855,15 +880,13 @@ class AppCore:
     def _uninstall_items(self, entry_id: int) -> list[dict]:
         """Everything that belongs to a library entry, grouped, with what may be deleted."""
         e = self.library.get(entry_id)
-        others = [o for o in self.library.all() if o.id != e.id]
-        shared = {Path(p).resolve() for o in others for p in (o.install_path, o.download_path) if p}
 
         def usable(p: Path) -> tuple[bool, str]:
             if not p.exists():
                 return False, "already gone"
-            r = p.resolve()
-            if r in shared or any(is_within(s, r) for s in shared if s != r):
-                return False, "also used by another game in your Library — kept"
+            other = self.library.shared_with(e.id, p)   # (the same folder, one inside it, or one around it)
+            if other:
+                return False, f"also used by “{other}” in your Library — kept"
             if not self.library.safe_to_delete(p):
                 return False, "outside the app's download/installation folders — delete it yourself if you want"
             return True, ""
@@ -1018,7 +1041,10 @@ class AppCore:
         titles = {g_key: title for g_key, title in self.games.dedup_titles()}
         used: set[Path] = set()
         for e in self.library.all():
-            for p in (e.install_path, e.download_path):
+            st = e.setup or {}
+            # (a repack waiting for its installer keeps its files in its own folder — "created by the app" would
+            # have offered it pre-ticked)
+            for p in (e.install_path, e.download_path, st.get("root"), st.get("target")):
                 if p:
                     used.add(Path(p).resolve())
         for t in self.downloads.tasks.values():
@@ -1213,11 +1239,20 @@ class AppCore:
             log.info("ProtonDB lookup for %s failed: %s", app_id, exc)
             return None
 
+    def _stops_with_the_app(self) -> None:
+        """This long job (asked for by the interface) is cancelled when the app shuts down, before the database
+        closes — not left to find it closed (seen in a friend's log)."""
+        task = asyncio.current_task()
+        if task is not None:
+            self._import_tasks.add(task)
+            task.add_done_callback(self._import_tasks.discard)
+
     async def run_trials(self, entry_id: int, findings: list[dict], generated: list[dict] | None = None,
                          deep: bool = False, repairs: list | None = None, symptom: str = "",
                          protons: bool = True) -> list[dict]:
         """“Try fixes for me”: test candidate setups one after another (each in a throw-away prefix).
         ``deep`` (“Try everything”): many more setups; stops at the first one that keeps the game running."""
+        self._stops_with_the_app()
         if self.library.is_running(entry_id):
             raise SourceError("Stop the game first.")
         cands = self.library.trial_candidates(entry_id, findings, generated, deep=deep, protons=protons)
@@ -1534,6 +1569,7 @@ class AppCore:
 
     async def fix_my_game(self, entry_id: int, symptom: str = "", test: bool = True) -> dict:
         """One button: check, repair what has strong evidence, test setups, and give one answer."""
+        self._stops_with_the_app()
         e = self.library.get(entry_id)
         if self.library.is_running(entry_id):
             raise SourceError("Stop the game first.")
@@ -2322,9 +2358,12 @@ class AppCore:
         return data
 
     async def steam_friend_open(self, action: str, friend: dict) -> str:
-        """chat | join | launch | profile: hand the friend's Steam link to Steam."""
+        """chat | invite | join | launch | profile: hand the friend's Steam link to Steam (invite: their chat — Steam
+        has no link that sends an invite; its friends list does, from the menu by their name)."""
         from ezgd.platform import steam as steam_mod, steamfriends
-        url = {"chat": lambda f: steamfriends.chat_url(f["steamid"]), "profile": lambda f: steamfriends.profile_url(
+        url = {"chat": lambda f: steamfriends.chat_url(f["steamid"]),
+               "invite": lambda f: steamfriends.chat_url(f["steamid"]),
+               "profile": lambda f: steamfriends.profile_url(
             f["steamid"]), "join": steamfriends.join_url, "launch": steamfriends.launch_url}[action](friend)
         if not url:
             raise RuntimeError("Nothing to join right now." if action == "join" else "Steam has no game to start.")

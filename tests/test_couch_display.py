@@ -160,6 +160,15 @@ def test_the_desktop_window_comes_back_from_couch_mode_as_it_was(ui, qtbot, monk
     calls.clear()
     win._check_after_couch(True)
     assert asked == [] and calls == [] and win._before_couch is None
+    win._before_couch = (size, False, False)                         # 28 px taller (KWin kept "no border"): back
+    monkeypatch.setattr(win, "height", lambda: size.height() + 28)
+    win._check_after_couch(False)
+    assert asked == [(win.windowTitle(), size.width(), size.height(), False)]
+    monkeypatch.setattr(win, "height", lambda: size.height() + 1)    # (a pixel of rounding: left alone)
+    asked.clear()
+    calls.clear()
+    win._check_after_couch(False)
+    assert asked == [] and calls == []
     win._before_couch = (size, True, False)                          # it was maximized: maximized again
     monkeypatch.setattr(win, "isFullScreen", lambda: True)
     win._check_after_couch(True)

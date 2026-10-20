@@ -860,3 +860,42 @@ def test_an_error_report_opens_above_a_modal_window(ui, qtbot):
     assert n._open is not None and n._open.parent() is modal
     n._open.close()
     modal.close()
+
+
+def test_a_torrent_from_the_couch_browser_shows_once_on_the_desktop(ui, qtbot, server, tmp_path):
+    """A site's .torrent downloaded in couch mode's browser: the game downloads as an ordinary torrent. The finished
+    .torrent file stayed listed too — the desktop's Downloads page showed the game twice after leaving couch mode —
+    and the row added while the desktop was hidden came back squashed."""
+    from PySide6.QtCore import QPointF
+    from ezgd.catalog.models import Game
+    from ezgd.ui import couch_pages
+    from ezgd.ui.dialogs import browser
+    from test_torrent import make_torrent
+    if not browser.AVAILABLE:
+        pytest.skip("Qt WebEngine not installed")
+    win, core, _ = ui
+    tor = make_torrent({"T.zip": b"x" * 5000}, tmp_path / "seed2", "TGame")
+    server.add("/f/TGame.torrent", data=tor, content_type="application/x-bittorrent",
+               headers={"Content-Disposition": 'attachment; filename="TGame.torrent"'})
+    server.add("/d/t", data=b'<html><body style="margin:0"><a href="/f/TGame.torrent" style="display:block;'
+                            b'width:100%;height:100vh">Download</a></body></html>', content_type="text/html")
+    g = Game("onlinefix", "555", "T Game", "https://online-fix.me/games/x/555-t.html")
+    core.games.save(g)
+    couch = _open_couch(win, qtbot)
+    couch_pages.open_browser(couch, g, None, server.url("/d/t"))
+    cb = couch.browser
+    qtbot.waitUntil(lambda: cb.dlg.current.url().path() == "/d/t", timeout=20000)
+    qtbot.wait(500)
+    cb.pointer = QPointF(cb.view_rect().center())
+    cb.button("a", True)
+    cb.button("a", False)
+    qtbot.waitUntil(lambda: bool(core.downloads.tasks), timeout=20000)
+    page = win.pages["downloads"]
+    qtbot.waitUntil(lambda: bool(page.rows) and not page.browser_rows, timeout=10000)
+    couch.force_close()
+    qtbot.waitUntil(lambda: win.isVisible(), timeout=5000)
+    win.navigate("downloads")
+    qtbot.wait(200)
+    assert [r.snap["title"] for _i, r in page.rows.values()] == ["T Game"] and not page.browser_rows
+    item, row = next(iter(page.rows.values()))
+    qtbot.waitUntil(lambda: row.height() >= row.sizeHint().height(), timeout=3000)   # (not squashed)

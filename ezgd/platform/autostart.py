@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import os
-import shlex
 from pathlib import Path
 
 from ezgd.platform import IS_WINDOWS
@@ -33,9 +32,12 @@ def command() -> list[str]:
 
 
 def desktop_entry(cmd: list[str]) -> str:
+    # (double quotes, as the Desktop Entry Specification has them — shlex's single quotes are not part of it, and
+    # the app's folder may have spaces in its name)
+    from ezgd.platform.appentry import exec_line
     return ("[Desktop Entry]\nType=Application\nName=EZ Game Downloader\n"
             "Comment=Finishes downloads and checks for game updates in the tray\n"
-            f"Exec={' '.join(shlex.quote(c) for c in cmd)}\nIcon=ezgd\nTerminal=false\n"
+            f"Exec={exec_line(cmd)}\nIcon=ezgd\nTerminal=false\n"
             "X-GNOME-Autostart-enabled=true\nX-KDE-autostart-after=panel\n")
 
 

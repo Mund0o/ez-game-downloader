@@ -113,6 +113,10 @@ STEAM_SHOW_SCRIPT = """
 
 DESKTOP_RESTORE_SCRIPT = """
 (function () {
+    function area(w) {          // where windows go (without the panel); the monitor itself if KWin does not say
+        try { var a = workspace.clientArea(KWin.PlacementArea, w); if (a && a.width > 0) return a; } catch (e) {}
+        return w.output.geometry;
+    }
     var pid = %(pid)d, title = %(title)s, max = %(max)s, cw = %(w)d, ch = %(h)d;
     var list = workspace.windowList ? workspace.windowList() : workspace.clientList();
     for (var i = 0; i < list.length; i++) {
@@ -122,8 +126,9 @@ DESKTOP_RESTORE_SCRIPT = """
         if (w.noBorder) w.noBorder = false;
         if (max) { w.setMaximize(true, true); continue; }
         if (w.maximizeMode !== undefined && w.maximizeMode !== 0) w.setMaximize(false, false);
-        var a = workspace.clientArea(KWin.PlacementArea, w);
-        var ww = Math.min(cw, a.width), hh = Math.min(ch, a.height);
+        var a = area(w);
+        var f = w.frameGeometry, c = w.clientGeometry || f;          // (its own size is without the title bar)
+        var ww = Math.min(cw + (f.width - c.width), a.width), hh = Math.min(ch + (f.height - c.height), a.height);
         w.frameGeometry = {x: a.x + Math.round((a.width - ww) / 2), y: a.y + Math.round((a.height - hh) / 2),
                            width: ww, height: hh};
     }
@@ -137,9 +142,15 @@ def restore_desktop_window(title: str, width: int, height: int, maximized: bool)
     if not WindowControl._kwin_available():
         return False
     import json
-    return _run_kwin(DESKTOP_RESTORE_SCRIPT % {"pid": os.getpid(), "title": json.dumps(title), "max": "true" if
-                                              maximized else "false", "w": int(width), "h": int(height)},
-                     "desktop window back to its size")
+    from PySide6.QtCore import QTimer
+    script = DESKTOP_RESTORE_SCRIPT % {"pid": os.getpid(), "title": json.dumps(title), "max": "true" if maximized
+                                       else "false", "w": int(width), "h": int(height)}
+    ok = _run_kwin(script, "desktop window back to its size")
+    if ok and not maximized:
+        # once more when its title bar is back: KWin adds it after the script, so the first pass could not count it
+        # (tested on KWin 6.8: 1100x672 instead of 1100x700)
+        QTimer.singleShot(300, lambda: _run_kwin(script, "desktop window back to its size (with its title bar)"))
+    return ok
 
 
 _guards: list[str] = []                 # the running guard_steam scripts (by name), so they can be called off
@@ -307,7 +318,7 @@ class WindowControl:
         can be wrong with fractional scaling)."""
         if self.kwin:
             self._kwin(self._find_output(screen) +
-                       "var a = workspace.clientArea(KWin.FullScreenArea, o); w.noBorder = true; "
+                       "var a = o.geometry; w.noBorder = true; "
                        "w.frameGeometry = {x: a.x, y: a.y, width: a.width, height: a.height};")
 
     def force_fullscreen(self, screen: str = "") -> None:
@@ -315,7 +326,7 @@ class WindowControl:
         screen on that monitor and sizes it to the monitor itself."""
         if self.kwin:
             self._kwin(self._find_output(screen) +
-                       "var a = workspace.clientArea(KWin.FullScreenArea, o); w.fullScreen = false; "
+                       "var a = o.geometry; w.fullScreen = false; "
                        "w.frameGeometry = {x: a.x, y: a.y, width: a.width, height: a.height}; w.fullScreen = true;")
 
     def place_pixels(self, pw: int, ph: int, screen: str = "") -> None:

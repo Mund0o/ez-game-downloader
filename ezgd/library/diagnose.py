@@ -403,6 +403,22 @@ def r_steam(c: Context) -> list[Finding]:
                     "without the release's launch script).", 0.7, ev)]
 
 
+def r_steam_client(c: Context) -> list[Finding]:
+    """OnlineFix's fix could not load Steam's client ("Failed to load original steamclient. Error code: 998"): Wine's
+    bridge to the running Steam client was off, or Steam was not running. GE-Proton11-7 switches the bridge off for
+    every game started with UMU_ID unless UMU_USE_STEAM=1 — a friend's Slay the Spire 2 and Risk of Rain 2 failed
+    that way with GE while they worked with GE in Steam and with Valve's Proton in the app."""
+    ev = _statements(c.everything, r"(Failed to load original steamclient|lsteamclient=d)")
+    if not any("steamclient" in x and "Failed" in x for x in ev):
+        return []
+    return [Finding("steam-client", "The game's online fix could not reach Steam",
+                    "OnlineFix's fix talks to the Steam client you have running, through Wine's bridge to Steam. "
+                    "It could not load Steam's client library: Steam was not running or not signed in, or the bridge "
+                    "was switched off (GE-Proton 11-7 and newer do that for games started outside Steam unless "
+                    "told otherwise — the app now tells them, for every OnlineFix game). Start Steam and sign in, "
+                    "then play again.", 0.8, ev)]
+
+
 def _modules(text: str, tid: str | None = None) -> list[tuple[int, str, str]]:
     """DLLs and their load addresses (from +loaddll), for one thread when given (Wine logs several processes)."""
     mods = []
@@ -1734,7 +1750,7 @@ def _reason(c: Context, findings: list[Finding]) -> list[dict]:
     return out
 
 
-RULES = [r_error_box, r_screen_text, r_integrity, r_emulator, r_fix_archive, r_missing_dll, r_unimplemented, r_imports, r_dotnet, r_steam, r_anticheat, r_vulkan, r_dx12, r_media,
+RULES = [r_error_box, r_screen_text, r_integrity, r_emulator, r_fix_archive, r_missing_dll, r_unimplemented, r_imports, r_dotnet, r_steam, r_steam_client, r_anticheat, r_vulkan, r_dx12, r_media,
          r_crash, r_minidump, r_prefix, r_quick_exit, r_native, r_system, r_protondb, r_old_prefix, r_advisor,
          r_overlay, r_fonts, r_display, r_disk, r_writable, r_onlinefix_missing, r_regression, r_exit_code, r_override_files,
          r_steam_reference, r_redist, r_engine_crash, r_mixed_prefix, r_heap, r_filesystem]

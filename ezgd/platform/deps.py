@@ -24,7 +24,7 @@ class Tool:
     purpose: str
     detect: Callable[[], bool]
     packages: dict[str, list[str]]           # distro family → package names
-    importance: str = "recommended"          # required | recommended | optional
+    importance: str = "recommended"          # required | highly_recommended | recommended | optional
     note: dict[str, str] = field(default_factory=dict)
 
 
@@ -69,7 +69,7 @@ LINUX_TOOLS: list[Tool] = [
           "fedora": "unrar comes from RPM Fusion; 7zip handles RAR archives as well."}),
     Tool("umu", "umu-launcher", "Runs Windows games with Proton, even without Steam (downloads GE-Proton and "
                                 "the Steam Runtime on first use)", _which("umu-run"),
-         {"arch": ["umu-launcher"], "fedora": ["umu-launcher"], "debian": [], "suse": []}, "recommended",
+         {"arch": ["umu-launcher"], "fedora": ["umu-launcher"], "debian": [], "suse": []}, "highly_recommended",
          {"debian": "Not packaged by Debian/Ubuntu — install Steam instead, or get the .deb from "
                     "github.com/Open-Wine-Components/umu-launcher/releases.",
           "suse": "Not packaged — install Steam instead."}),
@@ -278,7 +278,8 @@ def run_setup_cli(assume_yes: bool = False) -> int:
     family = detect_family()
     for st in status(family):
         mark = "✔" if st.installed else ("✘" if st.importance == "required" else "–")
-        print(f"  {mark} {st.name:<15} {st.purpose}")
+        star = " (highly recommended)" if st.importance == "highly_recommended" and not st.installed else ""
+        print(f"  {mark} {st.name:<15} {st.purpose}{star}")
     p = plan()
     print()
     for n in p.notes:

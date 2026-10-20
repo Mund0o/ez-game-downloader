@@ -260,9 +260,14 @@ def restore(zip_path: Path, prefix: Path) -> int:
                     log.warning("save restore: refused member %r", info.filename)
                     continue
                 target = base.joinpath(*rel.parts)
-                # the target must stay inside the prefix's users folder, also through symlinked folders
-                parent = Path(os.path.realpath(target.parent)) if target.parent.exists() else None
-                if parent is not None and not (parent == real_base or real_base in parent.parents):
+                # the target must stay inside the prefix's users folder, also through symlinked folders — checked
+                # at the deepest folder that exists (folders still to be made sit under it: a symlink further up
+                # would otherwise lead the new folders, and the file, out of the prefix)
+                existing = target.parent
+                while not existing.exists() and existing != base and base in existing.parents:
+                    existing = existing.parent
+                parent = Path(os.path.realpath(existing))
+                if not (parent == real_base or real_base in parent.parents):
                     log.warning("save restore: %s leaves the prefix, skipped", info.filename)
                     continue
                 target.parent.mkdir(parents=True, exist_ok=True)

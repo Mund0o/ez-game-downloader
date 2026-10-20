@@ -3,9 +3,11 @@
 Proton upgrades a prefix made by an older build of its own kind. Between kinds it cannot: GE-Proton and
 Proton-CachyOS name their prefix versions "GE-Proton11-7" / "CachyOS-11.0-100", and their upgrade code splits those
 on "-" expecting two parts — it fails ("Prefix has an invalid version?!") and then runs the game in a prefix set up by
-a different Wine. Seen 2026-10-13: Slay the Spire 2 under GE-Proton11-7 in a prefix made by Proton 11.0 ("11.0-100")
-→ OnlineFix "Failed to load original steamclient. Error code: 998". A downgrade (a prefix from a newer Proton) breaks
-the same way. So each family of Proton builds gets its own prefix for a game, and saves move along.
+a different Wine. Seen 2026-10-13: Slay the Spire 2 under GE-Proton11-7 in a prefix made by Proton 11.0 ("11.0-100").
+(Its OnlineFix "Failed to load original steamclient. Error code: 998" turned out to have another cause: GE-Proton11-7
+switches Wine's Steam client bridge off for UMU_ID launches — see proton.umu_steam_mode.) A downgrade (a prefix from
+a newer Proton) breaks the same way. So each family of Proton builds gets its own prefix for a game, and saves move
+along.
 """
 
 from __future__ import annotations

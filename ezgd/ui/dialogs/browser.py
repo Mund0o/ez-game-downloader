@@ -449,7 +449,9 @@ class BrowserDownloads(QObject):
         self.changed.emit()
 
         def ok(_task) -> None:
-            x.library = "downloading in the app (Downloads)"
+            # the game now downloads as an ordinary torrent in Downloads: the finished .torrent file was a second
+            # row for the same game there ("it shows twice" after a couch-mode download)
+            self.items.pop(x.id, None)
             self.actions.toasts.show("Torrent started", f"{game.title} is downloading with the built-in torrent "
                                                         "engine — see Downloads.", "success")
             self.changed.emit()

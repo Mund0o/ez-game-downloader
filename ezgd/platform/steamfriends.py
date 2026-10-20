@@ -13,7 +13,9 @@ What can be done with a friend uses Steam's own links, the same ones Steam's fri
 client's code): chat (``steam://friends/message/<id>`` opens Steam's chat with them), join their game
 (``steam://joinlobby/<app>/<lobby>/<id>`` or ``steam://connect/<server>``), start the game they play
 (``steam://rungameid/<game>``) and their profile (``steam://url/SteamIDPage/<id>``). Inviting someone into a game is
-not among them: Steam only lets the game itself (or Steam's own overlay) send an invite.
+not among them: Steam only lets the game itself, Steam's overlay or Steam's own friends list send an invite. Its
+friends list offers *Invite to Game* while you are in a joinable game, so "Invite to your game" opens Steam's chat
+with the friend and says where that choice is (your own status comes with the live data: ``self``).
 """
 
 from __future__ import annotations
@@ -198,7 +200,8 @@ def order(friends: list[Friend]) -> list[Friend]:
 
 async def load(client, steam_root: Path | None, key: str) -> dict:
     """Everything the friends views show: {"friends": [dict…], "live": bool, "private": bool, "me": id,
-    "error": "" | why the live part is missing, "at": time}."""
+    "self": {"playing", "game", "gameid"} (live only: what Steam shows you doing), "error": "" | why the live part
+    is missing, "at": time}."""
     me = my_steamid(steam_root)
     if me is None:
         raise FriendsError("No Steam account found on this computer — sign in to Steam once.")
@@ -214,13 +217,16 @@ async def load(client, steam_root: Path | None, key: str) -> dict:
         if ids is None:                               # private friends list: ask about the friends Steam knows
             out["private"] = True
             ids = list(known)
-        data = await summaries(client, key, ids)
+        data = await summaries(client, key, ids + [me])
     except FriendsError as exc:                       # (no live data: the list Steam keeps, and why)
         out.update(friends=[f.as_dict() for f in order(list(known.values()))], error=str(exc))
         return out
     friends = [from_summary(data[i], known.get(i)) if i in data else known.get(i) or Friend(i, i, "unknown")
-               for i in ids]
-    out.update(friends=[f.as_dict() for f in order(friends)], live=True)
+               for i in ids if i != me]
+    mine = from_summary(data[me]) if me in data else None
+    out.update(friends=[f.as_dict() for f in order(friends)], live=True,
+               self={"playing": bool(mine and mine.playing), "game": mine.game if mine else "",
+                     "gameid": mine.gameid if mine else ""})
     return out
 
 

@@ -45,9 +45,38 @@ def summary(data: dict | None) -> str:
     return f"{len(online)} online" + (f" · {len(playing)} playing" if playing else "")
 
 
-def actions(f: dict) -> list[tuple[str, str, str]]:
-    """(action, label, note) for a friend — only what can be done right now."""
+INVITE_HOW = "Opens Steam's chat — choose “Invite to Game” in the menu by their name"
+
+
+def invite_game(data: dict | None, playing: str = "") -> str:
+    """The game a friend can be invited to ("": none). Steam's friends list offers *Invite to Game* while Steam shows
+    you in a game: with live data that is your own Steam status; without it, one of the app's games being played
+    (``playing``: its title). The name is the app's Library title — Steam's own name for an OnlineFix game is the
+    app it plays as ("Spacewar")."""
+    d = data or {}
+    if d.get("live"):
+        me = d.get("self") or {}
+        if not me.get("playing"):
+            return ""
+        return playing or me.get("game") or "your game"
+    return playing
+
+
+def playing_title(w) -> str:
+    """The title of the app's game being played now (not a suspended one), "" when none. ``w`` is couch mode."""
+    ids = [i for i in getattr(w, "running", ()) if i not in getattr(w, "suspended", ())]
+    last = getattr(w, "_last_game", None)
+    pick = last if last in ids else (ids[0] if ids else None)
+    e = next((x for x in getattr(w, "entries", []) if x.id == pick), None) if pick is not None else None
+    return e.title if e is not None else ""
+
+
+def actions(f: dict, invite: str = "") -> list[tuple[str, str, str]]:
+    """(action, label, note) for a friend — only what can be done right now. ``invite``: the game you are in (see
+    invite_game), offered to friends who are not offline."""
     out = [("chat", "Chat", "Opens Steam's chat with them")]
+    if invite and f.get("state") != "offline":
+        out.append(("invite", f"Invite to {invite}", INVITE_HOW))
     if f.get("joinable"):
         out.append(("join", f"Join their game — {f.get('game') or 'in progress'}", "Steam starts it and joins them"))
     if f.get("gameid") and f.get("state") != "offline":
@@ -66,10 +95,13 @@ def open_action(w, action: str, f: dict, done: Callable[[], None] | None = None)
     def ok(_url) -> None:
         if done:
             done()
-        if action in ("chat", "profile"):
-            hint = f.get("name", "") if action == "chat" else ""
+        if action in ("chat", "invite", "profile"):
+            hint = f.get("name", "") if action != "profile" else ""
             for ms in (700, 1600, 3200):                  # (Steam takes a moment to open the window)
                 QTimer.singleShot(ms, lambda: show_steam_window(hint, main=action == "profile"))
+            if action == "invite":
+                w.toasts.show(f"Invite {f.get('name', '')}", "In Steam's chat, open the menu by their name and choose "
+                              "“Invite to Game”.", "info")
         elif action in ("join", "launch"):
             w.toasts.show("Steam is starting it", f.get("game") or "", "info")
 
@@ -177,7 +209,7 @@ class FriendsPage(Page):
         if f is None:
             return
         rows = []
-        for action, label, note in actions(f):
+        for action, label, note in actions(f, invite_game(self.data, playing_title(self.w))):
             rows.append((label, lambda a=action: self._do(a, f), "primary" if action == "chat" else "ghost", note))
         rows.append(("Close", self.w.close_overlay, "ghost", ""))
         self.w.menu(f.get("name", ""), rows, text=f.get("status") or "")
@@ -186,7 +218,7 @@ class FriendsPage(Page):
         self.w.close_overlay()
 
         def done() -> None:
-            if action in ("chat", "profile"):
+            if action in ("chat", "invite", "profile"):
                 self.w.step_away("steam")                # Steam's window needs the screen (the guide button
         open_action(self.w, action, f, done)             # brings couch mode back)
 

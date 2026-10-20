@@ -381,6 +381,12 @@ class SettingsPage(QWidget):
         sync.setToolTip("Save backups are written into “EZ Game saves” in this folder, so another computer with the "
                         "same folder (and this app) can restore them. Backups made before stay here too. Leave it "
                         "empty to keep backups on this computer only.")
+        own = self._check(f, "own_overlay", "Our overlay instead of Steam's: friends, chat and invites in the quick menu",
+                          "On: games start without Steam's overlay, and the PS / Xbox / Steam button (tap or hold) "
+                          "opens the app's quick menu over the game — your Steam friends, chat with them, invite them "
+                          "to your game, join theirs. Steam itself carries it out (its chat window, its friends "
+                          "list's “Invite to Game”). Off: Steam's overlay as usual — a tap of the Steam button opens "
+                          "it, a hold opens the quick menu.")
         self._check(f, "steam_overlay", "Steam overlay in games while Steam is running (friends list)",
                     "Loads Steam's overlay into games started here, without changing anything in Steam. Steam only "
                     "shows the friends list there, and Shift+Tab may not open it again once closed.")
@@ -390,6 +396,8 @@ class SettingsPage(QWidget):
                     "to restart once for that (the app asks first); the change is verified and backed up, and put "
                     "back automatically if Steam does not start normally. OnlineFix games do not see Steam's game "
                     "ids (they trigger OnlineFix's activation message).")
+        for key in ("steam_overlay", "launch_through_steam"):          # (ours replaces Steam's while it is on)
+            own.toggled.connect(lambda on, w=self.widgets[key]: w.setEnabled(not on))
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(button("Remove the app's games from Steam…", "trash", "ghost",
@@ -838,7 +846,8 @@ class SettingsPage(QWidget):
         self.refresh_info()
 
     def _system(self, st: dict) -> None:
-        missing = [t["name"] for t in st["tools"] if not t["installed"]]
+        missing = [t["name"] + (" (highly recommended)" if t["importance"] == "highly_recommended" else "")
+                   for t in st["tools"] if not t["installed"]]
         self.system_label.setText("All tools are installed." if not missing else
                                   f"Missing: {', '.join(missing)}.")
 

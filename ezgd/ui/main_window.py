@@ -49,6 +49,7 @@ class MainWindow(QMainWindow):
         self._quitting = False
         self.setWindowTitle(APP_DISPLAY_NAME)
         self.setWindowIcon(app_icon())
+        QTimer.singleShot(2000, self, self._register_launcher)     # (pinnable to the taskbar, same icon closed)
         self.resize(1360, 860)
         self.setMinimumSize(1020, 640)
         self._ui_state = QSettings(str(paths.data / "window.ini"), QSettings.IniFormat)   # size/position
@@ -499,11 +500,29 @@ class MainWindow(QMainWindow):
             return ("Open Settings", lambda: self.couch and self.couch.go_to(c.T_SETTINGS))
         return None
 
+    def _register_launcher(self) -> None:
+        """The launcher entry that lets the app be pinned to the taskbar, with the icon this window shows (see
+        platform.appentry). Not for test runs without a real screen."""
+        if QApplication.platformName() in ("offscreen", "minimal"):
+            return
+        from PySide6.QtCore import QBuffer, QByteArray, QIODevice
+        from ezgd.platform import appentry
+        data = QByteArray()
+        buf = QBuffer(data)
+        buf.open(QIODevice.WriteOnly)
+        app_icon().pixmap(256, 256).save(buf, "PNG")
+        buf.close()
+        appentry.register(bytes(data), str(self.settings.get("theme_accent") or "violet"))
+
     def _settings_loaded(self, s: dict, changed_key: str) -> None:
         self.settings.clear()
         self.settings.update(s)
         if changed_key in THEME_KEYS:
             theme.apply_theme(QApplication.instance(), s["theme_accent"], s["theme_contrast"])
+            self.setWindowIcon(app_icon())                    # (drawn in the accent colour)
+            if getattr(self, "tray", None) is not None:
+                self.tray.setIcon(app_icon())
+            self._register_launcher()
             self.navigate(next(k for k, b in self.nav_buttons.items() if b.isChecked()))
             self.toasts.show("Theme updated", "Some colours update fully after a restart.")
         self._apply_settings_to_pages()
@@ -629,7 +648,7 @@ class MainWindow(QMainWindow):
         if want and self._quick_pads is None:
             from ezgd.ui.gamepad import Gamepads
             pads = Gamepads(self)
-            pads.action.connect(lambda n: self._quick_menu_from_desktop() if n == "home" else None)
+            pads.action.connect(lambda n: self._desktop_guide(pads) if n == "home" else None)
             pads.home_held.connect(self._quick_menu_from_desktop)
             pads.start()
             self._quick_pads = pads
@@ -643,6 +662,29 @@ class MainWindow(QMainWindow):
                 self._bpm_timer.start()
         else:
             self._bpm_timer.stop()
+
+    def _desktop_guide(self, pads) -> None:
+        """The guide button tapped over a game started from the desktop: the quick menu — unless it was a Steam
+        Controller's tap (Steam logged it) and Steam's overlay is in the game: then the tap is Steam's (its overlay:
+        friends, invites) and a hold is the quick menu."""
+        lib = self.pages["library"]
+        ids = sorted(i for i in lib.running if i not in lib.suspended)
+        if not pads.home_from_steam or not ids or self.settings.get("own_overlay", False):
+            self._quick_menu_from_desktop()
+            return
+        answers: list[bool] = []
+
+        def got(has: bool) -> None:
+            answers.append(bool(has))
+            if len(answers) < len(ids):
+                return
+            if any(answers):
+                log.info("Steam button tapped over a game with Steam's overlay: Steam's (hold it for the quick menu)")
+            else:
+                self._quick_menu_from_desktop()
+        for gid in ids:
+            self.bridge.call(self.bridge.core.library_call("has_steam_overlay", gid), got, lambda _e: got(False),
+                             owner=self)
 
     def _bpm_tick(self) -> None:
         from ezgd.ui import steam_bpm
@@ -741,7 +783,9 @@ class MainWindow(QMainWindow):
 
     def _check_after_couch(self, last: bool) -> None:
         """Back from couch mode: the desktop window as it was before — not full screen, not covering the whole
-        screen (some window managers hand it the size couch mode had), maximized if it was."""
+        screen (some window managers hand it the size couch mode had), maximized if it was, else its old size. Any
+        other size is wrong too: a friend's KWin kept couch mode's "no border" on it — 28 px taller, no title bar
+        (1711x989 instead of 1711x961) — so KWin is asked for the title bar and the old size back."""
         saved = getattr(self, "_before_couch", None)
         if saved is None or not self.isVisible() or self.couch is not None:
             return
@@ -749,7 +793,10 @@ class MainWindow(QMainWindow):
         screen = self.screen()
         full = screen.geometry() if screen is not None else None
         covers = full is not None and self.width() >= full.width() * 0.97 and self.height() >= full.height() * 0.97
-        wrong = not was_fs and (self.isFullScreen() or (covers and not was_max))
+        resized = not was_max and not self.isMaximized() and (abs(self.width() - size.width()) > 2 or
+                                                              abs(self.height() - size.height()) > 2)
+        wrong = not was_fs and (self.isFullScreen() or (covers and not was_max) or resized or
+                                (was_max and not self.isMaximized()))
         log.info("desktop window back from couch mode: %dx%d%s (before: %dx%d%s)%s", self.width(), self.height(),
                  " full screen" if self.isFullScreen() else " maximized" if self.isMaximized() else "",
                  size.width(), size.height(), " maximized" if was_max else " full screen" if was_fs else "",

@@ -1,0 +1,62 @@
+# GE-Proton11-5's proton script, Session.run (trimmed; the UMU branches as shipped)
+            log("Unable to set Steam Input AppID: " + str(e))
+            return False
+
+        return result.returncode == 0
+
+    def run(self):
+        if shutil.which('steam-runtime-launcher-interface-0') is not None:
+            adverb = ['steam-runtime-launcher-interface-0', 'proton']
+        else:
+            adverb = []
+
+        if self.remote_debug_cmd:
+            remote_debug_cmd = self.remote_debug_cmd
+            if not os.path.isabs(remote_debug_cmd[0]):
+                remote_debug_cmd[0] = g_proton.path(remote_debug_cmd[0])
+            remote_debug_proc = subprocess.Popen([g_proton.wine_bin] + self.remote_debug_cmd,
+                                                 env=self.env, stderr=self.log_file, stdout=self.log_file)
+        else:
+            remote_debug_proc = None
+
+        # CoD: Black Ops 3 workaround
+        if os.environ.get("SteamGameId", 0) in [
+                    "311210",   # CoD: Black Ops 3
+                    "1985810",  # CoD: Black Ops Cold War
+                    "1549250",  # Undecember
+                ]:
+            argv = [g_proton.wine_bin, "c:\\Program Files (x86)\\Steam\\steam.exe"]
+        # Don't use steam if it's not a steam game
+        # Prevent this warning for non-steam games:
+        # [S_API FAIL] SteamAPI_Init() failed; no appID found.
+        # Either launch the game from Steam, or put the file steam_appid.txt containing the correct appID in your game folder.
+        elif "UMU_ID" in os.environ and os.environ.get("UMU_USE_STEAM", "0") != "1":
+            if len(sys.argv) >= 3 and sys.argv[2].startswith('/'):
+                log(sys.argv[2])
+                log("Executable is a unix path, launching with 'umu.exe'.")
+                if g_proton.host_pe_arch == "x86_64-windows":
+                    #run with winepreloader directly to avoid restart through start.exe
+                    self.env["WINELOADERNOEXEC"] = "1"
+                    argv = [g_proton.lib_dir + "/wine/x86_64-unix/wine-preloader", g_proton.lib_dir + "/wine/x86_64-unix/wine", "c:\\windows\\system32\\umu.exe"]
+                else:
+                    argv = [g_proton.wine_bin, "c:\\windows\\system32\\umu.exe"]
+            else:
+                log("Executable is inside wine prefix, launching normally.")
+                argv = [g_proton.wine_bin]
+        else:
+            if "UMU_ID" in os.environ:
+                append_to_env_str(self.env, "WINEDLLOVERRIDES", "lsteamclient=d", ";")
+            if g_proton.host_pe_arch == "x86_64-windows":
+                #run with winepreloader directly to avoid restart through start.exe
+                self.env["WINELOADERNOEXEC"] = "1"
+                argv = [g_proton.lib_dir + "/wine/x86_64-unix/wine-preloader", g_proton.lib_dir + "/wine/x86_64-unix/wine", "c:\\windows\\system32\\steam.exe"]
+            else:
+                argv = [g_proton.wine_bin, "c:\\windows\\system32\\steam.exe"]
+
+        steam_input_appid_forced = False
+        if self.force_steam_input_appid:
+            appid = os.environ.get("SteamGameId", os.environ.get("STEAM_COMPAT_APP_ID", "0"))
+            if str(appid).isdigit() and str(appid) != "0":
+                steam_input_appid_forced = self.set_steam_input_appid(appid)
+
+        try:

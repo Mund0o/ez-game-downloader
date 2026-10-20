@@ -1487,7 +1487,34 @@ class _Couch:
                 self.bridge.call(self.bridge.core.library_call("game_processes", game.id),
                                  lambda pids: bring_game_forward(pids), lambda _err: None, owner=self)
 
+    def _steam_tap_over_game(self) -> None:
+        """A Steam Controller's Steam button tapped (Steam logged it) over one of our games: with Steam's overlay in
+        the game the tap is Steam's — its overlay opens (friends, invites); a hold is the quick menu (Steam skips long
+        holds). Without the overlay it is the quick menu, as for other controllers."""
+        playing = [i for i in self.running if i not in self.suspended]
+        gid = self._last_game if self._last_game in playing else (playing[0] if playing else None)
+
+        def got(has: bool) -> None:
+            if self._exiting:
+                return
+            if has:
+                log.info("Steam button tapped over a game with Steam's overlay: Steam's (hold it for the quick menu)")
+                return
+            self.guide_pressed()
+            if self._game_in_front():
+                self._home_held()
+        if gid is None:
+            got(False)
+            return
+        self.bridge.call(self.bridge.core.library_call("has_steam_overlay", gid), got, lambda _e: got(False),
+                         owner=self)
+
     def _pad(self, name: str) -> None:
+        if name == "home" and self.pads.home_from_steam and self._game_in_front() and \
+                not self.actions.settings.get("own_overlay", False) and \
+                not (self.quick is not None and self.quick.isVisible()):
+            self._steam_tap_over_game()
+            return
         if name == "home":
             self.guide_pressed()
         if self.quick is not None and self.quick.isVisible():
@@ -2297,6 +2324,12 @@ class _Couch:
 
     def _starting_text(self) -> str:
         guide = self._pad_labels(self.pad_family or "generic")["home"]
+        if self.actions.settings.get("own_overlay", False) and (self.pads.names() or self.pads.steam_as_keys()):
+            return (f"The game opens in a moment. Press {guide} for the quick menu — friends, chat and invites are "
+                    "there.")
+        if self.pads.steam_as_keys():                   # (Steam has the controller: a tap of its button is Steam's)
+            return (f"The game opens in a moment. Hold {guide} for the quick menu — a tap opens Steam's overlay "
+                    "(friends, invites).")
         hold = f" Hold {guide} on the controller for the quick menu." if self.pads.names() else ""
         return "The game opens in a moment." + hold
 

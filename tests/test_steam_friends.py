@@ -63,9 +63,13 @@ async def test_live_status_with_the_users_key(tmp_path, routes, client):
         {"steamid": B, "personaname": "Bob", "personastate": 3},
         {"steamid": C, "personaname": "Cleo", "personastate": 0, "lastlogoff": 1700000000},
         {"steamid": D, "personaname": "Dan", "personastate": 1, "gameid": "730", "gameserverip": "1.2.3.4:27015",
-         "gameextrainfo": "Counter-Strike 2"}), content_type="application/json")
+         "gameextrainfo": "Counter-Strike 2"},
+        {"steamid": ME, "personaname": "me", "personastate": 1, "gameid": "480", "gameextrainfo": "Spacewar"}),
+        content_type="application/json")
     out = await sf.load(client, root, KEY)
     assert out["live"] and not out["private"] and out["error"] == "" and out["me"] == ME
+    assert out["self"] == {"playing": True, "game": "Spacewar", "gameid": "480"}    # what Steam shows you doing
+    assert ME in routes.calls[-1].url.params["steamids"]
     names = [f["name"] for f in out["friends"]]
     assert names == ["Alice", "Dan", "Bob", "Cleo"]                  # playing, then online, away, offline
     alice, dan, bob, cleo = out["friends"]
@@ -103,9 +107,9 @@ async def test_steam_friend_links_go_to_steam(core, monkeypatch):
     opened = []
     monkeypatch.setattr(steam, "open_steam_url", opened.append)
     f = {"steamid": A, "name": "Alice", "gameid": "548430", "lobby": "42", "server": ""}
-    for action in ("chat", "join", "launch", "profile"):
+    for action in ("chat", "join", "launch", "profile", "invite"):
         await core.steam_friend_open(action, f)
     assert opened == [f"steam://friends/message/{A}", f"steam://joinlobby/548430/42/{A}", "steam://rungameid/548430",
-                      f"steam://url/SteamIDPage/{A}"]
+                      f"steam://url/SteamIDPage/{A}", f"steam://friends/message/{A}"]    # invite: Steam's chat
     with pytest.raises(RuntimeError, match="Nothing to join"):
         await core.steam_friend_open("join", {"steamid": B, "name": "Bob"})

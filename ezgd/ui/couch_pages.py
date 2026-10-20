@@ -2169,6 +2169,7 @@ TOGGLES = [
                  ("auto_backup_saves", "Back up saves automatically (after playing, before updates)"),
                  ("check_game_updates", "Check installed games for new versions"),
                  ("auto_update_games", "Install game updates automatically"),
+                 ("own_overlay", "Our overlay instead of Steam's: friends, chat, invites in the quick menu"),
                  ("steam_overlay", "Steam overlay in games (friends list)"),
                  ("launch_through_steam", "Full Steam overlay: start games through Steam")]),
     ("Store", [("couch_controller_only", "Only show games that work with a controller (Steam's data)"),

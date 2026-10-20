@@ -227,6 +227,7 @@ class LibraryManager:
         self._installers: dict[int, dict] = {}       # entry id → running installer (repack setup.exe)
         self._steam_seen: dict[int, dict] = {}       # games running through Steam (play mode), last seen
         self._launch_info: dict[int, dict] = {}      # Proton used / overlay loaded, per running game
+        self.closing = False                        # the app is shutting down: nothing new is started
         self._suspended: dict[int, dict] = {}        # frozen games: {"at": monotonic, "pids": [...]}
         self._frozen_seconds: dict[int, float] = {}  # time a running game spent frozen (not playtime)
         self.thaw_leftovers()
@@ -483,16 +484,21 @@ class LibraryManager:
             e.proton_version = proton
             log.info("%s worked with %s — kept for it", e.title, proton)
 
+    def _spawn(self, plan: launcher.LaunchPlan, log_path: Path | None = None):
+        """Every game, test start, installer and tool goes through here: none once the app is closing (a "Fix my
+        game" test started a game while the app shut down, and it ran on with nothing to stop it)."""
+        if self.closing:
+            raise LibraryError("The app is closing — nothing new is started.")
+        return launcher.spawn(plan, log_path)
+
     def overlay_available(self) -> str | None:
         """Why the Steam overlay will not be in the next game (``None``: it will be)."""
         if not self.settings.settings.steam_overlay:
             return "switched off"
+        if self.settings.settings.own_overlay:
+            return "the app's own overlay is used instead (Settings)"
         if not IS_LINUX:
             return "only on Linux"
-        if steam.valve_controllers():
-            # Steam owns the controller: its Steam button opened Steam's overlay in the game *and* the quick menu
-            # (a friend's Steam Controller). Without the overlay, the button is the quick menu's alone.
-            return "a Steam Controller is connected: its Steam button opens the quick menu"
         if steam.overlay_env(self.steam_root()) is None:
             return "Steam is not installed"
         if not steam.is_steam_running():
@@ -548,7 +554,7 @@ class LibraryManager:
             steam_shortcut_appid=e.steam_shortcut_appid, steam_app_id=int(app_id) if app_id else None,
             compat=e.compat_config, game_root=Path(e.install_path) if e.install_path else None,
             log_dir=self.paths.logs, fix_env=fx.env, fix_wrappers=fx.wrappers, fix_args=fx.args,
-            fix_notes=fx.notes)
+            fix_notes=fx.notes, steam_client=self.talks_to_steam_itself(e))
         live = self._mangohud_env(e)
         if live:
             plan.env = {**plan.env, **live}
@@ -672,7 +678,7 @@ class LibraryManager:
             launcher.run_pre_launch(plan, log_path)       # raises LaunchError if an `&&` step fails
         with open(log_path, "rb") as fh:
             start = fh.seek(0, 2)
-        proc = launcher.spawn(plan, log_path)
+        proc = self._spawn(plan, log_path)
         self._processes[e.id] = (proc, time.monotonic(), plan, log_path)
         if diagnostic:
             self._watch_error_box(e.id, proc, log_path, start)
@@ -952,6 +958,21 @@ class LibraryManager:
         if not stopped:
             log.error("game %s: processes left after stopping: %s", entry_id, left)
         return {"stopped": stopped, "left": left}
+
+    def has_steam_overlay(self, entry_id: int) -> bool:
+        """Is Steam's overlay in this running game? (A Steam Controller's Steam button then belongs to Steam over the
+        game: a tap opens the overlay — friends, invites — and a hold the quick menu.) The app loaded it, or Steam
+        started the game and added it: one of the game's processes has Steam's overlay library preloaded."""
+        if self._launch_info.get(entry_id, {}).get("overlay"):
+            return True
+        for pid in self.game_processes(entry_id):
+            try:
+                env = Path(f"/proc/{pid}/environ").read_bytes()
+            except OSError:
+                continue
+            if b"gameoverlayrenderer" in env:
+                return True
+        return False
 
     # ------------------------------------------------- suspend / resume (quick menu)
     def game_processes(self, entry_id: int) -> list[int]:
@@ -1233,7 +1254,7 @@ class LibraryManager:
             argv = [wt]
         else:
             raise LibraryError(f"unknown tool {tool}")
-        launcher.spawn(launcher.LaunchPlan(argv, str(prefix), env, tool), self.paths.logs / f"game-{entry_id}.log")
+        self._spawn(launcher.LaunchPlan(argv, str(prefix), env, tool), self.paths.logs / f"game-{entry_id}.log")
 
     # ---------------------------------------------------- debugging assistant
     @property
@@ -1422,7 +1443,7 @@ class LibraryManager:
         log_path = self.paths.logs / f"trial-{entry_id}.log"
         with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} preparing a prefix for {proton.name}\n")
-        proc = launcher.spawn(plan, log_path)
+        proc = self._spawn(plan, log_path)
         try:
             proc.wait(timeout=240)
         except subprocess.TimeoutExpired:
@@ -1461,7 +1482,7 @@ class LibraryManager:
             with open(log_path, "a", encoding="utf-8") as fh:
                 fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} trial {n}: {cand['label']} · diagnostic run\n")
                 offset = fh.tell()
-            proc = launcher.spawn(plan, log_path)
+            proc = self._spawn(plan, log_path)
             code = None
             box = _BoxWatch(log_path, offset)
             looks = list(self.SCREEN_LOOKS)
@@ -1945,7 +1966,7 @@ class LibraryManager:
         log_path = self.paths.logs / f"game-{entry_id}.log"
         with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} winetricks {' '.join(verbs)}\n")
-        proc = launcher.spawn(launcher.LaunchPlan([wt, "-q", *verbs], str(prefix), env, "winetricks"), log_path)
+        proc = self._spawn(launcher.LaunchPlan([wt, "-q", *verbs], str(prefix), env, "winetricks"), log_path)
         if wait:                                     # "Fix my game" tests the game right after: wait for it
             try:
                 return proc.wait(timeout=1800)
@@ -1988,7 +2009,7 @@ class LibraryManager:
             return 127
         with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} winetricks {' '.join(verbs)} (test copy)\n")
-        proc = launcher.spawn(launcher.LaunchPlan([wt, "-q", *verbs], str(prefix), winetricks_env(proton, prefix),
+        proc = self._spawn(launcher.LaunchPlan([wt, "-q", *verbs], str(prefix), winetricks_env(proton, prefix),
                                                   "winetricks"), log_path)
         try:
             return proc.wait(timeout=self.TRIAL_WINETRICKS_SECONDS)
@@ -2160,11 +2181,11 @@ class LibraryManager:
         if not self.settings.settings.launch_through_steam:
             out["reason"] = "switched off in Settings"
             return out
+        if self.settings.settings.own_overlay:          # (started by Steam, Steam would add its overlay itself)
+            out["reason"] = "the app's own overlay is used instead of Steam's (Settings)"
+            return out
         if "no_steam_overlay" in e.compat_config.fixes:
             out["reason"] = "the Steam overlay is off for this game"
-            return out
-        if steam.valve_controllers():                 # (started by Steam, Steam would add its overlay itself)
-            out["reason"] = "a Steam Controller is connected: its Steam button opens the quick menu, not Steam's overlay"
             return out
         root = self.steam_root()
         if root is None or steam.steam_command() is None:
@@ -2465,7 +2486,7 @@ class LibraryManager:
         with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} {plan.description}\n"
                      f"{launcher.display_command(plan)}\n")
-        proc = launcher.spawn(plan, log_path)
+        proc = self._spawn(plan, log_path)
         started = time.time()
         self._processes[e.id] = (proc, time.monotonic(), plan, log_path)
         self._installers[e.id] = {"target": str(target), "started": started, "root": str(rep.root)}
@@ -2545,6 +2566,9 @@ class LibraryManager:
             if not self.safe_to_delete(t):
                 raise LibraryError(f"Refusing to delete {t}: it is outside the app's download and installation "
                                    "folders. Delete it yourself if you are sure.")
+            other = self.shared_with(e.id, t)
+            if other:
+                raise LibraryError(f"Refusing to delete {t}: “{other}” in your Library uses it too.")
         for t in targets:
             size = dir_size(t)
             if t.is_dir():
@@ -2571,6 +2595,19 @@ class LibraryManager:
                 return True
         return False
 
+    def shared_with(self, entry_id: int, path: Path | str) -> str | None:
+        """The title of another Library game that uses ``path`` — the same folder or file, one inside it, or one
+        around it — else None. Deleting it would delete (part of) that game: uninstalling a game whose folder held
+        another entry's folder only looked one way, and Remove + "delete files" did not look at all."""
+        rp = os.path.realpath(path)
+        for o in self.all():
+            if o.id == entry_id:
+                continue
+            for q in (o.install_path, o.download_path):
+                if q and (is_within(q, rp) or is_within(rp, q)):
+                    return o.title
+        return None
+
     def remove(self, entry_id: int, delete_files: bool = False) -> list[str]:
         e = self.get(entry_id)
         if self.is_running(entry_id):
@@ -2584,6 +2621,10 @@ class LibraryManager:
                 if not self.safe_to_delete(path):
                     raise LibraryError(f"Refusing to delete {path}: it is outside the app's download and "
                                        f"installation folders. Delete it manually if you are sure.")
+                other = self.shared_with(e.id, path)
+                if other:
+                    raise LibraryError(f"Refusing to delete {path}: “{other}” in your Library uses it too. Remove "
+                                       "the game without deleting files, or remove “" + other + "” first.")
             for p in {e.install_path, e.download_path} - {None}:
                 path = Path(p)
                 if path.is_dir():

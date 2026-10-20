@@ -547,16 +547,19 @@ class DownloadManager:
         self.wake()
         return task.snapshot()
 
+    def content_path(self, task_id: int) -> Path | None:
+        """The file or folder this download wrote (what Remove + "delete files" deletes)."""
+        task = self._get(task_id)
+        if task.kind is DownloadKind.TORRENT and self.torrents:
+            return self.torrents.content_path(task)
+        return Path(task.dest_dir) / task.filename if task.filename else None
+
     async def remove(self, task_id: int, delete_files: bool = False) -> list[str]:
         """Remove from the list. With ``delete_files`` the downloaded file/folder is deleted too —
         but only the exact content of this download inside its destination folder."""
         task = self._get(task_id)
         deleted: list[str] = []
-        content: Path | None = None
-        if task.kind is DownloadKind.TORRENT and self.torrents:
-            content = self.torrents.content_path(task)
-        elif task.filename:
-            content = Path(task.dest_dir) / task.filename
+        content = self.content_path(task_id)
         if not task.status.is_finished:
             await self.cancel(task_id, delete_partial=delete_files)
         if delete_files and content is not None and content.exists():

@@ -113,3 +113,49 @@ def test_friends_summary_and_actions():
     assert summary({"live": True, "friends": [FRIENDS["friends"][2]]}) == "Nobody is online right now"
     cleo = FRIENDS["friends"][2]
     assert [a for a, _l, _n in actions(cleo)] == ["chat", "profile"]
+
+
+def test_invite_to_your_game():
+    """Steam has no link that sends an invite; its friends list offers "Invite to Game" while Steam shows you in a
+    game. The app offers "Invite to <game>" then (named from the Library: an OnlineFix game is "Spacewar" to Steam)."""
+    from ezgd.ui.couch_friends import INVITE_HOW, actions, invite_game
+    live = {**FRIENDS, "self": {"playing": True, "game": "Spacewar", "gameid": "480"}}
+    assert invite_game(FRIENDS, "Friendly Game") == ""                # live data, Steam does not show you playing
+    assert invite_game(live, "Friendly Game") == "Friendly Game"      # the app's name, not Steam's "Spacewar"
+    assert invite_game(live) == "Spacewar"                            # a game started in Steam itself
+    assert invite_game({"live": False}, "Friendly Game") == "Friendly Game"   # no key: the app's game being played
+    assert invite_game({"live": False}) == "" and invite_game(None) == ""
+    bob, cleo = FRIENDS["friends"][1], FRIENDS["friends"][2]
+    assert ("invite", "Invite to Friendly Game", INVITE_HOW) in actions(bob, "Friendly Game")
+    assert "invite" not in [a for a, _l, _n in actions(cleo, "Friendly Game")]     # offline: no invite
+    assert "Invite to Game" in INVITE_HOW
+
+
+@linux_only
+def test_invite_from_the_quick_menu(ui, qtbot, tmp_path, monkeypatch):
+    win, core, _ = ui
+    opened = _fake_steam(core, monkeypatch)
+    live = {**FRIENDS, "self": {"playing": True, "game": "Spacewar", "gameid": "480"}}
+
+    async def friends(force=False):
+        return live
+    monkeypatch.setattr(core, "steam_friends", friends)
+    a = _running(win, core, tmp_path, qtbot, "Invite Game")
+    couch = _open_couch(win, qtbot)
+    qtbot.waitUntil(lambda: a.id in couch.running, timeout=5000)
+    couch._home_held()
+    qtbot.waitUntil(lambda: couch.quick is not None and couch.quick._shown >= 1.0, timeout=5000)
+    q = couch.quick
+    qtbot.waitUntil(lambda: q.friends is not None, timeout=3000)
+    q.open_friends()
+    q.command("down")
+    q.command("a")                                                    # Bob
+    assert [r.key for r in q.rows] == ["fa-chat", "fa-invite", "fa-profile"]
+    assert q.rows[1].label == "Invite to Invite Game" and "Invite to Game" in q.rows[1].note
+    q.grab()
+    q.focus = 1
+    q.command("a")
+    qtbot.waitUntil(lambda: opened == [("invite", "Bob")], timeout=3000)
+    qtbot.waitUntil(lambda: not q.isVisible(), timeout=3000)
+    win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
+    couch.force_close()

@@ -16,6 +16,12 @@ Per-game fixes:
   last number in ``STEAM_COMPAT_DATA_PATH``. We therefore always set ``UMU_ID``:
   the numeric Steam App ID when known (→ ``gamefixes-steam/<id>.py``), else
   ``umu-0`` (default fixes only) — never letting it guess from our prefix path.
+* ``UMU_ID`` also tells GE-Proton "not a Steam game": since GE-Proton11-7 its ``proton`` script then switches
+  Wine's bridge to the Steam client off (``lsteamclient=d``) unless ``UMU_USE_STEAM=1`` — a game that needs the
+  running Steam client (OnlineFix's multiplayer fix) failed with GE in the app while it worked with GE in Steam
+  (which never sets ``UMU_ID``) and with Valve's Proton (no UMU logic). Builds up to 11-6 (and Proton-CachyOS
+  11.0) had that switch the other way round. :func:`umu_steam_mode` reads which way a build works, so such games
+  keep the Steam client in every build (see ``steam_client`` in :func:`proton_command`).
 * Valve Proton keys its built-in per-app tweaks on ``SteamAppId``/``SteamGameId``.
   Exporting those is opt-in because games whose Steam emulation reads
   ``SteamAppId`` (e.g. OnlineFix's online fix) may misbehave.
@@ -116,6 +122,64 @@ def proton_supports(proton_dir, var: str) -> bool | None:
         hit = _SUPPORT_CACHE[key] = (mtime, blob)
     return var.encode() in hit[1]
 
+_UMU_MODE_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def umu_steam_mode(proton_dir) -> str:
+    """How this Proton build treats the Steam client when ``UMU_ID`` is set — from its own ``proton`` script:
+
+    * ``"flag"``: Wine's Steam client bridge is switched off unless ``UMU_USE_STEAM=1`` (GE-Proton11-7 and later)
+    * ``"inverted"``: it is switched off only *with* ``UMU_USE_STEAM=1`` (GE-Proton up to 11-6, Proton-CachyOS 11.0)
+    * ``"none"``: the bridge is never switched off (Valve's Proton: no UMU handling)
+    * ``"unknown"``: something else — the safe answer is a launch without ``UMU_ID``, as Steam does it
+    """
+    if not proton_dir:
+        return "unknown"
+    script = Path(proton_dir) / "proton"
+    try:
+        mtime = script.stat().st_mtime
+    except OSError:
+        return "unknown"
+    hit = _UMU_MODE_CACHE.get(str(script))
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
+    try:
+        text = script.read_text("utf-8", "replace")
+    except OSError:
+        return "unknown"
+    mode = _umu_mode_of(text)
+    _UMU_MODE_CACHE[str(script)] = (mtime, mode)
+    return mode
+
+
+def _umu_mode_of(text: str) -> str:
+    lines = text.splitlines()
+    hits = [k for k, line in enumerate(lines) if "lsteamclient=d" in line]
+    if not hits:
+        return "none"
+    modes = set()
+    for k in hits:
+        indent = len(lines[k]) - len(lines[k].lstrip())
+        guard = ""
+        for j in range(k - 1, max(-1, k - 12), -1):            # the condition the line sits under
+            line = lines[j]
+            if line.strip() and len(line) - len(line.lstrip()) < indent:
+                guard = line.strip()
+                break
+        names = re.findall(r"\b([a-z_][a-z0-9_]*)\b", guard)
+        defined = " ".join(l for l in lines[max(0, k - 40):k] if any(re.match(rf"\s*{re.escape(n)}\s*=[^=]", l)
+                                                                     for n in names if n not in ("if", "in", "and")))
+        cond = guard + " " + defined
+        if "UMU_USE_STEAM" in cond and re.search(r"UMU_USE_STEAM[\"']\)\s*!=\s*[\"']1", cond):
+            modes.add("flag")                   # off unless UMU_USE_STEAM=1
+        elif re.fullmatch(r"if\s+[\"']UMU_ID[\"']\s+in\s+os\.environ\s*:", guard) and \
+                re.search(r"UMU_USE_STEAM[\"'],\s*[\"']0[\"']\)\s*!=\s*[\"']1", "\n".join(lines[max(0, k - 40):k])):
+            modes.add("inverted")               # in the branch taken with UMU_USE_STEAM=1
+        else:
+            modes.add("unknown")
+    return modes.pop() if len(modes) == 1 else "unknown"
+
+
 # Wine has built-in versions of these DLLs, so a copy shipped next to a game's
 # .exe (proxy/hook DLLs used by mods, launchers and fixes) is ignored unless the
 # DLL is overridden to "native, then builtin".
@@ -173,7 +237,9 @@ class ProtonCommand:
 def proton_command(exe: Path, proton: ProtonInstall, *, steam_root: Path, prefix_dir: Path,
                    game_root: Path | None = None, steam_app_id: int | None = None,
                    compat: CompatConfig | None = None, log_dir: Path | None = None,
-                   verb: str = "waitforexitandrun") -> ProtonCommand:
+                   verb: str = "waitforexitandrun", steam_client: bool = False) -> ProtonCommand:
+    """``steam_client``: the game needs the running Steam client (OnlineFix): Wine's bridge to it stays on, in
+    every build (see umu_steam_mode)."""
     compat = compat or CompatConfig()
     game_root = game_root or exe.parent
     env = {
@@ -189,6 +255,11 @@ def proton_command(exe: Path, proton: ProtonInstall, *, steam_root: Path, prefix
         env["SteamAppId"] = env["SteamGameId"] = str(steam_app_id)
     if not compat.protonfixes:
         env["PROTONFIXES_DISABLE"] = "1"
+    steam_mode = umu_steam_mode(proton.path) if steam_client else ""
+    if steam_mode == "flag":
+        env["UMU_USE_STEAM"] = "1"            # GE-Proton11-7+: keep lsteamclient (and start through steam.exe)
+    elif steam_mode == "unknown":
+        del env["UMU_ID"]                      # as Steam starts it: nothing switches the Steam client off
     for key in compat.options:
         opt = OPTIONS_BY_KEY.get(key)
         if opt:
@@ -217,11 +288,14 @@ def proton_command(exe: Path, proton: ProtonInstall, *, steam_root: Path, prefix
         parts.append("Steam Linux Runtime not installed — running Proton directly")
     if proton.has_protonfixes and compat.protonfixes:
         parts.append(f"protonfixes for app {steam_app_id}" if steam_app_id else "protonfixes (defaults)")
+    if steam_client:
+        parts.append("Steam client on" + {"flag": " (UMU_USE_STEAM)", "unknown": " (no UMU_ID)"}.get(steam_mode, ""))
     return ProtonCommand(argv, env, " · ".join(parts), runtime.name if runtime else None)
 
 
 def umu_command(exe: Path, umu_run: str, *, prefix_dir: Path, proton: ProtonInstall | None = None,
-                steam_app_id: int | None = None, compat: CompatConfig | None = None) -> ProtonCommand:
+                steam_app_id: int | None = None, compat: CompatConfig | None = None,
+                steam_client: bool = False) -> ProtonCommand:
     """umu-launcher: Proton inside the Steam Runtime without Steam (umu downloads what it needs).
 
     Documented variables: WINEPREFIX, GAMEID, STORE, PROTONPATH ("GE-Proton" = latest GE-Proton).
@@ -232,6 +306,8 @@ def umu_command(exe: Path, umu_run: str, *, prefix_dir: Path, proton: ProtonInst
            "STORE": "none", "PROTONPATH": str(proton.path) if proton else "GE-Proton"}
     if not compat.protonfixes:
         env["PROTONFIXES_DISABLE"] = "1"
+    if steam_client and (proton is None or umu_steam_mode(proton.path) == "flag"):
+        env["UMU_USE_STEAM"] = "1"            # (umu always sets UMU_ID; the latest GE needs this for Steam)
     for key in compat.options:
         opt = OPTIONS_BY_KEY.get(key)
         if opt:
@@ -242,6 +318,8 @@ def umu_command(exe: Path, umu_run: str, *, prefix_dir: Path, proton: ProtonInst
              "Steam Runtime"]
     if compat.protonfixes:
         parts.append(f"protonfixes for app {steam_app_id}" if steam_app_id else "protonfixes (defaults)")
+    if steam_client:
+        parts.append("Steam client on" + (" (UMU_USE_STEAM)" if env.get("UMU_USE_STEAM") else ""))
     return ProtonCommand([umu_run, str(exe)], env, " · ".join(parts), "Steam Runtime (umu)")
 
 

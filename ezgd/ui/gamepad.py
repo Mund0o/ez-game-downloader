@@ -187,6 +187,8 @@ class Gamepads(QObject):
         self.guide.tapped.connect(lambda: self._steam_guide(False))
         self.guide.held.connect(lambda: self._steam_guide(True))
         self._home_seen = 0.0                            # the guide button read from a controller, last
+        self.home_from_steam = False                     # the last "home" was a Steam-button tap Steam logged (its
+        #                                                  controller: over a game with Steam's overlay, Steam's)
         self.pointer_mode = False                        # the left stick moves a pointer: no stick → directions
         self._repeat = QTimer(self)
         self._repeat.setInterval(int(REPEAT_EVERY * 1000))
@@ -277,7 +279,11 @@ class Gamepads(QObject):
         if held:
             self.home_held.emit()
         else:
-            self.action.emit("home")
+            self.home_from_steam = True
+            try:
+                self.action.emit("home")
+            finally:
+                self.home_from_steam = False
 
     def rescan(self) -> None:
         products = steam_products()
