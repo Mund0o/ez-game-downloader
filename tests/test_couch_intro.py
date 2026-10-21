@@ -213,3 +213,35 @@ def test_browser_drops_a_second_request_for_the_same_file(qapp):
         r = Req(name, url)
         browser.BrowserDownloads._requested(Fake(), r)
         assert r.state == "cancelled"
+
+
+def test_browser_views_release_opengl_before_they_go(qapp, monkeypatch):
+    """EZGD-ABRT-F8E5FD: with GPU acceleration, a browser view going away while another view's OpenGL context
+    was current made WebEngine fail to switch back — Qt aborted the app ("Failed to restore OpenGL context after
+    clean-up."). The guard releases the current context first, on hide, close and delete."""
+    from PySide6.QtCore import QEvent, QObject
+    from ezgd.ui.dialogs import browser
+    released = []
+    monkeypatch.setattr(browser, "_release_gl", lambda: released.append(1))
+    obj = QObject()
+    browser.install_gl_guard(obj)
+    for t in (QEvent.Type.Hide, QEvent.Type.Close, QEvent.Type.DeferredDelete, QEvent.Type.Paint):
+        browser._GUARD.eventFilter(obj, QEvent(t))
+    assert len(released) == 3                                   # not for every other event
+
+
+def test_couch_mode_survives_its_screen_being_recreated(ui, qtbot, monkeypatch):  # noqa: F811
+    """EZGD-PY-F80EE5: the desktop re-creates a monitor when its mode changes; Qt deletes the old QScreen and
+    couch mode used it ("Internal C++ object (QScreen) already deleted"). The same monitor is found by name."""
+    import shiboken6
+    from PySide6.QtWidgets import QApplication
+    win, _core, _ = ui
+    win.open_couch()
+    qtbot.waitUntil(lambda: win.couch is not None and win.couch.isVisible(), timeout=5000)
+    couch = win.couch
+    real = QApplication.primaryScreen()
+    couch._target_name = real.name()
+    monkeypatch.setattr(shiboken6, "isValid", lambda o: o is not couch._target_screen and True)
+    assert couch._live_target() is real                           # found again by its name
+    couch.display_target()                                         # (no "already deleted")
+    couch.force_close()

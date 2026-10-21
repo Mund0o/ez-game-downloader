@@ -84,6 +84,13 @@ class Settings:
     auto_update_games: bool = False              # download and install new versions by themselves
     auto_backup_saves: bool = True               # back up saves after playing and before updates/uninstalls
     save_sync_dir: str = ""                      # save backups go here too (a Syncthing / Nextcloud / Drive folder)
+    steam_input_layout: bool = True              # games started here: Steam's game controller layout, not the desktop one
+    keep_awake: bool = True                      # no screen dimming / locking while a game runs or couch mode is open
+    # the debugging assistant
+    hidden_tests: bool = True                    # test starts run off-screen and muted (KDE Plasma; else visible)
+    check_new_games: bool = True                 # test each newly installed game, invisibly, before its first start
+    crash_reports: bool = True                   # keep what happened when a game crashes or freezes while played
+    share_knowledge: bool = True                 # what fixed which failure: shared with everyone (anonymous, sealed)
     # app updates (GitHub releases)
     update_repo: str = ""                        # "owner/name" with the app's releases; empty = the official one
     check_app_updates: bool = True               # look for a new version of the app once a day

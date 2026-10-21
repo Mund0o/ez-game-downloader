@@ -146,6 +146,7 @@ def test_steam_reference_compares_prefixes_and_proton(tmp_path):
 
 def test_shipped_redistributables(tmp_path):
     e = game(tmp_path)
+    (tmp_path / "Game" / "Game.exe").write_bytes(build_pe(["kernel32.dll", "d3dx9_43.dll", "xaudio2_7.dll"], 64))
     redist = tmp_path / "Game" / "_CommonRedist" / "vcredist" / "2022"
     redist.mkdir(parents=True)
     (redist / "VC_redist.x64.exe").write_bytes(b"MZ")
@@ -155,7 +156,28 @@ def test_shipped_redistributables(tmp_path):
     log.write_text(run_block("2026-10-03 10:00:00", "GE", None, "x", 53, 2))
     d = dg.diagnose(e, tmp_path / "pfx", log, protons=[], proton_name="GE").to_dict()
     f = next(f for f in d["findings"] if f["key"] == "redist")
-    assert set(f["fix"]["value"].split()) == {"vcrun2022", "d3dx9", "d3dx10", "d3dx11_43", "xact"}
+    assert set(f["fix"]["value"].split()) == {"vcrun2022", "d3dx9", "xact"}    # only what the game imports
+
+
+def test_a_generic_redist_bundle_offers_only_what_the_game_uses(tmp_path):
+    """SteamRIP's _CommonRedist is the same bundle for every game: Avatar: Frontiers of Pandora (DirectX 12) was
+    offered .NET 4.8, XNA, OpenAL and DirectX 9–11 extensions — and .NET failed to install."""
+    e = game(tmp_path)
+    redist = tmp_path / "Game" / "_CommonRedist"
+    redist.mkdir()
+    for n in ("dotNetFx40_Full_setup.exe", "dxwebsetup.exe", "oalinst.exe", "xnafx40_redist.msi"):
+        (redist / n).write_bytes(b"MZ")
+    log = tmp_path / "game-1.log"
+    log.write_text(run_block("2026-10-03 10:00:00", "GE", None, "x", 53, 2))
+    (tmp_path / "Game" / "Game.exe").write_bytes(build_pe(["kernel32.dll", "d3d12.dll", "dxgi.dll"], 64))
+    d = dg.diagnose(e, tmp_path / "pfx", log, protons=[], proton_name="GE").to_dict()
+    assert not any(f["key"] == "redist" for f in d["findings"])
+    # an XNA game (a .NET program that uses OpenAL) gets exactly those
+    (tmp_path / "Game" / "Game.exe").write_bytes(build_pe(["mscoree.dll"], 32, dotnet=True))
+    (tmp_path / "Game" / "soft_oal.dll").write_bytes(build_pe(["kernel32.dll", "openal32.dll"], 32))
+    d = dg.diagnose(e, tmp_path / "pfx", log, protons=[], proton_name="GE").to_dict()
+    f = next(f for f in d["findings"] if f["key"] == "redist")
+    assert set(f["fix"]["value"].split()) == {"dotnet48", "xna40", "openal"}
 
 
 def test_investigation_evidence_and_last_words(tmp_path):
@@ -323,3 +345,27 @@ def test_friendly_notes_and_wrapping_widgets(qtbot):
     p.resize(140, 20)
     p.show()
     assert "…" in p.text() and p.toolTip().endswith("Shipping.exe")
+
+
+def test_onlinefix_loaders_next_to_unreals_real_game_are_found_and_fixed_first(tmp_path):
+    """Expedition 33: Expedition33_Steam.exe (Unreal's launcher) starts Sandfall/Binaries/Win64/…-Shipping.exe, and
+    OnlineFix's winmm.dll and UE4SS's dwmapi.dll sit there. Only the launcher's folder was searched, so Wine's own
+    winmm/dwmapi were used, OnlineFix never loaded and the game crashed before its log — through every trial."""
+    from ezgd.platform.proton import suggest_dll_overrides
+    root = tmp_path / "Game"
+    (root / "Engine").mkdir(parents=True)
+    win64 = root / "Sandfall" / "Binaries" / "Win64"
+    win64.mkdir(parents=True)
+    (root / "Expedition33_Steam.exe").write_bytes(build_pe(["kernel32.dll"], 64))
+    (win64 / "SandFall-Win64-Shipping.exe").write_bytes(build_pe(["kernel32.dll", "winmm.dll", "dwmapi.dll"], 64))
+    for n in ("winmm.dll", "dwmapi.dll", "OnlineFix64.dll", "OnlineFix.ini"):
+        (win64 / n).write_bytes(b"MZ")
+    s = suggest_dll_overrides(root / "Expedition33_Steam.exe")
+    assert s.found == ["dwmapi", "winmm"] and s.onlinefix
+    e = LibraryEntry(title="E33", status=LibraryStatus.INSTALLED, id=1, executable=str(root / "Expedition33_Steam.exe"),
+                     install_path=str(root), source="onlinefix")
+    log = tmp_path / "game-1.log"
+    log.write_text(run_block("2026-10-20 05:39:42", "GE", None, "x", 5, 11))
+    d = dg.diagnose(e, tmp_path / "pfx", log, protons=[], proton_name="GE").to_dict()
+    f = next(f for f in d["findings"] if f["key"] == "advisor:dll-overrides")
+    assert f["confidence"] >= 0.85 and f["fix"]["kind"] == "enable_fix" and f["fix"]["value"] == "game_dlls"

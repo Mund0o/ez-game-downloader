@@ -83,6 +83,48 @@ def test_real_proton_error_box_ends_a_trial_at_once(library, tmp_path, monkeypat
     assert time.monotonic() - started < 90
 
 
+NOTICE = ('014c:trace:msgbox:MSGBOX_OnInit L"The fix is made by online-fix.me. Please notice that the only trusted '
+          'sites are online-fix.me and cs.rin.ru. You will get this message only once. Enjoy :)"\n')
+
+
+def test_onlinefixs_one_time_notice_is_not_an_error():
+    """Expedition 33's test with the OnlineFix DLLs loaded stopped on this greeting and was counted as a crash."""
+    from ezgd.library.manager import _trial_reason
+    assert errorbox.messages(NOTICE) == [] and not errorbox.shown(NOTICE) and errorbox.notice_shown(NOTICE)
+    assert errorbox.messages(NOTICE, notices=True)[0].startswith("The fix is made by online-fix.me")
+    assert errorbox.shown(NOTICE + BOX) and errorbox.messages(NOTICE + BOX) == [
+        "Fatal error! VCRUNTIME140_1.dll was not found. Reinstalling may fix this."]
+    assert _trial_reason(NOTICE) == ""
+
+
+def test_a_trial_held_by_a_notice_runs_again(library, tmp_path, monkeypatch):
+    """The notice waits for OK, but comes only once: the test starts the game again and judges that start."""
+    import subprocess
+    from ezgd.platform import launcher
+    folder = tmp_path / "games" / "N"
+    folder.mkdir(parents=True)
+    (folder / "N.exe").write_bytes(b"MZ" + b"\0" * 64)
+    e = library.import_folder("N", folder)
+    library.set_executable(e.id, folder / "N.exe")
+    monkeypatch.setattr(library, "_trial_prefix", lambda eid, n, p=None: (tmp_path / "copy", "a copy"))
+    monkeypatch.setattr(library, "launch_plan", lambda eid, o=None: launcher.LaunchPlan(["sleep", "30"], str(folder)))
+    monkeypatch.setattr(library, "TRIAL_SECONDS", 3)
+    monkeypatch.setattr(library, "SCREEN_LOOKS", ())
+    starts = []
+
+    def spawn(plan, log_path):
+        starts.append(1)
+        if len(starts) == 1:
+            with open(log_path, "a", encoding="utf-8") as fh:
+                fh.write(NOTICE)                          # first start: OnlineFix greets
+        return subprocess.Popen(plan.argv, start_new_session=True)
+
+    monkeypatch.setattr(library, "_spawn", spawn)
+    r = library.run_trial(e.id, {"label": "game DLLs", "overrides": {}}, 1)
+    assert len(starts) == 2 and r["outcome"] == "ran", r
+    assert "notice" not in r["detail"]
+
+
 # --------------------------------------------------------- errors drawn by the game itself (screenshots)
 def test_screen_text_is_filtered_to_errors():
     from ezgd.library import screenread

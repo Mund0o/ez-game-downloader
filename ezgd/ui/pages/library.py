@@ -525,6 +525,10 @@ class LibraryPage(QWidget):
         notes = _friendly_notes(e.notes)
         if notes:
             self.dl.addWidget(Banner("info", notes))
+        self._check_holder = QVBoxLayout()
+        self.dl.addLayout(self._check_holder)
+        self.bridge.call(self.bridge.core.new_game_check(e.id),
+                         lambda st: gen == self._render_gen and self._show_check(e, st), lambda _err: None, owner=self)
 
         xs = self.extraction_state.get(e.id)
         if e.status is LibraryStatus.EXTRACTING and xs:
@@ -1336,6 +1340,36 @@ class LibraryPage(QWidget):
         if r == QMessageBox.Yes:
             self._call("stop", e.id, ok_text="Game stopped")
 
+    def _show_check(self, e, st: dict) -> None:
+        """The new-game check (started once, out of sight, before the first Play)."""
+        status = st.get("status")
+        texts = {"waiting": ("info", "This game is checked once, out of sight, as soon as no game is running."),
+                 "checking": ("info", "Checking this game out of sight: " + (st.get("detail") or "") + "…"),
+                 "ready": ("success", "Checked before its first start: " + (st.get("detail") or "it works") + "."),
+                 "fixed": ("success", "Its first start failed — fixed before you played: " + (st.get("detail") or "")
+                           + "."),
+                 "problem": ("warning", "Checked before its first start — a problem the app could not fix: "
+                             + (st.get("detail") or "") + " (Diagnose has the details.)")}
+        if status not in texts:
+            return
+        kind, text = texts[status]
+        b = Banner(kind, text)
+        if st.get("report"):
+            from pathlib import Path as _P
+            from ezgd.ui.dialogs.diagnose import _open_file
+            rep = _P(st["report"])
+            b.actions.addWidget(button("Report", "folder", on_click=lambda: _open_file(rep)))
+        self._check_holder.addWidget(b)
+
+    def _froze(self, e) -> None:
+        """The game hangs: what its threads are doing is read first (the debugging assistant's evidence for a
+        freeze), then it is stopped."""
+        self.bridge.call(self.bridge.core.report_freeze(e.id),
+                         lambda verdict: self.actions.toasts.show(f"{e.title} stopped", f"Kept what it was doing: "
+                                                                   f"{verdict} Diagnose → Fix my game starts from it.",
+                                                                   "success"),
+                         lambda err: self.actions.fail("Could not stop the game", err), owner=self)
+
     def _resume(self, e) -> None:
         """A suspended game: let it run again and give it the screen."""
         def done(_r) -> None:
@@ -1358,6 +1392,7 @@ class LibraryPage(QWidget):
             m.addAction("Resume the game", lambda: self._resume(e))
         elif e.id in self.running:
             m.addAction("Suspend (freeze) the game", lambda: self._suspend(e))
+            m.addAction("It froze — stop it and keep what happened", lambda: self._froze(e))
         self._organize_menu(m, e)
         m.addSeparator()
         m.addAction("Fixes…", lambda: self._open_fixes(e)).setEnabled(bool(e.executable))

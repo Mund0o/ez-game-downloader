@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import re
 
-PLAY_WINEDEBUG = "-all,+msgbox"           # a normal launch: nothing but message boxes (no cost otherwise)
+# a normal launch: message boxes, and which DLLs were loaded from where (a few hundred lines a start — what the
+# investigator needs to explain a crash while playing: whose loader was replaced, which module a crash dump names)
+PLAY_WINEDEBUG = "-all,+msgbox,+loaddll"
 
 _LINE = re.compile(r"trace:msgbox:MSGBOX_OnInit L?\"(.*?)\"(\.\.\.)?\s*$", re.M)
 _ESC = re.compile(r"\\(x[0-9a-fA-F]{2,4}|u[0-9a-fA-F]{4}|.)")
@@ -28,13 +30,25 @@ def _unescape(s: str) -> str:
     return _ESC.sub(one, s)
 
 
-def messages(text: str, limit: int = 5) -> list[str]:
-    """The texts of the message boxes in a Wine log, oldest first (each once)."""
+# boxes that are not errors: the game goes on once they are closed. OnlineFix greets once ("The fix is made by
+# online-fix.me. Please notice that the only trusted sites are online-fix.me and cs.rin.ru. You will get this message
+# only once. Enjoy :)") — Expedition 33's test runs were stopped on it and counted as crashes.
+_NOTICE = re.compile(r"fix is made by online-fix\.me|only trusted sites are online-fix\.me", re.I)
+
+
+def is_notice(msg: str) -> bool:
+    return bool(_NOTICE.search(msg or ""))
+
+
+def messages(text: str, limit: int = 5, notices: bool = False) -> list[str]:
+    """The texts of the message boxes in a Wine log, oldest first (each once) — errors only, unless ``notices``."""
     out: list[str] = []
     for m in _LINE.finditer(text or ""):
         msg = " ".join(_unescape(m.group(1)).split())
         if m.group(2):
             msg += "…"
+        if not notices and is_notice(msg):
+            continue
         if msg and msg not in out:
             out.append(msg)
             if len(out) >= limit:
@@ -43,8 +57,13 @@ def messages(text: str, limit: int = 5) -> list[str]:
 
 
 def shown(text: str) -> bool:
-    """Has a message box opened (for the live watch of a test run)?"""
-    return "trace:msgbox:MSGBOX_OnInit" in (text or "")
+    """Has an error box opened (for the live watch of a test run)? Notices (is_notice) do not count."""
+    return "trace:msgbox:MSGBOX_OnInit" in (text or "") and bool(messages(text, 1))
+
+
+def notice_shown(text: str) -> bool:
+    """Has a harmless notice opened (it waits for OK: the run is not getting anywhere until it is closed)?"""
+    return any(is_notice(m) for m in messages(text, 20, notices=True))
 
 
 # what a message says → (key, what it means, a fix: (kind, value, label) or None)

@@ -499,14 +499,28 @@ async def test_app_update_check_download_verify_stage_and_swap(routes, tmp_path,
     import hashlib
     from ezgd.core import selfupdate
     from ezgd.net.client import SafeHttpClient
+    import base64
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from ezgd.core import release_keys
     marker = tmp_path / "relaunched.txt"
     blob = release_tarball("9.9.9", marker)
     asset = "https://github.com/o/r/releases/download/v9.9.9/EZGameDownloader-linux-x86_64.tar.gz"
+    # releases are signed with the developer's key: a test key stands in for it
+    key = Ed25519PrivateKey.generate()
+    pub = base64.b64encode(key.public_key().public_bytes(serialization.Encoding.Raw,
+                                                         serialization.PublicFormat.Raw)).decode()
+    monkeypatch.setattr(release_keys, "PUBLIC_KEYS", (pub,))
+    sha = hashlib.sha256(blob).hexdigest()
+    sig = base64.b64encode(key.sign(release_keys.message("EZGameDownloader-linux-x86_64.tar.gz", "9.9.9", sha)))
     routes.add("https://api.github.com/repos/o/r/releases/latest", json.dumps({
         "tag_name": "v9.9.9", "name": "9.9.9", "body": "notes", "html_url": "https://github.com/o/r/releases/v9.9.9",
         "assets": [{"name": "EZGameDownloader-linux-x86_64.tar.gz", "browser_download_url": asset, "size": len(blob),
-                    "digest": "sha256:" + hashlib.sha256(blob).hexdigest()}]}), content_type="application/json")
+                    "digest": "sha256:" + sha},
+                   {"name": "EZGameDownloader-linux-x86_64.tar.gz.sig", "browser_download_url": asset + ".sig"}]}),
+        content_type="application/json")
     routes.add(asset, blob, content_type="application/octet-stream")
+    routes.add(asset + ".sig", sig, content_type="application/octet-stream")
     client = SafeHttpClient(transport=httpx.MockTransport(routes))
     try:
         info = await selfupdate.check(client, "o/r")
@@ -519,6 +533,16 @@ async def test_app_update_check_download_verify_stage_and_swap(routes, tmp_path,
         no_sum = dict(info, sha256=None, sums_url=None)
         with pytest.raises(selfupdate.UpdateError, match="no SHA-256"):
             await selfupdate.download(client, no_sum, tmp_path / "updates3")
+        # a stolen GitHub account: a correct checksum, but no signature — or one made with another key, or the
+        # developer's signature of this file passed off as another version
+        with pytest.raises(selfupdate.UpdateError, match="not signed"):
+            await selfupdate.download(client, dict(info, sig_url=None), tmp_path / "updates4")
+        with pytest.raises(selfupdate.UpdateError, match="not valid"):
+            await selfupdate.download(client, dict(info, version="9.9.10"), tmp_path / "updates5")
+        monkeypatch.setattr(release_keys, "PUBLIC_KEYS", (release_keys.PUBLIC_KEYS[0][:-4] + "AAA=",))
+        with pytest.raises(selfupdate.UpdateError, match="not valid"):
+            await selfupdate.download(client, info, tmp_path / "updates6")
+        assert not [p for d in ("updates4", "updates5", "updates6") for p in (tmp_path / d).glob("*")]
     finally:
         await client.aclose()
     app = tmp_path / "apps" / "EZGameDownloader"

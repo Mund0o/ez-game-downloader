@@ -97,6 +97,7 @@ async def check(client, repo: str) -> dict:
     assets = rel.get("assets") or []
     asset = next((a for a in assets if a.get("name") == want), None)
     sums = next((a for a in assets if str(a.get("name", "")).upper() in ("SHA256SUMS", "SHA256SUMS.TXT")), None)
+    sig = next((a for a in assets if a.get("name") == want + ".sig"), None)
     digest = str((asset or {}).get("digest") or "")
     c = compare(version, __version__)
     return {"repo": repo, "tag": tag, "version": version, "current": __version__,
@@ -106,7 +107,8 @@ async def check(client, repo: str) -> dict:
             "asset": want if asset else None, "asset_url": (asset or {}).get("browser_download_url"),
             "size": (asset or {}).get("size"),
             "sha256": digest.split(":", 1)[1].lower() if digest.startswith("sha256:") else None,
-            "sums_url": (sums or {}).get("browser_download_url"), "checked_at": time.time()}
+            "sums_url": (sums or {}).get("browser_download_url"), "sig_url": (sig or {}).get("browser_download_url"),
+            "checked_at": time.time()}
 
 
 async def _expected_sha(client, info: dict) -> str:
@@ -152,8 +154,30 @@ async def download(client, info: dict, folder: Path, progress=None) -> Path:
         part.unlink(missing_ok=True)
         raise UpdateError("The downloaded update does not match its published SHA-256 — it was deleted, nothing "
                           "was changed.")
+    try:
+        await _check_signature(client, info, h.hexdigest())
+    except UpdateError:
+        part.unlink(missing_ok=True)
+        raise
     os.replace(part, target)
     return target
+
+
+async def _check_signature(client, info: dict, sha256: str) -> None:
+    """The release must be signed with the developer's release key (release_keys): the SHA-256 only proves the file is
+    the one on the release page — a stolen GitHub account could put any file there."""
+    from ezgd.core import release_keys
+    sig = ""
+    if info.get("sig_url"):
+        res = await client.fetch(info["sig_url"], max_bytes=4096)
+        if res.status == 200:
+            sig = res.content.decode("ascii", "replace")
+    if not sig:
+        raise UpdateError("This release is not signed, so the app does not install it by itself (a signature proves "
+                          "the developer made it). Download it from the release page only if you trust it.")
+    if not release_keys.verify(sig, info["asset"], info.get("version") or "", sha256):
+        raise UpdateError("This release's signature is not valid — it was not made with the developer's release key. "
+                          "Nothing was installed; the download was deleted.")
 
 
 def _staging_paths(app: Path) -> tuple[Path, Path]:

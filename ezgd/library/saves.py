@@ -15,7 +15,9 @@ backing up the current state first.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import secrets
 import logging
 import os
 import re
@@ -43,6 +45,37 @@ SKIP_SUFFIXES = (".log", ".dmp", ".mdmp", ".dxvk-cache", ".dxvk.bin", ".dxvk.lut
 MAX_FILE = 512 * 1024 * 1024                  # a single "save" bigger than this is not a save
 AUTO_MAX_BYTES = 768 * 1024 * 1024            # automatic backups skip games whose saves are larger
 KEEP = {"auto": 10, "safety": 10, "manual": 20}
+MAX_MANIFEST = 256 * 1024
+MAX_LISTED = 400
+MAX_RESTORE = 16 * 1024 ** 3                     # a zip that unpacks to more is not a save backup
+
+# This computer marks the backups it makes (an HMAC with a key only it has): only those are ever pruned. The synced
+# folder is not trusted — someone with access could put "newer" fake backups there to push the real ones out of the
+# keep-limit and get them deleted. Backups from the user's other computers are kept and listed, never deleted here.
+_OWNER: tuple[str, bytes] | None = None
+
+
+def set_owner(machine_id: str, key_file: Path) -> None:
+    global _OWNER
+    try:
+        key = bytes.fromhex(key_file.read_text().strip())
+    except (OSError, ValueError):
+        key = secrets.token_bytes(32)
+        key_file.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(key.hex() + "\n")
+    _OWNER = (machine_id or "this", key)
+
+
+def _mac(m: dict, key: bytes) -> str:
+    body = json.dumps({k: v for k, v in m.items() if k != "mac"}, sort_keys=True, ensure_ascii=True)
+    return hmac.new(key, body.encode(), hashlib.sha256).hexdigest()
+
+
+def _made_here(m: dict) -> bool:
+    return bool(_OWNER and m.get("made_by") == _OWNER[0] and isinstance(m.get("mac"), str)
+                and hmac.compare_digest(m["mac"], _mac(m, _OWNER[1])))
 SAFETY_REASONS = ("before-update", "before-uninstall", "before-restore", "before-reset", "before-fix")
 REASON_TEXT = {"auto": "After playing", "manual": "Backed up by you", "before-update": "Before an update",
                "before-uninstall": "Before uninstalling", "before-restore": "Before restoring a backup",
@@ -64,11 +97,12 @@ class SaveBackup:
     entry_id: int | None = None
     fingerprint: str = ""
     folders: list[str] = field(default_factory=list)
+    mine: bool = True                    # made (and marked) by this computer — the only ones ever pruned
 
     def public(self) -> dict:
         return {"path": str(self.path), "created": self.created, "reason": self.reason,
                 "reason_text": REASON_TEXT.get(self.reason, self.reason), "files": self.files, "bytes": self.bytes,
-                "title": self.title, "entry_id": self.entry_id, "folders": self.folders,
+                "title": self.title, "entry_id": self.entry_id, "folders": self.folders, "this_pc": self.mine,
                 "size": self.path.stat().st_size if self.path.exists() else 0}
 
 
@@ -151,17 +185,26 @@ def _folders(files: list[tuple[Path, str, int, float]]) -> list[str]:
 
 def list_backups(folder: Path) -> list[SaveBackup]:
     out = []
-    for z in sorted(Path(folder).glob("*.zip")) if Path(folder).is_dir() else []:
+    zips = sorted(Path(folder).glob("*.zip")) if Path(folder).is_dir() else []
+    for z in zips[-MAX_LISTED:]:
+        if z.is_symlink() or not z.is_file():
+            continue                                  # (a link planted in the synced folder: not followed)
         try:
             with zipfile.ZipFile(z) as zf:
+                if zf.getinfo(MANIFEST).file_size > MAX_MANIFEST:
+                    continue
                 m = json.loads(zf.read(MANIFEST))
+            if not isinstance(m, dict):
+                continue
         except (OSError, KeyError, ValueError, zipfile.BadZipFile):
             continue
         out.append(SaveBackup(path=z, created=float(m.get("created") or z.stat().st_mtime),
                               reason=str(m.get("reason") or "manual"), files=int(m.get("files") or 0),
                               bytes=int(m.get("bytes") or 0), title=str(m.get("title") or ""),
                               entry_id=m.get("entry_id"), fingerprint=str(m.get("fingerprint") or ""),
-                              folders=list(m.get("folders") or [])))
+                              folders=[str(x) for x in (m.get("folders") or [])][:50]
+                              if isinstance(m.get("folders"), list) else [],
+                              mine=_made_here(m)))
     out.sort(key=lambda b: b.created, reverse=True)
     return out
 
@@ -174,6 +217,8 @@ def prune(folder: Path) -> int:
     removed = 0
     count: dict[str, int] = {}
     for b in list_backups(folder):                       # newest first
+        if not b.mine:
+            continue                                     # another computer's (or planted): never deleted here
         k = _klass(b.reason)
         count[k] = count.get(k, 0) + 1
         if count[k] > KEEP[k]:
@@ -210,10 +255,12 @@ def backup(prefix: Path, folder: Path, *, title: str, reason: str, entry_id: int
     while target.exists():
         n += 1
         target = folder / f"{name[:-4]}-{n}.zip"
-    tmp = target.with_suffix(".zip.part")
+    tmp = folder / f".{secrets.token_hex(8)}.zip.part"      # random, and never through a planted link
     written = 0
     try:
-        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "wb") as raw, zipfile.ZipFile(raw, "w", compression=zipfile.ZIP_DEFLATED,
+                                                        compresslevel=6) as zf:
             for f, arc, _size, _mtime in files:
                 try:
                     zf.write(f, arc)
@@ -222,6 +269,9 @@ def backup(prefix: Path, folder: Path, *, title: str, reason: str, entry_id: int
                     log.info("save backup of %s: skipped %s (%s)", title, arc, exc)
             manifest = {"title": title, "entry_id": entry_id, "reason": reason, "created": now, "files": written,
                         "bytes": total, "fingerprint": fp, "folders": _folders(files), "format": 1}
+            if _OWNER is not None:
+                manifest["made_by"] = _OWNER[0]
+                manifest["mac"] = _mac(manifest, _OWNER[1])
             zf.writestr(MANIFEST, json.dumps(manifest, ensure_ascii=False, indent=1))
         os.replace(tmp, target)
     except OSError as exc:
@@ -230,7 +280,7 @@ def backup(prefix: Path, folder: Path, *, title: str, reason: str, entry_id: int
     prune(folder)
     log.info("saves of %s backed up (%s): %d files, %d bytes → %s", title, reason, written, total, target.name)
     return SaveBackup(path=target, created=now, reason=reason, files=written, bytes=total, title=title,
-                      entry_id=entry_id, fingerprint=fp, folders=manifest["folders"])
+                      entry_id=entry_id, fingerprint=fp, folders=manifest["folders"], mine=_made_here(manifest))
 
 
 def _safe_member(name: str) -> PurePosixPath | None:
@@ -251,7 +301,11 @@ def restore(zip_path: Path, prefix: Path) -> int:
     real_base = Path(os.path.realpath(base))
     n = 0
     try:
+        if Path(zip_path).is_symlink():
+            raise SaveBackupError("That backup is a link, not a backup file — not restored.")
         with zipfile.ZipFile(zip_path) as zf:
+            if sum(i.file_size for i in zf.infolist()) > MAX_RESTORE or len(zf.infolist()) > 200_000:
+                raise SaveBackupError("That backup unpacks to far more than any save — not restored.")
             for info in zf.infolist():
                 if info.filename == MANIFEST or info.is_dir():
                     continue
@@ -273,8 +327,9 @@ def restore(zip_path: Path, prefix: Path) -> int:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if target.is_symlink():
                     target.unlink()
-                tmp = target.with_name(target.name + ".ezgd-restore")
-                with zf.open(info) as src, open(tmp, "wb") as dst:
+                tmp = target.with_name(f".{secrets.token_hex(6)}.ezgd-restore")
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+                with zf.open(info) as src, os.fdopen(fd, "wb") as dst:
                     while chunk := src.read(1024 * 1024):
                         dst.write(chunk)
                 os.replace(tmp, target)

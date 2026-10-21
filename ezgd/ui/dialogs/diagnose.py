@@ -220,6 +220,10 @@ class DiagnoseDialog(QDialog):
         if v["status"] == "fixed":
             head = label(f"✓ Fixed — {self.entry.title} kept running with: {v['kept']}", "h2", wrap=True)
             head.setStyleSheet(f"color: {theme.CURRENT.success};")
+        elif v["status"] == "trying":
+            head = label(f"On trial: {v['kept']}", "h2", wrap=True)
+            cl.addWidget(head)
+            head = label(v.get("reason", ""), wrap=True, selectable=True)
         elif v["status"] in ("changed",):
             head = label("Repairs applied — start the game to see if it works now", "h2", wrap=True)
         else:
@@ -229,6 +233,16 @@ class DiagnoseDialog(QDialog):
         if v["applied"]:
             cl.addWidget(label("What was changed:\n" + "\n".join(f"• {a}" for a in v["applied"]), wrap=True,
                                selectable=True))
+        if v.get("investigation"):
+            cl.addWidget(label("What the investigation found: " + v["investigation"][-1][:600], wrap=True,
+                               selectable=True))
+        if v.get("report"):
+            from pathlib import Path
+            rep = Path(v["report"])
+            row = QHBoxLayout()
+            row.addWidget(label(f"Every step is written down in {rep.name}", "small", wrap=True), 1)
+            row.addWidget(button("Open the report", "folder", on_click=lambda: _open_file(rep)))
+            cl.addLayout(row)
         if v.get("offer_ge"):
             from ezgd.core.fsutil import format_bytes
             ge = v["offer_ge"]
@@ -775,6 +789,12 @@ class DiagnoseDialog(QDialog):
         except (RuntimeError, TypeError):
             pass
         super().done(r)
+
+
+def _open_file(path) -> None:
+    from PySide6.QtCore import QUrl
+    from PySide6.QtGui import QDesktopServices
+    QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
 
 def open_diagnose(actions, entry, parent) -> None:

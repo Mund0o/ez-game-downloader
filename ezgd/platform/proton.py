@@ -184,7 +184,8 @@ def _umu_mode_of(text: str) -> str:
 # .exe (proxy/hook DLLs used by mods, launchers and fixes) is ignored unless the
 # DLL is overridden to "native, then builtin".
 PROXY_DLLS = ("winmm", "winhttp", "version", "dinput8", "dsound", "wininet", "iphlpapi", "xinput1_3",
-              "xinput1_4", "xinput9_1_0", "dbghelp", "winhttp")
+              "xinput1_4", "xinput9_1_0", "dbghelp", "winhttp",
+              "dwmapi")                                 # UE4SS, the Unreal mod loader (Expedition 33's co-op mod)
 ONLINEFIX_MARKERS = ("onlinefix64.dll", "onlinefix.dll", "onlinefix.ini")
 
 
@@ -206,9 +207,25 @@ class OverrideSuggestion:
         return text
 
 
+def game_binary_dirs(exe: Path) -> list[Path]:
+    """Where the game's own DLLs are: next to the exe — and, for an Unreal game started through its small launcher
+    (Expedition33_Steam.exe), next to the real game, <Project>/Binaries/Win64 (WinGDK on Game Pass). Expedition 33's
+    OnlineFix and UE4SS loaders sat there and were never found, so Wine's own winmm/dwmapi replaced them."""
+    exe = Path(exe)
+    dirs = [exe.parent]
+    root = exe.parent
+    if (root / "Engine").is_dir():
+        for ship in sorted(root.glob("*/Binaries/Win*/*-Shipping.exe"))[:2]:
+            if ship.parent not in dirs:
+                dirs.append(ship.parent)
+    return dirs
+
+
 def suggest_dll_overrides(exe: Path) -> OverrideSuggestion:
-    folder = Path(exe).parent
-    present = {p.name.lower(): p for p in folder.glob("*") if p.is_file()} if folder.is_dir() else {}
+    present = {}
+    for folder in reversed(game_binary_dirs(exe)):
+        if folder.is_dir():
+            present.update({p.name.lower(): p for p in folder.glob("*") if p.is_file()})
     found = sorted({Path(n).stem for n in present if n.endswith(".dll") and Path(n).stem in PROXY_DLLS})
     onlinefix = any(m in present for m in ONLINEFIX_MARKERS)
     return OverrideSuggestion(";".join(f"{d}=n,b" for d in found), found, onlinefix)
@@ -272,6 +289,10 @@ def proton_command(exe: Path, proton: ProtonInstall, *, steam_root: Path, prefix
     proton_cmd = [str(proton.script), verb]
     runtime = find_runtime(steam_root, proton.require_tool_appid) if compat.use_runtime else None
     tool_paths = [str(proton.path)]
+    from ezgd.library.dxlayers import base_of
+    base = base_of(proton.path)                     # a Proton variant: its links lead into the Proton it mirrors
+    if base is not None:
+        tool_paths.append(str(base))
     if runtime is not None:
         tool_paths.append(str(runtime.path))
         # pressure-vessel shares $HOME; make sure games/prefixes elsewhere are visible too
@@ -326,6 +347,43 @@ def umu_command(exe: Path, umu_run: str, *, prefix_dir: Path, proton: ProtonInst
 def prefix_ready(prefix_dir: Path) -> bool:
     # Steam layout keeps the Wine prefix in <compatdata>/pfx; umu-launcher uses the folder itself
     return (prefix_dir / "pfx" / "system.reg").is_file() or (prefix_dir / "system.reg").is_file()
+
+
+# Proton prefixes say the .NET Framework is installed (Wine Mono stands in for it: NDP v4 "Release" 4.8.1 on the
+# 32-bit side), so Microsoft's .NET installers stop at "Same or higher version of .NET Framework 4 has already been
+# installed" and report success without installing anything. winetricks removes those keys only after uninstalling
+# Wine Mono — which Proton ships without an uninstaller entry, so it never does.
+_NDP_KEYS = [rf"HKLM\Software\{side}Microsoft\NET Framework Setup\NDP\{v}"
+             for side in ("", "Wow6432Node\\") for v in ("v3.5", "v4")]
+
+
+def winetricks_command(winetricks: str, verbs: list[str], prefix_dir: Path) -> list[str]:
+    """The command that runs winetricks with ``verbs`` (validated by the caller) in a Proton prefix.
+
+    First, links in the prefix to Proton files that do not exist are removed: Proton-CachyOS prefixes link 34 files
+    (dxva2.dll, evr.dll, uiautomationcore.dll, Framework/v4.0.30319/ngen.exe …) to builtins it does not ship, and
+    Microsoft's installers cannot write over them (.NET 4: "compressed file wasn't installed (Dxva2_amd64.dll)",
+    error 1603; winetricks then said ngen.exe was missing). For .NET Framework verbs the prefix's claim to have it is
+    cleared too (see _NDP_KEYS)."""
+    remove_dead_links(prefix_dir / "pfx" / "drive_c" / "windows")
+    if not any(v.startswith("dotnet") for v in verbs):
+        return [winetricks, "-q", *verbs]
+    script = "".join(f'"$WINE" reg delete "{k}" /f >/dev/null 2>&1; ' for k in _NDP_KEYS)
+    return ["/bin/sh", "-c", script + 'exec "$@"', "winetricks", winetricks, "-q", *verbs]
+
+
+def remove_dead_links(folder: Path) -> int:
+    """Remove symbolic links under ``folder`` whose target does not exist (nothing else is touched)."""
+    n = 0
+    if folder.is_dir():
+        for link in folder.rglob("*"):
+            if link.is_symlink() and not link.exists():
+                try:
+                    link.unlink()
+                    n += 1
+                except OSError:
+                    pass
+    return n
 
 
 def winetricks_env(proton: ProtonInstall, prefix_dir: Path) -> dict[str, str]:

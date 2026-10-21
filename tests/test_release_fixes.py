@@ -244,7 +244,7 @@ async def test_fix_my_game_finds_a_combination(core, tmp_path, monkeypatch):
     monkeypatch.setattr(core.library, "trial_candidates", lambda *a, **k: cands)
     monkeypatch.setattr(core.library, "protons", lambda refresh=False: [type("P", (), {"name": "GE-Proton11-7"})()])
 
-    def run_trial(entry_id, cand, n, cancel=None):      # this "game" needs GE-Proton AND DirectX 11
+    def run_trial(entry_id, cand, n, cancel=None, **_kw):      # this "game" needs GE-Proton AND DirectX 11
         o = cand["overrides"]
         both = o.get("proton_version") == "GE-Proton11-7" and "-dx11" in (o.get("launch_args") or "")
         secs = {"Use GE-Proton11-7": 9, "Start with DirectX 11": 6}.get(cand["label"], 2)
@@ -271,7 +271,7 @@ async def test_fix_my_game_investigates_first_when_the_logs_say_little(core, tmp
     events, started = [], []
     core.set_emitter(lambda n, p: events.append((n, p)))
 
-    def run_trial(entry_id, cand, n, cancel=None):
+    def run_trial(entry_id, cand, n, cancel=None, **_kw):
         started.append(cand["label"])
         core.library.trial_evidence.setdefault(entry_id, {})[n] = {
             "text": "0124:err:module:import_dll Library VCRUNTIME140_1.dll (which is needed by L\"C:\\\\G.exe\") not "
@@ -300,7 +300,7 @@ async def test_fix_my_game_fixes_the_root_cause_instead_of_cycling_setups(core, 
     installed: list = []
     tests: list = []
 
-    def trial(entry_id, cand, n, cancel=None):
+    def trial(entry_id, cand, n, cancel=None, **_kw):
         tests.append(cand["label"])
         ok = bool(installed)
         if not ok:

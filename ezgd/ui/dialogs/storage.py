@@ -183,6 +183,8 @@ class StorageDialog(QDialog):
                 bits.append(f"download {format_bytes(g['downloads'])}")
             if g["saves"]:
                 bits.append(f"save backups {format_bytes(g['saves'])}")
+            if g.get("shaders"):
+                bits.append(f"built shaders {format_bytes(g['shaders'])}")
             col.addWidget(label(" · ".join(bits), "small"))
             row.addLayout(col, 1)
             total_l = label(format_bytes(g["total"] + g["saves"]))

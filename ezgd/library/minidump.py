@@ -7,7 +7,7 @@ tell *where* a game crashed even without a diagnostic launch.
 
 from __future__ import annotations
 
-import glob
+import os
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,11 +59,21 @@ def _string(data: bytes, rva: int) -> str:
 
 
 def read_minidump(path: Path) -> Minidump | None:
+    """The exception and module list of a minidump. The file is mapped, not read: Sentry writes full-memory dumps
+    (Expedition 33's was 945 MB) and only a few kilobytes of it are needed."""
+    import mmap
     try:
-        data = path.read_bytes()[:256 * 1024 * 1024]
         mtime = path.stat().st_mtime
-    except OSError:
+        with open(path, "rb") as fh:
+            if os.fstat(fh.fileno()).st_size < 32:
+                return None
+            with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                return _parse(path, mtime, data)
+    except (OSError, ValueError):
         return None
+
+
+def _parse(path: Path, mtime: float, data) -> Minidump | None:
     if len(data) < 32 or struct.unpack_from("<I", data, 0)[0] != SIGNATURE:
         return None
     nstreams, dir_rva = struct.unpack_from("<II", data, 8)
@@ -92,16 +102,43 @@ def read_minidump(path: Path) -> Minidump | None:
     return d
 
 
+def _walk(root: Path, depth: int, since: float, out: list[Path], budget: list[int]) -> None:
+    """*.dmp / *.mdmp below ``root`` (``depth`` levels), newer than ``since`` — a bounded walk (a game folder can
+    hold 100 000 files)."""
+    import os
+    base = len(root.parts)
+    try:
+        for d, dirs, files in os.walk(root):
+            budget[0] -= len(files) + len(dirs)
+            if budget[0] < 0:
+                return
+            if len(Path(d).parts) - base >= depth:
+                dirs[:] = []
+            dirs[:] = [x for x in dirs if x.lower() not in ("paks", "movies", "content", "shadercache", "shaders",
+                                                            "steamapps", "windows", "system32", "syswow64")]
+            for f in files:
+                if f.lower().endswith((".dmp", ".mdmp")):
+                    p = Path(d) / f
+                    try:
+                        if p.stat().st_mtime >= since:
+                            out.append(p)
+                    except OSError:
+                        continue
+    except OSError:
+        return
+
+
 def find_dumps(game_dir: Path, prefix_dir: Path, since: float = 0.0) -> list[Path]:
-    """Minidumps the game may have written, newest first (only files newer than ``since``)."""
+    """Minidumps the game may have written, newest first (only files newer than ``since``): in its folder (Unreal's
+    Saved/Crashes, dumps next to the exe), and where crash handlers keep them in the prefix — Unreal and Unity under
+    AppData, Sentry (.sentry-native), Crashpad (Crashpad/reports), Windows' own CrashDumps, Temp, Documents."""
     users = prefix_dir / "pfx" / "drive_c" / "users" / "steamuser"
-    pats = [str(game_dir / "*.dmp"), str(game_dir / "*" / "*.dmp"), str(game_dir / "**" / "Saved" / "Crashes" /
-            "*" / "*.dmp"), str(users / "AppData" / "Local" / "CrashDumps" / "*.dmp"),
-            str(users / "AppData" / "Local" / "*" / "Saved" / "Crashes" / "*" / "*.dmp"),
-            str(users / "AppData" / "LocalLow" / "*" / "*" / "Crashes" / "*" / "*.dmp")]
-    found = set()
-    for p in pats:
-        found.update(glob.glob(p, recursive=True))
-    files = [Path(f) for f in found if Path(f).is_file()]
-    files = [f for f in files if f.stat().st_mtime >= since]
+    found: list[Path] = []
+    budget = [250_000]
+    for root, depth in ((game_dir, 5), (users / "AppData" / "Local", 6), (users / "AppData" / "LocalLow", 6),
+                        (users / "AppData" / "Roaming", 5), (users / "Documents", 5), (users / "Temp", 3),
+                        (prefix_dir / "pfx" / "drive_c" / "ProgramData", 4)):
+        if root.is_dir():
+            _walk(root, depth, since, found, budget)
+    files = list(dict.fromkeys(found))
     return sorted(files, key=lambda f: f.stat().st_mtime, reverse=True)[:10]

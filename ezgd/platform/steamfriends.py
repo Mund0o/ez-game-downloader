@@ -20,6 +20,8 @@ with the friend and says where that choice is (your own status comes with the li
 
 from __future__ import annotations
 
+import re
+
 import json
 import logging
 import time
@@ -270,10 +272,10 @@ def join_url(f: dict) -> str | None:
     gid, lobby, server = str(f.get("gameid") or ""), str(f.get("lobby") or ""), str(f.get("server") or "")
     if not gid.isdigit():
         return None
-    if lobby.isdigit():
+    if lobby.isdigit() and str(f.get("steamid") or "").isdigit():
         return f"steam://joinlobby/{gid}/{lobby}/{f['steamid']}"
-    if server and server != "0.0.0.0:0":
-        return f"steam://connect/{server}?appid={gid}"
+    if server and server != "0.0.0.0:0" and re.fullmatch(r"[A-Za-z0-9.\-\[\]:]{3,64}:\d{1,5}", server):
+        return f"steam://connect/{server}?appid={gid}"      # (the friend's status is their data: only an address)
     return None
 
 

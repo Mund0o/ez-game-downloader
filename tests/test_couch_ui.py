@@ -914,3 +914,31 @@ def test_couch_mode_never_starts_the_web_engine_to_look_for_browser_downloads(ui
     couch._poll_browser()
     assert made == [] and browser._MANAGER is None and couch.browser_downloads == []
     couch.force_close()
+
+
+def test_couch_browser_stops_stepping_when_couch_mode_closes_under_it(ui, qtbot, server):
+    """Crash report EZGD-PY-70EB64: couch mode closed while its browser was open; the browser window (it outlives
+    couch mode for its downloads) kept stepping the pointer and reached the deleted couch window."""
+    import shiboken6
+    from ezgd.catalog.models import Game
+    from ezgd.ui import couch_pages
+    from ezgd.ui.dialogs import browser
+    if not browser.AVAILABLE:
+        pytest.skip("Qt WebEngine not installed")
+    win, core, _ = ui
+    server.add("/d/gone", data=b"<html><body>page</body></html>", content_type="text/html")
+    g = Game("steamrip", "96", "Gone Under", "https://steamrip.com/gone-under/")
+    core.games.save(g)
+    couch = _open_couch(win, qtbot)
+    couch_pages.open_browser(couch, g, None, server.url("/d/gone"))
+    cb = couch.browser
+    qtbot.waitUntil(lambda: cb.dlg.isVisible(), timeout=5000)
+    couch.force_close()
+    assert not cb._tick.isActive()
+    qtbot.waitUntil(lambda: not shiboken6.isValid(couch), timeout=5000)
+    if shiboken6.isValid(cb.dlg):
+        cb.dlg.show()                                          # still on screen when a step comes
+        cb._tick.start()
+        cb._step()                                             # no RuntimeError from the deleted couch window
+        assert not cb._tick.isActive()
+        cb.dlg.close()

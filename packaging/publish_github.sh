@@ -12,10 +12,12 @@ tarball=dist/EZGameDownloader-linux-x86_64.tar.gz
 built=$(tar -xzOf "$tarball" EZGameDownloader/ezgd >/dev/null 2>&1 && echo ok || true)
 [ -n "$built" ] || { echo "$tarball does not contain EZGameDownloader/ezgd" >&2; exit 1; }
 (cd dist && sha256sum EZGameDownloader-linux-x86_64.tar.gz > SHA256SUMS)
+# signed with the release key (packaging/sign_release.py): installed copies install nothing unsigned
+.venv/bin/python packaging/sign_release.py "$tarball" "$version" >/dev/null
 if gh release view "v$version" --repo "$repo" >/dev/null 2>&1; then
     echo "Release v$version already exists on $repo — bump __version__ in ezgd/__init__.py first." >&2
     exit 2
 fi
-gh release create "v$version" "$tarball" dist/SHA256SUMS --repo "$repo" \
+gh release create "v$version" "$tarball" "$tarball.sig" dist/SHA256SUMS --repo "$repo" \
     --title "EZ Game Downloader $version" --notes "${NOTES:-EZ Game Downloader $version}"
 echo "Published v$version to https://github.com/$repo/releases"

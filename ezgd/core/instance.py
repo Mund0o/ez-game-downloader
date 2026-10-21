@@ -75,6 +75,7 @@ def listen(data_dir: Path, on_show, parent=None):
     name = server_name(data_dir)
     QLocalServer.removeServer(name)               # left behind by a crash; we hold the lock, so it is ours
     server = QLocalServer(parent)
+    server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)    # only this user may connect
     if not server.listen(name):
         log.warning("could not listen for other app starts: %s", server.errorString())
         return server

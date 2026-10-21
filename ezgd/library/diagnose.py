@@ -264,6 +264,7 @@ class Context:
     history: list = field(default_factory=list)   # every launch, oldest first (ezgd.library.history.Run)
     steam_ref: dict | None = None         # how Steam itself runs this game (ezgd.library.steamref.reference)
     investigated: bool = False            # the run analysed is the assistant's own diagnostic test run
+    play_crashes: list = field(default_factory=list)   # crashes / freezes while played (ezgd.library.crashes)
 
     @property
     def wine(self) -> str:
@@ -667,6 +668,10 @@ def r_advisor(c: Context) -> list[Finding]:
         elif "launch_args" in ch:
             fix = Fix("launch_args", ch["launch_args"], "Fix the launch options")
         conf = 0.75 if s.severity == "warning" else 0.5
+        if s.key == "dll-overrides" and s.title.startswith("Load the OnlineFix fix"):
+            # OnlineFix's fix is loaded only through these DLLs — without them it cannot work at all (Expedition 33
+            # crashed at start, before its own log, while every Proton and renderer was tried): fixed first
+            conf = 0.9
         out.append(Finding(f"advisor:{s.key}", s.title, s.detail, conf, [], fix))
     return out
 
@@ -1224,6 +1229,16 @@ def r_regression(c: Context) -> list[Finding]:
     for key, _what, then, _now in diffs:
         if key == "proton" and then and any(getattr(p, "name", "") == then for p in c.protons):
             restore["proton_version"] = then
+        elif key == "proton_build" and then and "proton_version" not in restore:
+            # "Proton-GE Latest" updated in place (GE-Proton11-5 → 11-7 broke OnlineFix games): the build that worked
+            # may still be installed under its own name
+            for p in c.protons:
+                try:
+                    if (Path(p.path) / "version").read_text("utf-8", "replace").strip()[:80] == then:
+                        restore["proton_version"] = p.name
+                        break
+                except (OSError, AttributeError, TypeError):
+                    continue
         elif key == "launch_args" and "launch_args" in s:
             restore["launch_args"] = s["launch_args"]
         elif key == "executable" and s.get("executable") and Path(s["executable"]).is_file():
@@ -1372,6 +1387,89 @@ def r_steam_reference(c: Context) -> list[Finding]:
     return out
 
 
+# Runtimes a release's redist folder often carries for every game (SteamRIP's _CommonRedist is one bundle: .NET 4,
+# DirectX, OpenAL, XNA, Visual C++ — "install these if the game doesn't start"): offered only when the game's own
+# files use them. Avatar: Frontiers of Pandora (DirectX 12) was offered all of it, and .NET 4.8 failed to install.
+_REDIST_USE = {
+    "dotnet48": None,                                   # a .NET program (see _redists_the_game_uses)
+    "xna40": None,
+    "openal": (r"^openal32\.dll$",),
+    "d3dx9": (r"^d3dx9_\d+\.dll$",),
+    "d3dx10": (r"^d3dx10(_\d+)?\.dll$",),
+    "d3dx11_43": (r"^d3dx11_\d+\.dll$", r"^d3dcompiler_43\.dll$"),
+    "xact": (r"^(xactengine|x3daudio|xapofx|xaudio2_[0-7])",),
+}
+
+
+def _game_binaries(c: Context, limit: int = 80) -> list[Path]:
+    """The game's exe, Unreal's real exe and the DLLs next to them."""
+    out = [c.exe, *_ue_shipping(c.exe)]
+    for exe in list(out):
+        out.extend(sorted(exe.parent.glob("*.dll"))[:limit])
+    return out[:limit * 2]
+
+
+def _redists_the_game_uses(c: Context, found: list[tuple[str, str, str]]) -> list[tuple[str, str, str]]:
+    from ezgd.platform.pe import read_pe
+    if not any(x in _REDIST_USE for v, _w, _f in found for x in v.split()):
+        return found
+    imports: set[str] = set()
+    dotnet = read = False
+    for path in _game_binaries(c):
+        info = read_pe(path)
+        if info is None:
+            continue
+        read = True
+        dotnet = dotnet or info.dotnet
+        imports.update(info.imports)
+        imports.update(info.delay_imports)
+    if not read:
+        return found                                    # nothing could be read: no claim either way
+    names = {p.name.lower() for exe in (c.exe, *_ue_shipping(c.exe)) for p in exe.parent.glob("*.dll")}
+    xna = dotnet or any(n.startswith("microsoft.xna.framework") for n in names)
+
+    def used(verb: str) -> bool:
+        if verb not in _REDIST_USE:
+            return True                                 # Visual C++, PhysX: as before
+        if verb == "dotnet48":
+            return dotnet
+        if verb == "xna40":
+            return xna
+        return any(re.search(rx, d) for rx in _REDIST_USE[verb] for d in imports)
+
+    out = []
+    for v, w, f in found:
+        keep = [x for x in v.split() if used(x)]
+        if keep:
+            out.append((" ".join(keep), w, f))
+    return out
+
+
+def r_play_crash(c: Context) -> list[Finding]:
+    """Crashes and freezes while it was played (kept by ezgd.library.crashes): the real evidence for a problem a
+    45-second test start cannot show."""
+    from ezgd.library import crashes
+    recs = [r for r in c.play_crashes if (r.get("played") or 0) >= 60]
+    if not recs:
+        return []
+    last = recs[0]
+    same = [r for r in recs if (r.get("crash") or {}).get("describe") == (last.get("crash") or {}).get("describe")
+            and r.get("kind") == last.get("kind")]
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(last.get("at") or 0))
+    ev = [f"{when}: {crashes.summary(last)}"] + [f"{time.strftime('%Y-%m-%d', time.localtime(r.get('at') or 0))}: "
+                                                 f"{crashes.summary(r)}" for r in recs[1:3]]
+    reasons = " ".join((last.get("chain") or [])[1:4])
+    if last.get("kind") == "freeze":
+        title = f"It froze while you played ({len(same)}×)" if len(same) > 1 else "It froze while you played"
+    else:
+        title = (f"It crashes while you play — {len(same)} times the same way" if len(same) > 1
+                 else "It crashed while you played")
+    return [Finding("play-crash", title,
+                    crashes.summary(last).capitalize() + ". " + (reasons + " " if reasons else "")
+                    + "“Fix my game” starts from this crash: it tries the most likely change and your next play "
+                    "session shows whether it helped.", 0.75 if len(same) > 1 else 0.65, ev)]
+
+
 def r_redist(c: Context) -> list[Finding]:
     """Redistributable installers the release ships (Steam or the release's instructions would run them first)."""
     from ezgd.library import steamref
@@ -1382,6 +1480,7 @@ def r_redist(c: Context) -> list[Finding]:
         # Unreal ships .NET for its own tools (crash reporter, prerequisites setup) — the game does not use it, and
         # it rarely installs under Proton (Valor Mortis was offered dotnet48, which failed — 2026-10-14)
         found = [(v, w, f) for v, w, f in found if not v.startswith("dotnet")]
+    found = _redists_the_game_uses(c, found)
     if not found:
         return []
     failing = _failing(c)
@@ -1753,14 +1852,14 @@ def _reason(c: Context, findings: list[Finding]) -> list[dict]:
 RULES = [r_error_box, r_screen_text, r_integrity, r_emulator, r_fix_archive, r_missing_dll, r_unimplemented, r_imports, r_dotnet, r_steam, r_steam_client, r_anticheat, r_vulkan, r_dx12, r_media,
          r_crash, r_minidump, r_prefix, r_quick_exit, r_native, r_system, r_protondb, r_old_prefix, r_advisor,
          r_overlay, r_fonts, r_display, r_disk, r_writable, r_onlinefix_missing, r_regression, r_exit_code, r_override_files,
-         r_steam_reference, r_redist, r_engine_crash, r_mixed_prefix, r_heap, r_filesystem]
+         r_steam_reference, r_redist, r_engine_crash, r_mixed_prefix, r_heap, r_filesystem, r_play_crash]
 
 
 def diagnose(entry: LibraryEntry, prefix_dir: Path, log_path: Path, *, protons: list, proton_name: str,
              game_extra: dict | None = None, system=None, protondb: dict | None = None, symptom: str = "",
              learned: list[dict] | None = None, integrity: dict | None = None, methods: list | None = None,
              install_dest: Path | None = None, community: dict | None = None, steam_ref: dict | None = None,
-             evidence: dict | None = None) -> Diagnosis:
+             evidence: dict | None = None, play_crashes: list | None = None) -> Diagnosis:
     """``evidence``: the assistant's own diagnostic test run ({"text", "exit_code", "seconds", "label"}), analysed
     instead of the last run in the game's log."""
     exe = Path(entry.executable) if entry.executable else None
@@ -1800,7 +1899,7 @@ def diagnose(entry: LibraryEntry, prefix_dir: Path, log_path: Path, *, protons: 
                 v64, v32, game_extra or {}, system=system, proton_dir=getattr(proton, "path", None),
                 protondb=protondb, run_started=started, integrity=integrity, methods=list(methods or []),
                 install_dest=install_dest, community=community, history=hist, steam_ref=steam_ref,
-                investigated=bool(evidence))
+                investigated=bool(evidence), play_crashes=list(play_crashes or []))
     findings: list[Finding] = []
     for rule in RULES:
         try:

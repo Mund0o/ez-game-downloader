@@ -125,9 +125,42 @@ def parse_invite(text: str) -> dict | None:
     appid = str(attrs.get("appid") or "")
     lobby = str(attrs.get("lobbyid") or attrs.get("lobby") or "")
     connect = str(attrs.get("connect") or "")
-    if not appid.isdigit():
+    if not appid.isdigit() or len(appid) > 10 or not safe_connect(connect):
         return None
     return {"kind": m.group(1).lower(), "appid": appid, "lobby": lobby if lobby.isdigit() else "", "connect": connect}
+
+
+# Steam hands an invite's connect string to the game as its command line ("+connect 1.2.3.4:27015",
+# "+connect_lobby 1097…", "-join 5678"). The text comes from whoever wrote the chat message, so only those forms join:
+# no other switches (Source's "+exec cfg", "-insecure", a "-game" folder …) and no shell or path characters.
+_CONNECT_SWITCH = re.compile(r"^[+-](connect\w*|join\w*|lobby\w*|password|server|ip|port)$", re.I)
+_CONNECT_TOKEN = re.compile(r"^[A-Za-z0-9_.:\[\]-]{1,64}$")
+
+
+# the Steam links the app ever hands to Steam (joining, chats, profiles, starting a game) — nothing else, whoever
+# built the text
+_ALLOWED_URL = re.compile(r"^steam://(joinlobby/\d+/\d+/\d+|rungame/\d+/\d+(/[A-Za-z0-9%._\-]*)?|"
+                          r"connect/[A-Za-z0-9.\-\[\]:]+\?appid=\d+|rungameid/\d+|friends/message/\d+|"
+                          r"url/SteamIDPage/\d+)$")
+
+
+def allowed_url(url: str) -> bool:
+    return bool(_ALLOWED_URL.match(url or ""))
+
+
+def safe_connect(connect: str) -> bool:
+    if not connect:
+        return True
+    tokens = connect.split()
+    if len(connect) > 160 or len(tokens) > 6:
+        return False
+    for t in tokens:
+        if t[0] in "+-":
+            if not _CONNECT_SWITCH.match(t):
+                return False
+        elif not _CONNECT_TOKEN.match(t):
+            return False
+    return True
 
 
 def join_url(invite: dict, inviter_steamid64: str) -> str:
@@ -255,8 +288,8 @@ class Bridge:
         return r
 
     async def open_url(self, url: str) -> None:
-        if not url.startswith("steam://"):
-            raise BridgeError("Only Steam links.")
+        if not allowed_url(url):
+            raise BridgeError("Only Steam's join, chat and profile links.")
         await self.eval(_JS_URL % json.dumps(url))
 
     async def close(self) -> None:

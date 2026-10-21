@@ -1,0 +1,11 @@
+# EZ Game Downloader — shared crash knowledge. Deploy: see the README section "Shared crash knowledge (server)".
+name = "ezgd-knowledge"
+main = "src/worker.js"
+compatibility_date = "2026-09-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "ezgd-knowledge"
+database_id = "c903b45b-d64a-43b9-a321-0e54c5117a5a"
+
+# Secrets (never in this file): KEY_X25519, KEY_ED25519, SALT — made by make_keys.py, set with `wrangler secret put`.

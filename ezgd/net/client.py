@@ -130,7 +130,7 @@ class SafeHttpClient:
         await self._client.aclose()
 
     async def _open(self, method: str, url: str, headers: Mapping[str, str] | None,
-                    polite: bool) -> httpx.Response:
+                    polite: bool, content: bytes | None = None) -> httpx.Response:
         current = url
         hdrs = dict(headers or {})
         for _hop in range(self.max_redirects + 1):
@@ -138,7 +138,7 @@ class SafeHttpClient:
             host = host_of(current)
             if polite and self.rate_limiter:
                 await self.rate_limiter.acquire(host)
-            request = self._client.build_request(method, current, headers=hdrs)
+            request = self._client.build_request(method, current, headers=hdrs, content=content)
             response = await self._client.send(request, stream=True)
             if response.status_code in REDIRECT_CODES and response.headers.get("location"):
                 await response.aclose()
@@ -146,7 +146,7 @@ class SafeHttpClient:
                 if urlsplit(current).scheme == "https" and urlsplit(nxt).scheme == "http":
                     raise UnsafeURLError(f"refusing HTTPS→HTTP redirect to {host_of(nxt)}")
                 if response.status_code == 303:
-                    method = "GET"
+                    method, content = "GET", None
                 if host_of(nxt) != host:
                     hdrs.pop("Referer", None)      # do not leak page URLs across hosts
                 log.debug("redirect %s → %s", current, nxt)
@@ -157,9 +157,9 @@ class SafeHttpClient:
 
     async def fetch(self, url: str, *, headers: Mapping[str, str] | None = None,
                     max_bytes: int = 8 * 1024 * 1024, polite: bool = True,
-                    method: str = "GET") -> FetchResult:
+                    method: str = "GET", content: bytes | None = None) -> FetchResult:
         """Fetch a whole (bounded) response body. Does not raise for HTTP status codes."""
-        response = await self._open(method, url, headers, polite)
+        response = await self._open(method, url, headers, polite, content)
         try:
             declared = response.headers.get("content-length")
             if declared and declared.isdigit() and int(declared) > max_bytes:

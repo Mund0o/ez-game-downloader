@@ -21,6 +21,10 @@ os.environ["EZGD_STEAM_ROOT"] = "/nonexistent/ezgd-test-steam"
 # and listed the user's real chats. Port 1: nothing listens; bridge tests start a fake Steam on a port of their own.
 os.environ["EZGD_STEAM_BRIDGE_PORT"] = "1"
 os.environ["EZGD_NO_GAMEPADS"] = "1"       # never the real controllers (a game played meanwhile pressed buttons in tests)
+os.environ["EZGD_HIDDEN"] = "0"             # never KWin scripts in the real desktop (hidden tests): faked where tested
+os.environ["EZGD_AWAKE"] = "0"              # never a real idle hold on the desktop: a fake systemd-inhibit where tested
+os.environ["EZGD_STEAM_INPUT"] = "0"        # never steam://forceinputappid to the real Steam client (faked where tested)
+os.environ["EZGD_CROWD"] = "0"               # never the real knowledge server (a fake one where tested)
 os.environ["EZGD_NO_INTRO"] = "1"          # couch mode opens straight away (tests of the intro switch it back on)
 os.environ["EZGD_NO_SOUNDS"] = "1"         # couch mode's sounds are only counted, never played through the speakers
 

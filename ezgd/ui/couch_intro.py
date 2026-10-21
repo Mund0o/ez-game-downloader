@@ -33,6 +33,19 @@ def available() -> bool:
     return VIDEO.is_file() and os.environ.get("EZGD_NO_INTRO") != "1"      # (the tests: straight into couch mode)
 
 
+def _to_image(frame) -> QImage:
+    """The video frame as a picture. Qt converts it on the GPU with an OpenGL context of its own and leaves that one
+    current: done while couch mode's OpenGL frame was being drawn, the rest of that frame went to the wrong context —
+    the intro flickered. So it is converted when it arrives, never while painting, and the context is put back."""
+    from PySide6.QtGui import QOpenGLContext
+    ctx = QOpenGLContext.currentContext()
+    surface = ctx.surface() if ctx is not None else None
+    img = frame.toImage()
+    if ctx is not None and surface is not None and QOpenGLContext.currentContext() is not ctx:
+        ctx.makeCurrent(surface)
+    return img
+
+
 class CouchIntro(QObject):
     """States: ``loading`` (dark screen until the first frame) → ``playing`` → ``fading`` (over couch) → ``done``."""
 
@@ -45,9 +58,7 @@ class CouchIntro(QObject):
         self.sound = sound and volume > 0
         self.volume = max(0.0, min(1.0, volume))
         self._player = self._sink = self._audio = None
-        self._frame = None                  # the newest QVideoFrame
-        self._image: QImage | None = None   # … converted, when it was drawn
-        self._converted = None
+        self._image: QImage | None = None   # the newest video frame, converted when it arrived
         self._started = 0.0
         self._fade_from = 0.0
         self._fade_len = FADE
@@ -112,7 +123,9 @@ class CouchIntro(QObject):
             self.state = "playing"
             log.info("couch intro: playing (first frame after %.0f ms)", (time.monotonic() - self._started) * 1000)
         if self.state == "playing":
-            self._frame = frame
+            img = _to_image(frame)
+            if not img.isNull():
+                self._image = img
             self.owner.update()
 
     def _status(self, status) -> None:
@@ -142,7 +155,6 @@ class CouchIntro(QObject):
     def _fade(self, seconds: float) -> None:
         if self.state != "playing":
             return
-        self._current_image()                   # the last picture stays while it fades
         self.state = "fading"
         self._fade_from = time.monotonic()
         self._fade_len = seconds
@@ -172,24 +184,15 @@ class CouchIntro(QObject):
                 except RuntimeError:
                     pass
         self._sink = self._audio = None
-        self._frame = None
 
     # ------------------------------------------------------------ drawing
-    def _current_image(self) -> QImage | None:
-        if self._frame is not None and self._frame is not self._converted:
-            img = self._frame.toImage()
-            if not img.isNull():
-                self._image = img
-            self._converted = self._frame
-        return self._image
-
     def paint(self, p: QPainter, w: float, h: float) -> bool:
         """Draw the intro over the window. True when it covers everything (couch mode need not be drawn)."""
         if self.state == "loading":
             p.fillRect(QRectF(0, 0, w, h), BG)
             return True
         if self.state == "playing":
-            img = self._current_image()
+            img = self._image
             if img is None:
                 p.fillRect(QRectF(0, 0, w, h), BG)
             else:

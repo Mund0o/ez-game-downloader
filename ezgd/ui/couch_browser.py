@@ -398,6 +398,10 @@ class CouchBrowser:
         self._last = now
         if self.menu is not None or self.overlay.keyboard is not None or not self.dlg.isVisible():
             return
+        import shiboken6
+        if not self.active or not shiboken6.isValid(self.couch):    # couch mode closed under it (a crash report)
+            self._tick.stop()
+            return
         lx, ly, rx, ry = self.couch.pads.sticks()
         s = self.couch._s()
         if lx or ly:

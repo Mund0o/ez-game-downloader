@@ -91,7 +91,42 @@ def profile():
         _PROFILE.setUrlRequestInterceptor(_INTERCEPTOR)
         _PROFILE.scripts().insert(_click_recorder())
         _PROFILE.scripts().insert(_cosmetic_collector())
+        install_gl_guard()
     return _PROFILE
+
+
+class _GLGuard(QObject):
+    """Releases the current OpenGL context just before a browser view or page is hidden, closed or deleted.
+
+    With GPU acceleration every view draws through its own OpenGL context, and the last one to draw stays
+    current. When a view goes away, WebEngine frees its GPU resources with its own context and then switches back
+    to the one that was current — if that belonged to a view already gone, switching back fails and Qt aborts the
+    whole app ("Failed to restore OpenGL context after clean-up.": the app died quitting after the in-app browser
+    had been used, EZGD-ABRT-F8E5FD). Closing three GPU-drawn views in a row aborted 5 of 6 times; with this guard
+    0 of 6. With nothing current there is nothing to switch back to."""
+
+    _EVENTS = None
+
+    def eventFilter(self, obj, ev) -> bool:                  # noqa: N802
+        if _GLGuard._EVENTS is None:
+            from PySide6.QtCore import QEvent
+            _GLGuard._EVENTS = (QEvent.Type.Hide, QEvent.Type.Close, QEvent.Type.DeferredDelete)
+        if ev.type() in _GLGuard._EVENTS:
+            _release_gl()
+        return False
+
+
+_GUARD: _GLGuard | None = None
+
+
+def install_gl_guard(obj=None) -> None:
+    """The guard on a browser view or page (only those: an app-wide filter would run for every event of every
+    widget)."""
+    global _GUARD
+    if _GUARD is None:
+        _GUARD = _GLGuard()
+    if obj is not None:
+        obj.installEventFilter(_GUARD)
 
 
 # remembers what the user actually pressed (link / form target) so a new window that goes somewhere else — the
@@ -594,6 +629,7 @@ class BrowserDownloadDialog(QDialog):
         self._closed: list = []                       # tabs left with Back: kept until the window goes
         self.page = _Page(profile(), self)
         _PAGES.add(self.page)
+        install_gl_guard(self.page)
         self.tabs: list = [self.page]                 # pages opened by the user's clicks, newest last
         self._attach(self.page)
         lay.addWidget(self.stack, 1)
@@ -610,6 +646,7 @@ class BrowserDownloadDialog(QDialog):
 
     def _attach(self, page):
         v = QWebEngineView(self.stack)
+        install_gl_guard(v)
         v.setPage(page)
         if self.zoom != 1.0:
             v.setZoomFactor(self.zoom)
@@ -677,6 +714,7 @@ class BrowserDownloadDialog(QDialog):
                 return self._blocked_popup(url, "opened by the page, not by you")
             tab = _Page(profile(), self)
             _PAGES.add(tab)
+            install_gl_guard(tab)
             tab.probation = (self._gesture()[0], time.monotonic() + PROBATION_SECONDS)
             req.openIn(tab)
             self._pending.append(tab)
@@ -693,6 +731,7 @@ class BrowserDownloadDialog(QDialog):
         ADBLOCK.add_allowed(_site(_host(url)))
         tab = _Page(profile(), self)
         _PAGES.add(tab)
+        install_gl_guard(tab)
         req.openIn(tab)                          # keeps POST data / opener, e.g. a host's download form
         self._show_tab(tab, url)
 
@@ -825,6 +864,7 @@ class BrowserDownloadDialog(QDialog):
         url = old.url()
         tab = _Page(profile(), self)
         _PAGES.add(tab)
+        install_gl_guard(tab)
         idx = self.tabs.index(old) if old in self.tabs else -1
         if idx >= 0:
             self.tabs[idx] = tab
@@ -1011,6 +1051,20 @@ def active_count() -> int:
     return _MANAGER.active() if shiboken6.isValid(_MANAGER) else 0
 
 
+def _release_gl() -> None:
+    """No OpenGL context current while pages are deleted. With GPU acceleration, deleting a page makes WebEngine's
+    own context current to free the page's GPU resources and then restores whatever was current before; at exit
+    that was the context of a window already closed (couch mode / the main window), restoring it failed and Qt
+    aborted the app: "Failed to restore OpenGL context after clean-up." (EZGD-ABRT-F8E5FD, 2026-10-21)."""
+    try:
+        from PySide6.QtGui import QOpenGLContext
+        ctx = QOpenGLContext.currentContext()
+        if ctx is not None:
+            ctx.doneCurrent()
+    except Exception:
+        pass
+
+
 def shutdown() -> None:
     """Stop transfers and delete every page before the shared profile (Qt WebEngine aborts otherwise)."""
     global _PROFILE, _MANAGER, _INTERCEPTOR
@@ -1020,12 +1074,14 @@ def shutdown() -> None:
     if _MANAGER is not None:
         _MANAGER.cancel_all()
         _MANAGER = None
+    _release_gl()
     for page in list(_PAGES or ()):
         if shiboken6.isValid(page):
             view = QWebEngineView.forPage(page)
             if view is not None and shiboken6.isValid(view):
                 view.setPage(None)
             shiboken6.delete(page)
+            _release_gl()
     if shiboken6.isValid(_PROFILE):
         _PROFILE.setUrlRequestInterceptor(None)       # detach before anything is freed (IO thread may be in it)
         shiboken6.delete(_PROFILE)

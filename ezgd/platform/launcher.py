@@ -477,8 +477,10 @@ def display_command(plan: LaunchPlan) -> str:
     """Human-readable command line (for previews and logs)."""
     q = (lambda s: subprocess.list2cmdline([s])) if IS_WINDOWS else shlex.quote
     ready = "MANGOHUD_CONFIGFILE" in plan.env         # MangoHud loaded hidden, for the on/off switch (not shown)
+    from ezgd.library.errorbox import PLAY_WINEDEBUG
     interesting = {k: v for k, v in plan.env.items() if not k.startswith("STEAM_COMPAT_CLIENT")
-                   and not (k == "WINEDEBUG" and v == "-all,+msgbox")      # (error pop-ups' text into the log)
+                   and not (k == "WINEDEBUG" and v == PLAY_WINEDEBUG)     # (error pop-ups and DLLs into the log)
+                   and not k.startswith(("__GL_SHADER_DISK_CACHE", "MESA_SHADER_CACHE"))  # (its own shader cache)
                    and not (ready and k in ("MANGOHUD", "MANGOHUD_CONFIGFILE"))}
     env = " ".join(f"{k}={q(v)}" for k, v in sorted(interesting.items()))
     if plan.shell_script is not None:                 # what /bin/sh -c will run, with the app's environment

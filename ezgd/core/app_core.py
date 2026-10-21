@@ -93,6 +93,44 @@ class PreparedDownload:
                 **install_estimate(self.game, self.size)}
 
 
+
+
+def _change_key(ov: dict, exe: str | None = None) -> str:
+    """Two overrides with the same effect compare equal: key and list order left out, and the "game DLLs" fix
+    counted as the DLL overrides it stands for (the trace sets dwmapi=n,b, the checks switch on game_dlls)."""
+    norm = {}
+    for k, v in (ov or {}).items():
+        if k == "compat" and isinstance(v, dict):
+            c = dict(v)
+            dlls = {p.strip().lower() for p in (c.get("dll_overrides") or "").split(";") if p.strip()}
+            fixes = set(c.get("fixes") or [])
+            if "game_dlls" in fixes and exe:
+                from ezgd.platform.proton import suggest_dll_overrides
+                dlls |= {f"{d}=n,b" for d in suggest_dll_overrides(Path(exe)).found}
+                fixes.discard("game_dlls")
+            c["dll_overrides"], c["fixes"] = sorted(dlls), sorted(fixes)
+            norm[k] = {kk: sorted(vv) if isinstance(vv, list) else vv for kk, vv in c.items()}
+        else:
+            norm[k] = sorted(v) if isinstance(v, list) else v
+    return json.dumps(norm, sort_keys=True, default=str)
+
+def _exe_ticks(pids: list[int]) -> int | None:
+    """Processor time (clock ticks) used so far by a game's Windows processes (wineserver and Wine's own services
+    left out); None when there are none."""
+    total, found = 0, False
+    for pid in pids:
+        try:
+            cmd = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace").lower()
+            if ".exe" not in cmd or any(x in cmd for x in ("wineserver", "services.exe", "winedevice", "plugplay",
+                                                           "svchost", "explorer.exe", "rpcss", "tabtip", "xalia")):
+                continue
+            f = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+            total += int(f[11]) + int(f[12])
+            found = True
+        except (OSError, ValueError, IndexError):
+            continue
+    return total if found else None
+
 class AppCore:
     def __init__(self, paths: AppPaths, *, allow_private_network: bool = False,
                  transport=None, enable_torrents: bool = True, torrent_overrides: dict | None = None):
@@ -174,8 +212,11 @@ class AppCore:
         self.post = PostProcessor(self.library_repo, self.extraction_repo, self.games, self.settings, self.emit,
                                   created=self.created_paths)
         self.post.choose_executable = self.library.auto_executable
+        self.post.on_ready = lambda eid: self._soon(self.check_new_game(eid))
         self.post.before_update = self.library.backup_saves
         self.library.on_game_exit = self._game_exited
+        self._freezes: dict[int, dict] = {}            # games that seem / were said to be frozen: their threads
+        self._cpu_hist: dict[int, list] = {}           # running games' processor time (the freeze watch)
         self.post.recover()
         self.downloads = DownloadManager(self.download_repo, self.settings, self.http_engine, self.torrents,
                                          self.emit, client=self.client, on_completed=self._after_download,
@@ -204,7 +245,9 @@ class AppCore:
         self._bg_tasks = [asyncio.create_task(parsing.warm_up()), asyncio.create_task(self._resume_installs()),
                           asyncio.create_task(self._game_updates_loop()),
                           asyncio.create_task(self._wishlist_loop()),
-                          asyncio.create_task(self._app_update_loop())]
+                          asyncio.create_task(self._app_update_loop()),
+                          asyncio.create_task(self._crowd_loop())]
+        await asyncio.to_thread(self._forget_old_sharing)
         self.started = True
         log.info("core started (db schema v%d, %d cached games)", db.schema_version, self.games.count())
 
@@ -226,6 +269,13 @@ class AppCore:
             self.library.resume_all()    # a game frozen from the quick menu must not stay frozen after the app
         except Exception:
             log.exception("could not resume suspended games")
+        from ezgd.platform import awake
+        awake.shared().release_all()
+        if self.library.input_layout.games:          # a forced game layout must not outlive the app (the desktop
+            try:                                      # controller would stay a gamepad)
+                self.library.input_layout.hand_back()
+            except Exception:
+                log.exception("could not hand the controller layout back to Steam")
         from ezgd.sources import parsing
         parsing.shutdown()
         if getattr(self, "_verify_task", None):
@@ -572,12 +622,34 @@ class AppCore:
                 self.library.reap()
             except Exception:
                 log.exception("game reaper failed")
+            try:
+                self._keep_awake()
+            except Exception:
+                log.exception("keeping the screen awake failed")
             n += 1
+            if n % 5 == 0 and self.settings.settings.crash_reports:
+                try:                                     # every 10 s: has a running game frozen?
+                    await self._watch_freezes()
+                except Exception:
+                    log.exception("freeze watch failed")
             if n % 10 == 1:                              # every 20 s
                 try:
                     await self._apply_ready_fixes()
                 except Exception:
                     log.exception("applying waiting fixes failed")
+
+    def _keep_awake(self) -> None:
+        """The screen stays on while a game runs (a controller is not activity to the desktop): one idle hold per
+        running game — not for one paused from the quick menu, nor for a hidden test start."""
+        from ezgd.platform import awake
+        wanted = {}
+        if self.settings.settings.keep_awake and not self.library.closing:
+            for eid in self.library.running_ids():
+                if eid in self.library._suspended or eid in self.library._installers:
+                    continue
+                e = self.library.repo.get(eid)
+                wanted[f"game:{eid}"] = f"{e.title if e else 'A game'} is running"
+        awake.shared().sync(wanted, "game:")
 
     async def _apply_ready_fixes(self) -> None:
         """Fix-only downloads (OnlineFix "Friend's Pass" games): put the fix into the free Steam game as soon as
@@ -947,6 +1019,16 @@ class AppCore:
                 it["size"] = sum(r["size"] for r in it["paths"])
                 it["default"] = True
             items.append(it)
+        cache = self.library.shader_cache_dir(e.id)
+        if cache.exists():
+            it = item("shadercache", "Shader cache (its built shaders — kept so they are built only once)", [cache],
+                      True, "Only useful while the game is installed.")
+            if it:
+                for r in it["paths"]:          # the app's own folder
+                    r["ok"], r["why"], r["size"] = True, "", dir_size(cache)
+                it["size"] = sum(r["size"] for r in it["paths"])
+                it["default"] = True
+            items.append(it)
         if e.steam_shortcut_appid:
             items.append({"key": "shortcut", "title": "Steam shortcut", "paths": [], "default": True, "size": 0,
                           "note": "Removed from your Steam library (restart Steam to see it go)."})
@@ -1016,7 +1098,7 @@ class AppCore:
                 else:
                     freed += r["size"]
                     deleted.append(str(p))
-        for key in ("files", "downloads", "repack", "prefix"):
+        for key in ("files", "downloads", "repack", "prefix", "shadercache"):
             if key in items and key in keys:
                 await asyncio.to_thread(wipe, items[key]["paths"])
         if "shortcut" in items and "shortcut" in keys and e.steam_shortcut_appid:
@@ -1372,8 +1454,12 @@ class AppCore:
         edits = overrides.get("edits") or []
         exe = overrides.get("executable")
         verbs = overrides.get("winetricks") or []
-        if not changes and not edits and not exe and not verbs:
+        regs = overrides.get("registry") or []
+        if not changes and not edits and not exe and not verbs and not regs:
             return "That is already the current setup."
+        if regs:                                   # the release's .reg files helped in the test: into the real prefix
+            await asyncio.to_thread(self.library.import_reg, entry_id, self.library.prefix_dir(entry_id), regs,
+                                    overrides.get("proton_version"))
         if verbs:                                  # it worked in the test copy: now into the real prefix
             code = await asyncio.to_thread(self.library.run_winetricks, entry_id, verbs, True)
             if code not in (0, None):
@@ -1573,8 +1659,15 @@ class AppCore:
         log.info("fix outcome for %s: %s", e.title, "worked" if worked else "did not work")
         return self.fix_stats()
 
-    async def fix_my_game(self, entry_id: int, symptom: str = "", test: bool = True) -> dict:
-        """One button: check, repair what has strong evidence, test setups, and give one answer."""
+    async def fix_my_game(self, entry_id: int, symptom: str = "", test: bool = True,
+                          background: bool = False) -> dict:
+        """One button: check, repair what has strong evidence, test setups, and give one answer.
+        ``background``: the new-game check runs it (a press of the button stops that check first)."""
+        if getattr(self, "_investigating", False) and not background:
+            self._trial_cancel.set()                    # a new-game check is running: it steps aside
+            while getattr(self, "_investigating", False):
+                await asyncio.sleep(0.5)
+            self._trial_cancel = threading.Event()
         self._stops_with_the_app()
         e = self.library.get(entry_id)
         if self.library.is_running(entry_id):
@@ -1596,6 +1689,11 @@ class AppCore:
         step("Checking the game", "running", "files, Steam setup, fix archives, logs and your system")
         d = await self.diagnose_game(entry_id, symptom)
         step("Checking the game", "done", d["summary"])
+        late = self._late_crash(entry_id, symptom)
+        if late is not None and test:
+            # it crashed (or froze) while played, minutes in: a 45-second test cannot show that crash — start from
+            # the real one, and let the next play sessions judge the change
+            return await self._fix_late_crash(entry_id, late, symptom, step, before)
         top = max((f["confidence"] for f in d["findings"] if f.get("fix")), default=0.0)
         seen_ev = None                                 # the investigation's test run (its evidence is kept)
         if test and top < 0.6 and d.get("suggest_diagnostic_run", True):
@@ -1619,24 +1717,39 @@ class AppCore:
         if not test:
             verdict.update(status="changed" if applied else "nothing", kept=None)
             return verdict
-        # the root cause first: act on what the evidence names (the game's own error message, a missing DLL or
-        # runtime), test once, read that test, repeat — a fixed list of setups (every Proton…) only as a last resort
+        # follow the error: read the run, test the one change the evidence points at (in a throw-away copy), read
+        # that run, follow the next error — a fixed list of setups (every Proton…) only once the trail goes cold
         d2 = await self.diagnose_game(entry_id, symptom, evidence=seen_ev)    # findings after the repairs
-        rounds, d2, acted = await self._root_cause(entry_id, symptom, d2, applied, step,
-                                                   tested=seen_ev is not None and not applied)
+        rounds: list[dict] = []
+        follow = await self._follow_errors(entry_id, symptom, seen_ev if not applied else None, step, rounds, applied)
+        kept_ov, acted, notes, how = follow["kept"], follow["labels"], follow["notes"], follow["how"]
+        if follow["d"].get("findings"):
+            d2 = follow["d"]
         verdict["applied"] = applied
-        if rounds and rounds[-1]["outcome"] == "ran":
+        verdict["investigation"] = notes
+        verdict["report"] = follow["report"]
+        gen_id = next((r.get("gen_id") for r in reversed(rounds) if r.get("gen_id") and r.get("overrides") == kept_ov),
+                      None)
+        problems = [f["key"] for f in d2["findings"][:3]] + ([f"symptom:{symptom}"] if symptom else [])
+        if how in ("fixed", "ran"):
             step("Testing", "running", "it ran — checking once more", at=0.9)
             again = await asyncio.to_thread(self.library.run_trial, entry_id,
-                                            {"label": "Second check", "overrides": {}}, len(rounds) + 1,
+                                            {"label": "Second check", "overrides": kept_ov}, len(rounds) + 1,
                                             self._trial_cancel)
             if again["outcome"] == "ran":
-                kept = "; ".join(a.split(" — ")[0] for a in (acted or applied)) or "the repaired setup"
+                if kept_ov:
+                    await self.apply_trial(entry_id, kept_ov, gen_id, problems)
+                kept = "; ".join(acted) or "; ".join(a.split(" — ")[0] for a in applied) or "the repaired setup"
                 verdict.update(status="fixed", kept=kept, trials=rounds + [again])
                 step("Testing", "done", f"✓ the game kept running after: {kept} (checked twice)", at=1.0)
                 return verdict
             step("Testing", "running", f"✗ the second check failed ({again['detail']})")
             rounds.append(again)
+        elif how == "partial" and kept_ov:
+            # every kept step came true as predicted or took the game further: kept for real, and the setups
+            # tested below start from there
+            msg = await self.apply_trial(entry_id, kept_ov, gen_id, problems)
+            applied.append("Followed the error: " + "; ".join(acted) + " — " + msg)
         if self._trial_cancel.is_set():
             verdict.update(status="not_fixed", kept=None, trials=rounds, reason="Stopped by you.")
             step("Testing", "done", "stopped", at=1.0)
@@ -1726,6 +1839,15 @@ class AppCore:
             if best["overrides"]:
                 await self.apply_trial(entry_id, best["overrides"], best.get("gen_id"),
                                        [f["key"] for f in d["findings"][:3]] + ([f"symptom:{symptom}"] if symptom else []))
+                if follow["first"] is not None:          # the crash memory learns from the list's finds too
+                    from ezgd.library import tracer
+                    from ezgd.library.diagnose import engine_of
+                    gen = next((g for g in (d2.get("generated") or []) + (d2.get("generated_deep") or [])
+                                if g.get("gen_id") and g["gen_id"] == best.get("gen_id")), None)
+                    fixes = [{k: v for k, v in gen.items() if k != "overrides"}] if gen else []
+                    tracer.remember(self._memory_path(), follow["first"], engine_of(Path(e.executable)), e.title,
+                                    fixes, best["overrides"], [best["label"]])
+                    self._publish_memory()
             kept = best["label"] if best["overrides"] else diff["title"]
             verdict.update(status="fixed", kept=kept)
             step("Testing", "done", f"✓ {kept} kept the game running (checked twice)" if best["overrides"]
@@ -1734,75 +1856,603 @@ class AppCore:
             ge = await self.ge_proton_status()
             if ge.get("newer_available"):
                 verdict["offer_ge"] = {"tag": ge["latest"], "size": ge["size"]}
+            found = (" What the investigation found: " + notes[-1]) if notes else ""
             verdict.update(status="not_fixed", kept=None,
-                           reason=(unfixable["title"] + " — " + unfixable["explanation"]) if unfixable else
-                           "None of the setups kept the game running. Run a diagnostic launch and check the "
-                           "findings, or try the game's other release.")
+                           reason=((unfixable["title"] + " — " + unfixable["explanation"]) if unfixable else
+                                   "None of the setups kept the game running. Run a diagnostic launch and check the "
+                                   "findings, or try the game's other release.") + found)
             step("Testing", "done", "✗ no setup kept the game running")
         return verdict
 
-    ROOT_KINDS = ("repair_files", "write_file", "edit", "copy_files", "copy_folder", "apply_archive", "set_executable",
-                  "winetricks", "enable_fix", "launch_args", "set_overrides", "proton", "add_args")
-    ROOT_CONFIDENCE = 0.85               # what the evidence names this clearly is fixed, not tested among others
-    ROOT_ROUNDS = 5
+    # ------------------------------------------------------------ following the error (the investigator)
+    FOLLOW_STEPS = 6                    # errors followed one after another
+    FOLLOW_TESTS = 3                    # suspects tested for one error before the trail is called cold
+    # what a test may change: a suspect from the regular checks is tested only for these (file repairs are made
+    # for real by _auto_repair; .NET is installed for real — far too slow for a test copy)
+    FOLLOW_FINDING_KINDS = ("enable_fix", "add_args", "launch_args", "winetricks", "set_overrides", "proton")
+    FOLLOW_FINDING_CONFIDENCE = 0.6
 
-    async def _root_cause(self, entry_id: int, symptom: str, d: dict, applied: list[str], step,
-                          tested: bool = False) -> tuple[list[dict], dict, list[str]]:
-        """Fix the cause the evidence names, test once, read what that test showed, repeat. Returns (the test runs,
-        the last diagnosis, what was changed)."""
+    def _trace(self, ev: dict, exe: Path):
+        from ezgd.library import tracer
+        return tracer.trace(ev.get("text") or "", exe, exit_code=ev.get("exit_code"), seconds=ev.get("seconds"),
+                            ran=ev.get("exit_code") is None, extra=ev.get("extra") or "")
+
+    def _finding_suspects(self, entry_id: int, d: dict, trace) -> list:
+        """What the regular checks found in the same run, as suspects to test (after the traced ones)."""
+        from ezgd.library import tracer
+        out = []
+        wine_evidence = bool(trace.unimplemented) or any(f["key"].startswith(("proton-lacks", "unimplemented"))
+                                                         for f in d["findings"])
+        for f in d["findings"]:
+            fx = f.get("fix") or {}
+            if f["confidence"] < self.FOLLOW_FINDING_CONFIDENCE or fx.get("kind") not in self.FOLLOW_FINDING_KINDS:
+                continue
+            if fx["kind"] == "proton" and not wine_evidence:
+                continue                                 # another Proton only when the evidence is about Wine
+            if fx["kind"] == "winetricks" and any(v.startswith("dotnet") for v in fx["value"].split()):
+                continue
+            cands = self.library.trial_candidates(entry_id, [f], [], protons=False)[1:]
+            if not cands:
+                continue
+            out.append(tracer.Suspect(f"finding:{f['key']}", fx.get("label") if fx.get("label") not in (None, "Apply")
+                                      else f["title"], f["title"], f["confidence"], overrides=cands[0]["overrides"]))
+        return out
+
+    PATIENT_SECONDS = 120               # a test still starting up at 45 s (shaders, first-start setup) gets this once
+
+    def _memory_path(self) -> Path:
+        return self.library.paths.data / "crash_memory.json"
+
+    # ------------------------------------------------------------ everyone's knowledge (ezgd.library.crowd)
+    CROWD_EVERY = 12 * 3600              # the published knowledge is fetched (and unsent reports sent) this often
+
+    def _crowd_on(self) -> bool:
+        from ezgd.core import crowd_keys
+        return bool(self.settings.settings.share_knowledge and crowd_keys.SERVER and crowd_keys.ENCRYPT_KEY
+                    and crowd_keys.SIGN_KEY and os.environ.get("EZGD_CROWD", "1") != "0")   # (tests: never the real one)
+
+    def _crowd_file(self) -> Path:
+        return self.paths.data / "crowd_knowledge.json"
+
+    def _shared_records(self) -> list[dict]:
+        """What everyone solved: the server's signed knowledge (its signature checked again whenever it is read)."""
+        from ezgd.core import crowd_keys
+        from ezgd.library import crowd
+        if not self.settings.settings.share_knowledge:
+            return []
+        f = self._crowd_file()
+        try:
+            stamp = f.stat().st_mtime
+        except OSError:
+            return []
+        cached = getattr(self, "_crowd_cache", None)
+        if cached and cached[0] == stamp:
+            return cached[1]
+        doc = crowd.verify(f.read_bytes(), crowd_keys.SIGN_KEY)
+        recs = crowd.records_from(doc) if doc else []
+        self._crowd_cache = (stamp, recs)
+        return recs
+
+    def _publish_memory(self) -> None:
+        """A failure was solved: share it (anonymous, sealed for the server — crowd.py), in the background."""
+        if self._crowd_on():
+            self._soon(self._crowd_submit())
+
+    async def _crowd_submit(self) -> int:
+        """Send what this computer solved and has not sent yet; returns how many records the server kept."""
+        from ezgd.core import crowd_keys
+        from ezgd.library import crowd, tracer
+        from ezgd.platform import machine
+        if not self._crowd_on():
+            return 0
+        lock = getattr(self, "_crowd_lock", None)
+        if lock is None:
+            lock = self._crowd_lock = asyncio.Lock()
+        async with lock:
+            sent_file = self.paths.data / "crowd_sent.json"
+            sent = crowd.load_sent(sent_file)
+            solved = tracer._load_memory(self._memory_path())["solved"]
+            records, ids = crowd.reports(solved, machine.profile(), sent)
+            if not records:
+                return 0
+            body = json.dumps(crowd.seal({"v": 1, "records": records[:20]}, crowd_keys.ENCRYPT_KEY)).encode()
+            try:
+                res = await self.client.fetch(crowd_keys.SERVER.rstrip("/") + "/v1/report", method="POST",
+                                              content=body, headers={"Content-Type": "application/json"},
+                                              max_bytes=64 * 1024, polite=False)
+            except Exception as exc:
+                log.info("sharing what was solved failed: %s", exc)
+                return 0
+            if res.status != 200:
+                log.info("the knowledge server answered HTTP %s", res.status)
+                return 0
+            crowd.save_sent(sent_file, sent | set(ids[:20]))
+            try:
+                kept = int(json.loads(res.content).get("kept") or 0)
+            except (ValueError, AttributeError, TypeError):
+                kept = 0
+            log.info("shared %d solved failure(s) (anonymous, sealed for the server)", kept)
+            return kept
+
+    async def _crowd_refresh(self) -> bool:
+        """Fetch everyone's knowledge; kept only when the server's signature is valid."""
+        from ezgd.core import crowd_keys
+        from ezgd.library import crowd
+        if not self._crowd_on():
+            return False
+        try:
+            res = await self.client.fetch(crowd_keys.SERVER.rstrip("/") + "/v1/knowledge",
+                                          max_bytes=crowd.MAX_KNOWLEDGE, polite=False)
+        except Exception as exc:
+            log.info("fetching everyone's knowledge failed: %s", exc)
+            return False
+        if res.status != 200 or crowd.verify(res.content, crowd_keys.SIGN_KEY) is None:
+            log.warning("the knowledge download was refused (HTTP %s, or not signed by the server)", res.status)
+            return False
+        f = self._crowd_file()
+        tmp = f.with_name(f".{f.name}.tmp")
+        tmp.write_bytes(res.content)
+        os.replace(tmp, f)
+        return True
+
+    async def _crowd_loop(self) -> None:
+        await asyncio.sleep(60)                         # (out of the way of the start)
+        while True:
+            try:
+                if await self._crowd_refresh():
+                    await self._crowd_submit()
+            except Exception:
+                log.exception("everyone's knowledge: update failed")
+            await asyncio.sleep(self.CROWD_EVERY)
+
+    async def crowd_status(self) -> dict:
+        """For Settings: whether sharing works, and how much everyone's knowledge holds."""
+        from ezgd.core import crowd_keys
+        recs = await asyncio.to_thread(self._shared_records)
+        try:
+            updated = self._crowd_file().stat().st_mtime
+        except OSError:
+            updated = None
+        return {"server": bool(crowd_keys.SERVER), "on": self._crowd_on(), "entries": len(recs), "updated": updated}
+
+    def _forget_old_sharing(self) -> None:
+        """Before 0.5.8 the knowledge went to the synced folder (with a sharing code): this computer's file and its
+        code are removed."""
+        try:
+            (self.paths.config / "knowledge-code").unlink(missing_ok=True)
+            sync = self.settings.settings.save_sync_dir
+            if sync:
+                from ezgd.platform import machine
+                d = Path(sync) / "EZ Game knowledge"
+                me = machine.profile().get("id") or "this"
+                for name in (f"{me}.ezk", f"{me}.json"):
+                    p = d / name
+                    if p.is_file() and not p.is_symlink():
+                        p.unlink()
+        except OSError:
+            pass
+
+    def _good_run_path(self, entry_id: int) -> Path:
+        d = self.library.paths.data / "investigations"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / f"good-{entry_id}.json"
+
+    def _load_good_run(self, entry_id: int) -> dict | None:
+        try:
+            return json.loads(self._good_run_path(entry_id).read_text("utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    def _save_good_run(self, entry_id: int, trace) -> None:
+        from ezgd.library import tracer
+        try:
+            self._good_run_path(entry_id).write_text(json.dumps(tracer.summary(trace)), "utf-8")
+        except OSError:
+            pass
+
+    def _proton_with_build(self, build: str):
+        """An installed Proton whose build is ``build`` (the one that worked, still installed under another name —
+        "Proton-GE Latest" updated in place to GE-Proton11-7 broke OnlineFix games while 11-5 sat next to it)."""
+        for p in self.library.protons():
+            try:
+                if (Path(p.path) / "version").read_text("utf-8", "replace").strip()[:80] == build:
+                    return p
+            except OSError:
+                continue
+        return None
+
+    def _write_report(self, entry_id: int, lines: list[str]) -> str | None:
+        """The investigation, step by step, as a text file in the app's reports folder (readable later without
+        anyone to explain it)."""
+        try:
+            e = self.library.get(entry_id)
+            folder = self.library.paths.data / "reports"
+            folder.mkdir(parents=True, exist_ok=True)
+            p = folder / f"investigation-{safe_dirname(e.title)}-{time.strftime('%Y%m%d-%H%M%S')}.txt"
+            p.write_text(f"Fix my game — {e.title}\n{time.strftime('%Y-%m-%d %H:%M')}\n\n" + "\n".join(lines) + "\n",
+                         "utf-8")
+            return str(p)
+        except OSError:
+            return None
+
+    async def _follow_errors(self, entry_id: int, symptom: str, ev: dict | None, step, results: list[dict],
+                             applied: list[str]) -> dict:
+        """Read one detailed run, ask why it ended, test the one change the evidence points at in a throw-away copy,
+        read that run, and follow the next error — like a person debugging it. A change is kept when its prediction
+        came true or the game got further; nothing is changed for real here.
+
+        Evidence, strongest first: failures solved before that look the same (crash memory), what differs from the
+        last run that worked, the run's own trace (error message, crash, replaced DLLs, missing files and registry
+        keys), the regular checks. When the trail goes cold, one closer look (registry lookups recorded) before
+        giving up. A fix that works is trimmed to the parts it really needs.
+
+        Returns {"kept", "labels", "notes", "how": fixed|partial|cold|ran, "d", "report", "first"}."""
+        from ezgd.library import tracer
+        from ezgd.library.diagnose import engine_of
+        from ezgd.library.manager import merge_overrides
         if getattr(self, "_trial_cancel", None) is None or self._trial_cancel.is_set():
             self._trial_cancel = threading.Event()
-        results: list[dict] = []
-        acted: list[str] = []
-        done: set = set()
-        for rnd in range(1, self.ROOT_ROUNDS + 1):
-            if self._trial_cancel.is_set():
-                break
-            base = 0.3 + 0.5 * (rnd - 1) / self.ROOT_ROUNDS
-            already = {a.split(" — ")[0] for a in applied}       # (repaired in the step before)
-            causes = [f for f in d["findings"] if f.get("fix") and f["confidence"] >= self.ROOT_CONFIDENCE
-                      and f["fix"]["kind"] in self.ROOT_KINDS and (f["fix"]["kind"], f["fix"]["value"]) not in done
-                      and f["title"] not in already]
-            if not causes and (rnd > 1 or tested):
-                break                                   # nothing certain (and the game was just tested as it is)
-            label = "Current setup"
-            if causes:
-                f = causes[0]
-                fx = f["fix"]
-                done.add((fx["kind"], fx["value"]))
-                step("Fixing the cause", "running", f"{f['title']} → {fx['label']}", at=base)
-                try:
-                    if fx["kind"] == "winetricks":
-                        step("Fixing the cause", "running", f"installing {fx['value']} (a few minutes)", at=base)
-                        code = await asyncio.to_thread(self.library.run_winetricks, entry_id, fx["value"].split(), True)
-                        if code not in (0, None):
-                            raise SourceError(self.library._winetricks_failure(entry_id, fx["value"]))
-                        msg = f"installed {fx['value']}"
-                    else:
-                        msg = await self.apply_fix(entry_id, fx["kind"], fx["value"])
-                        if fx["kind"] == "proton":           # its own prefix, before anything is installed into it
-                            await asyncio.to_thread(self.library.ensure_prefix_for, self.library.get(entry_id))
-                    applied.append(f"{f['title']} — {msg}")
-                    acted.append(f"{fx['label']} — {msg}")
-                    label = f"After: {fx['label']}"
-                    step("Fixing the cause", "running", f"✓ {fx['label']}", at=base + 0.04)
-                except Exception as exc:
-                    applied.append(f"{f['title']} — could not apply: {exc}")
-                    step("Fixing the cause", "running", f"✗ {fx['label']}: {exc}", at=base + 0.04)
-                    d = {**d, "findings": [g for g in d["findings"] if g is not f]}
-                    continue
-            step("Testing", "running", "starting the game once — " + ("did that fix it?" if causes else
-                                                                     "what does it do?"), at=base + 0.05)
-            r = await asyncio.to_thread(self.library.run_trial, entry_id, {"label": label, "overrides": {}},
-                                        len(results) + 1, self._trial_cancel)
+        e = self.library.get(entry_id)
+        exe = Path(e.executable)
+        engine = engine_of(exe)
+        memory = self._memory_path()
+        good = self._load_good_run(entry_id)
+        parts: list[tuple[str, dict, object]] = []      # (label, its own change, the suspect) — for trimming
+        kept: dict = {}
+        notes: list[str] = []
+        report: list[str] = []
+        tried: set[str] = set()
+        no_change: list[str] = []
+        d: dict = {"findings": []}
+        res = {"kept": kept, "labels": [], "notes": notes, "how": "cold", "d": d, "report": None, "first": None}
+
+        def say(name: str, text: str, status: str = "running") -> None:
+            step(name, status, text)
+            report.append(f"[{name}] {text}")
+
+        async def trial(label: str, overrides: dict, **kw) -> tuple[dict, dict | None]:
+            cand = {"label": label, "overrides": overrides}
+            kw = {k: v for k, v in kw.items() if v}       # (only what differs from a normal test)
+            r = await asyncio.to_thread(self.library.run_trial, entry_id, cand, len(results) + 1,
+                                        self._trial_cancel, **kw)
+            r["overrides"] = overrides
             results.append(r)
-            mark = "✓" if r["outcome"] == "ran" else "✗"
-            step("Testing", "running", f"{mark} {label}: {r['detail']}", at=base + 0.09)
-            if r["outcome"] == "ran":
+            return r, self.library.trial_evidence.get(entry_id, {}).get(len(results))
+
+        def finish(how: str) -> dict:
+            res.update(kept=kept, labels=[p[0] for p in parts], how=how, d=d)
+            report.append(f"\nResult: {how}" + (" — kept: " + "; ".join(res["labels"]) if res["labels"] else ""))
+            res["report"] = self._write_report(entry_id, report)
+            if res["first"] is not None and no_change:
+                tracer.remember_no_help(memory, res["first"], engine, e.title, no_change)
+            return res
+
+        if ev is None:                                   # one start with Wine's detailed logging: the evidence
+            say("Following the error 1", "starting the game once with detailed logging")
+            r, ev = await trial("Current setup", {})
+            if r["outcome"] == "ran" and not r.get("stuck"):
+                say("Following the error 1", "it ran with its current setup", "done")
+                if ev:
+                    self._save_good_run(entry_id, self._trace(ev, exe))
+                return finish("ran")
+            if ev is None:
+                return finish("cold")
+        cur = self._trace(ev, exe)
+        res["first"] = cur
+        tried |= tracer.no_help(memory, cur, engine, e.title)
+        looked_closer = cur.keys_traced
+        n = 0
+        while n < self.FOLLOW_STEPS and not self._trial_cancel.is_set():
+            n += 1
+            name = f"Following the error {n}"
+            chain, suspects = tracer.follow(cur, e, good)
+            if good:
+                diff, more = tracer.compare(good, cur)
+                chain += diff
+                suspects = more + suspects
+                if good.get("proton_build") and cur.setup.get("proton_build") and \
+                        good["proton_build"] != cur.setup["proton_build"]:
+                    p = self._proton_with_build(good["proton_build"])
+                    if p is not None:
+                        suspects.append(tracer.Suspect(f"proton-build:{p.name}", f"Use {p.name}",
+                                                       f"It worked with {good['proton_build']}, which is {p.name}.",
+                                                       0.8, overrides={"proton_version": p.name}))
+            suspects = tracer.recall(memory, cur, engine, e.title, self._shared_records()) + suspects
+            suspects += await self._layer_suspects(entry_id, cur)
+            d = await self.diagnose_game(entry_id, symptom, evidence=ev)      # the regular checks, same run
+            suspects += self._finding_suspects(entry_id, d, cur)
+            best: dict[str, object] = {}
+            for s_ in suspects:                          # one per key, the most confident wins
+                if s_.key not in best or s_.confidence > best[s_.key].confidence:
+                    best[s_.key] = s_
+            suspects = sorted(best.values(), key=lambda x: -x.confidence)
+            notes.append(" ".join(chain))
+            say(name, " ".join(chain[:6]))
+            # .NET named by the evidence: installed for real (a test copy would take far too long), then followed
+            dotnet = next((x for x in suspects if x.key not in tried and x.fix is not None and x.confidence >= 0.85
+                           and any(v.startswith("dotnet") for v in getattr(x.fix, "winetricks", []))), None)
+            if dotnet is not None:
+                tried.add(dotnet.key)
+                verbs = list(dotnet.fix.winetricks)
+                say(name, f"installing {' '.join(verbs)} (the evidence names it; a few minutes)")
+                code = await asyncio.to_thread(self.library.run_winetricks, entry_id, verbs, True)
+                applied.append(f"{dotnet.title} — " + ("installed" if code in (0, None) else
+                                                       self.library._winetricks_failure(entry_id, " ".join(verbs))))
+            moved = False
+            tested = 0
+            for sx in suspects:
+                if self._trial_cancel.is_set() or tested >= self.FOLLOW_TESTS:
+                    break
+                if sx.key in tried or sx.confidence < 0.3:
+                    continue
+                tried.add(sx.key)
+                ov = sx.changes(e)
+                if not ov or any(v.startswith("dotnet") for v in ov.get("winetricks") or []):
+                    continue
+                merged = merge_overrides(kept, ov) if kept else ov
+                if not merged or merged == kept:
+                    continue
+                tested += 1
+                say(name, f"testing: {sx.title} — {sx.why}")
+                r, nev = await trial(sx.title, merged, deep="no_key" in sx.expect)
+                if r["outcome"] == "ran" and r.get("stuck") and not self._trial_cancel.is_set():
+                    say(name, f"{sx.title}: still starting after {r.get('seconds')}s — giving it "
+                              f"{self.PATIENT_SECONDS}s")
+                    r, nev = await trial(sx.title + " (longer)", merged, seconds=self.PATIENT_SECONDS)
+                if nev is None:
+                    say(name, f"✗ {sx.title}: {r['detail']}")
+                    no_change.append(sx.key)
+                    continue
+                after = self._trace(nev, exe)
+                v, why = tracer.verdict(cur, after, sx.expect)
+                if r["outcome"] == "ran" and not r.get("stuck"):
+                    v, why = "fixed", r["detail"]
+                ok = v in ("fixed", "progress", "confirmed")
+                say(name, f"{'✓' if ok else '✗'} {sx.title}: {why}")
+                if not ok:
+                    no_change.append(sx.key)
+                    continue
+                kept, cur, ev, moved = merged, after, nev, True
+                parts.append((sx.title, ov, sx))
+                if v == "fixed":
+                    kept = await self._trim(entry_id, parts, kept, trial, say, name)
+                    self._save_good_run(entry_id, after)
+                    fixes = [x.fix.to_dict() for _l, _o, x in parts if x.fix is not None]
+                    tracer.remember(memory, res["first"], engine, e.title, fixes, kept, [p[0] for p in parts])
+                    self._publish_memory()
+                    say(name, f"✓ fixed by: {'; '.join(p[0] for p in parts)}", "done")
+                    return finish("fixed")
                 break
-            ev = self.library.trial_evidence.get(entry_id, {}).get(len(results))
-            d = await self.diagnose_game(entry_id, symptom, evidence=ev)    # what did this test show?
-        return results, d, acted
+            if moved:
+                say(name, f"✓ kept: {parts[-1][0]} — following the next error", "done")
+                continue
+            if not looked_closer and not self._trial_cancel.is_set():
+                # the trail is cold with what this run recorded: one closer look — the registry too
+                looked_closer = True
+                say(name, "no lead in this run — looking closer (recording every file and registry lookup)")
+                r, nev = await trial("Looking closer", kept, deep=True)
+                if nev is not None:
+                    deeper = self._trace(nev, exe)
+                    if r["outcome"] == "ran" and not r.get("stuck"):
+                        self._save_good_run(entry_id, deeper)
+                        say(name, "it ran during the closer look", "done")
+                        return finish("fixed" if kept else "ran")
+                    cur, ev = deeper, nev
+                    n -= 1                               # (the same error, now with more evidence)
+                    say(name, "recorded: " + (cur.first_problem()), "done")
+                    continue
+            say(name, "the trail ends here: " + cur.first_problem(), "done")
+            break
+        return finish("partial" if kept else "cold")
+
+    async def _trim(self, entry_id: int, parts: list, kept: dict, trial, say, name: str) -> dict:
+        """A fix of several changes: each is left out once — if the game still runs without it, it was not needed
+        (fewer leftovers on the game, nothing that breaks later for no reason)."""
+        from ezgd.library.manager import merge_overrides
+        if len(parts) < 2:
+            return kept
+        needed = list(parts)
+        for part in list(parts):
+            if self._trial_cancel.is_set() or len(needed) < 2:
+                break
+            rest = [p for p in needed if p is not part]
+            merged: dict | None = {}
+            for _l, ov, _s in rest:
+                merged = merge_overrides(merged, ov) if merged else ov
+                if merged is None:
+                    break
+            if not merged:
+                continue
+            say(name, f"is “{part[0]}” really needed? testing without it")
+            r, _ev = await trial(f"Without: {part[0]}", merged)
+            if r["outcome"] == "ran" and not r.get("stuck"):
+                needed = rest
+                kept = merged
+                say(name, f"✓ not needed: {part[0]} — left out")
+            else:
+                say(name, f"✓ needed: {part[0]}")
+        parts[:] = needed
+        return kept
+
+    LATE_TESTS = 4                      # ideas checked with a hidden start (must still start fine) per round
+
+    async def _late_suspects(self, entry_id: int, rec: dict, symptom: str, cur, ev: dict) -> tuple[list[str], list]:
+        """The reasoning about a crash / freeze while playing, and what to try, most likely first."""
+        from ezgd.library import tracer
+        from ezgd.library.diagnose import engine_of
+        e = self.library.get(entry_id)
+        engine = engine_of(Path(e.executable))
+        good = self._load_good_run(entry_id)
+        chain, suspects = tracer.follow(cur, e, good)
+        if rec.get("kind") == "freeze":
+            snap = rec.get("freeze") or {}
+            chain.insert(0, f"It froze after {max(1, (rec.get('played') or 0) // 60)} min. {snap.get('verdict', '')}")
+            kinds = {t.get("kind") for t in snap.get("threads") or []}
+            if kinds & {"gpu", "busy", "waiting"}:
+                cur_proton = (self.library._proton_for(e).name if self.library._proton_for(e) else "")
+                for p in self.library.protons():
+                    if p.name != cur_proton:
+                        suspects.append(tracer.Suspect(f"proton:{p.name}", f"Use {p.name}",
+                                                       "A hang in Wine or the graphics layer: another Proton build "
+                                                       "brings other versions of both.",
+                                                       0.5 if "ge" in p.name.lower() else 0.4,
+                                                       overrides={"proton_version": p.name}))
+        suspects = tracer.recall(self._memory_path(), cur, engine, e.title, self._shared_records()) + suspects
+        suspects += await self._layer_suspects(entry_id, cur)
+        d = await self.diagnose_game(entry_id, symptom or "crash_later", evidence=ev)
+        suspects += self._finding_suspects(entry_id, d, cur)
+        for g in (d.get("generated") or [])[:6]:                 # the fix generator's ideas for "crashes after a while"
+            suspects.append(tracer.Suspect(f"gen:{g['gen_id']}", g["label"], g.get("why", ""), 0.45,
+                                           overrides=g["overrides"]))
+        no = tracer.no_help(self._memory_path(), cur, engine, e.title)
+        best: dict = {}
+        for x in suspects:                    # one per actual change (the trace and the checks name some alike)
+            if x.key in no:
+                continue
+            k = _change_key(x.changes(e), e.executable)
+            if k not in best or x.confidence > best[k].confidence:
+                best[k] = x
+        return chain, sorted(best.values(), key=lambda x: -x.confidence)
+
+    async def _fix_late_crash(self, entry_id: int, rec: dict, symptom: str, step, before: dict) -> dict:
+        """A crash (or freeze) minutes into playing: start from the real one. Each idea is checked with a hidden
+        start (the game must still start as well as before); the first that does is applied for real, on trial —
+        the next play session decides: past the old crash time → kept; the same crash → undone, the next idea."""
+        from ezgd.library import crashes, tracer
+        if getattr(self, "_trial_cancel", None) is None or self._trial_cancel.is_set():
+            self._trial_cancel = threading.Event()
+        e = self.library.get(entry_id)
+        report: list[str] = []
+        verdict: dict = {"applied": [], "before": before, "findings": [], "investigation": []}
+
+        def say(name: str, text: str, status: str = "running") -> None:
+            step(name, status, text)
+            report.append(f"[{name}] {text}")
+        ev = crashes.evidence(rec)
+        if ev is None:
+            verdict.update(status="not_fixed", kept=None, reason="The crash record could not be read.")
+            return verdict
+        cur = self._trace(ev, Path(e.executable))
+        chain, suspects = await self._late_suspects(entry_id, rec, symptom, cur, ev)
+        verdict["investigation"] = [" ".join(chain)]
+        say("Following the crash", crashes.summary(rec) + ". " + " ".join(chain[1:5]))
+        if not suspects:
+            verdict.update(status="not_fixed", kept=None, reason="Nothing in the crash points to a change to try. "
+                           + " ".join(chain[:4]), report=self._write_report(entry_id, report))
+            say("Following the crash", "no idea to try", "done")
+            return verdict
+        say("Checking", "how far it gets with its current setup (hidden start)")
+        base = await asyncio.to_thread(self.library.run_trial, entry_id, {"label": "Current setup", "overrides": {}},
+                                       1, self._trial_cancel)
+        reach = len(base.get("progress") or [])
+        ok: list = []
+        n = 1
+        for sx in suspects:
+            if len(ok) >= 1 or n > self.LATE_TESTS or self._trial_cancel.is_set():
+                break
+            ov = sx.changes(e)
+            if not ov or any(v.startswith("dotnet") for v in ov.get("winetricks") or []):
+                continue
+            n += 1
+            say("Checking", f"{sx.title} — {sx.why} (does it still start?)")
+            r = await asyncio.to_thread(self.library.run_trial, entry_id, {"label": sx.title, "overrides": ov}, n,
+                                        self._trial_cancel)
+            fine = r["outcome"] == "ran" or (r["outcome"] not in ("crashed", "error")
+                                             and len(r.get("progress") or []) >= reach)
+            say("Checking", f"{'✓' if fine else '✗'} {sx.title}: {r['detail']}")
+            if fine:
+                ok.append((sx, ov))
+        if not ok:
+            verdict.update(status="not_fixed", kept=None, reason="None of the ideas kept the game starting as before: "
+                           + "; ".join(x.title for x in suspects[:4]) + ".", report=self._write_report(entry_id, report))
+            say("Checking", "nothing safe to try", "done")
+            return verdict
+        sx, ov = ok[0]
+        problems = [f"crash:{tracer._sig_id(rec.get('fingerprint') or {})}"]
+        msg = await self.apply_trial(entry_id, ov, sx.gen_id, problems)
+        queue = [{"key": x.key, "title": x.title, "overrides": x.changes(e), "gen_id": x.gen_id,
+                  "fix": x.fix.to_dict() if x.fix is not None else None}
+                 for x in suspects if x is not sx and x.changes(e)
+                 and _change_key(x.changes(e), e.executable) != _change_key(ov, e.executable)][:6]
+        fol = self._followups()
+        fol[str(entry_id)] = {"what": [sx.title], "keys": [f"trial:{sx.key}"], "at": time.time(),
+                              "crash_after": rec.get("played") or 0, "kind": rec.get("kind"),
+                              "sig": tracer._sig_id(rec.get("fingerprint") or {}), "before": before,
+                              "current": {"key": sx.key, "title": sx.title, "overrides": ov, "gen_id": sx.gen_id,
+                                          "fix": sx.fix.to_dict() if sx.fix is not None else None},
+                              "queue": queue, "record": rec.get("folder")}
+        try:
+            self._followup_path().write_text(json.dumps(fol), "utf-8")
+        except OSError:
+            pass
+        mins = max(1, (rec.get("played") or 0) // 60)
+        say("Trying", f"{sx.title} is set for your next session ({msg}) — "
+                      f"if it gets well past {mins} min, it is kept", "done")
+        verdict.update(status="trying", kept=sx.title, applied=[f"{sx.title} — on trial"],
+                       reason=f"It crashed {mins} min into playing — a test start cannot show that. “{sx.title}” is "
+                              f"set now. Play it: if it gets well past {mins} min, it is kept; if it crashes the same "
+                              f"way, it is undone and the next idea ({queue[0]['title'] if queue else 'none left'}) "
+                              "is set instead.", report=self._write_report(entry_id, report))
+        return verdict
+
+    async def _judge_trial_fix(self, entry_id: int, e, rec: dict | None, played: int, p: dict) -> None:
+        """The play session after a fix for a crash while playing: kept, undone (and the next one set), or not
+        judged yet (quit before the old crash time)."""
+        from ezgd.library import crashes, tracer
+        from ezgd.library.diagnose import engine_of
+        fol = self._followups()
+        after = int(p.get("crash_after") or 0)
+        cur = p.get("current") or {}
+        engine = engine_of(Path(e.executable)) if e.executable else None
+        first = None
+        if p.get("record"):
+            ev = crashes.evidence({"folder": p["record"]})
+            first = self._trace(ev, Path(e.executable)) if ev else None
+        if rec is None and played >= max(after * 1.5, after + 600):
+            fol.pop(str(entry_id), None)
+            self._write_followups(fol)
+            self._record_outcome(e.title, True, [cur.get("title", "the fix")], [f"trial:{cur.get('key')}"], e)
+            if first is not None:
+                tracer.remember(self._memory_path(), first, engine, e.title,
+                                [cur["fix"]] if cur.get("fix") else [], cur.get("overrides") or {},
+                                [cur.get("title", "")])
+                self._publish_memory()
+            self.emit("notify", ("The fix held", f"{e.title} ran {played // 60} min without crashing (it used to "
+                                 f"crash after {max(1, after // 60)} min) — “{cur.get('title')}” is kept."))
+            return
+        if rec is None:                                       # quit before the old crash time: not judged yet
+            fol[str(entry_id)] = p
+            self._write_followups(fol)
+            return
+        # it crashed again: this change did not help — undone, the next idea set
+        await self.undo_fix_my_game(entry_id, p.get("before") or {})
+        self._record_outcome(e.title, False, [cur.get("title", "the fix")], [f"trial:{cur.get('key')}"], e)
+        if first is not None and cur.get("key"):
+            tracer.remember_no_help(self._memory_path(), first, engine, e.title, [cur["key"]])
+        queue = list(p.get("queue") or [])
+        nxt = queue.pop(0) if queue else None
+        if nxt is None:
+            fol.pop(str(entry_id), None)
+            self._write_followups(fol)
+            self.emit("notify", ("Still crashing", f"{e.title} crashed again after {max(1, played // 60)} min with "
+                                 f"“{cur.get('title')}” — undone. No idea is left; Diagnose has the details."))
+            return
+        try:
+            await self.apply_trial(entry_id, nxt["overrides"], nxt.get("gen_id"))
+        except Exception as exc:
+            log.warning("could not set the next idea for %s: %s", e.title, exc)
+        p.update(current=nxt, queue=queue, crash_after=rec.get("played") or after, at=time.time(),
+                 what=[nxt["title"]], keys=[f"trial:{nxt['key']}"])
+        fol[str(entry_id)] = p
+        self._write_followups(fol)
+        self.emit("notify", ("Trying the next idea", f"{e.title} still crashed after {max(1, played // 60)} min "
+                             f"with “{cur.get('title')}” — undone. Next session: “{nxt['title']}”."))
+
+    def _write_followups(self, d: dict) -> None:
+        try:
+            self._followup_path().write_text(json.dumps(d), "utf-8")
+        except OSError:
+            pass
 
     def _real_start_difference(self, entry_id: int, base: dict) -> dict | None:
         """The current setup ran in the test copy but the game's real starts fail: what is different?"""
@@ -1954,8 +2604,17 @@ class AppCore:
             pass
 
     def _game_exited(self, entry_id: int, code: int | None, played: int) -> None:
-        """After a fix: did the next start work? Tell the user and count it (no need to answer "did it work?")."""
+        """After a fix: did the next start work? Tell the user and count it (no need to answer "did it work?").
+        Every session that ends in a crash or a freeze is kept (ezgd.library.crashes); a fix on trial for a crash
+        while playing is judged by this session."""
         d = self._followups()
+        trial = d.get(str(entry_id))
+        if trial and trial.get("crash_after") is not None:
+            self._soon(self._after_play(entry_id, code, played, probation=trial))
+            return
+        st = getattr(getattr(self, "settings", None), "settings", None)
+        if st is not None and st.crash_reports:
+            self._soon(self._after_play(entry_id, code, played))
         p = d.pop(str(entry_id), None)
         if not p or time.time() - p.get("at", 0) > 14 * 86400:
             if played < 60 and code not in (None, 0, -15, 143):
@@ -1980,6 +2639,297 @@ class AppCore:
             self.emit("notify", ("Still not working", f"{e.title} stopped again after {played}s (after {what}). "
                                                       "Open Diagnose: it has analysed this run and has the next "
                                                       "suggestion — or press “Try fixes for me”."))
+
+    def _soon(self, coro) -> None:
+        try:
+            asyncio.get_running_loop().create_task(coro)
+        except RuntimeError:
+            coro.close()
+
+    # ------------------------------------------------- crashes and freezes while playing (ezgd.library.crashes)
+    FREEZE_IDLE_SECONDS = 60             # no processor time at all for this long: probably frozen
+    LATE_CRASH_SECONDS = 60              # a crash after this long is one a test start cannot show
+
+    async def _after_play(self, entry_id: int, code: int | None, played: int, probation: dict | None = None) -> None:
+        from ezgd.library import crashes
+        from ezgd.platform import machine
+        await asyncio.sleep(1.0)                                   # (the exit line is written first)
+        try:
+            e = self.library.get(entry_id)
+        except Exception:
+            return
+        freeze = self._freezes.pop(entry_id, None)
+        kind = "freeze" if freeze and code in crashes.NORMAL_EXITS else "crash"
+        try:
+            prof = await asyncio.to_thread(machine.profile)
+            rec = await asyncio.to_thread(crashes.capture, self.paths.data, e, self.library.prefix_dir(entry_id),
+                                          self.paths.logs / f"game-{entry_id}.log", code, played, kind=kind,
+                                          freeze=freeze["snap"] if freeze else None, machine=prof)
+        except Exception:
+            log.exception("keeping the crash record failed")
+            rec = None
+        if probation is not None:
+            await self._judge_trial_fix(entry_id, e, rec, played, probation)
+            return
+        if rec is not None and (played >= self.LATE_CRASH_SECONDS or kind == "freeze"):
+            self.emit("notify", (f"{e.title} {'froze' if kind == 'freeze' else 'crashed'}",
+                                 crashes.summary(rec)[:220] + ". The app kept what happened — Diagnose → "
+                                 "“Fix my game” starts from it."))
+            self.emit("library_changed", entry_id)
+
+    def _late_crash(self, entry_id: int, symptom: str) -> dict | None:
+        """The crash / freeze record to start from: the game's last session ended that way, minutes in."""
+        from ezgd.library import crashes
+        rec = crashes.latest(self.paths.data, entry_id, since=time.time() - 14 * 86400)
+        if rec is None or (rec.get("played") or 0) < self.LATE_CRASH_SECONDS or symptom not in ("", "crash_later"):
+            return None
+        try:
+            started_since = (self.paths.logs / f"game-{entry_id}.log").stat().st_mtime > rec["at"] + 60
+        except OSError:
+            started_since = False
+        return None if started_since and symptom != "crash_later" else rec
+
+    async def _watch_freezes(self) -> None:
+        """A running game whose Windows processes used no processor time at all for a minute is probably frozen:
+        what its threads were doing is kept now, while it hangs (once it is stopped there is nothing to read)."""
+        from ezgd.library import crashes
+        now = time.monotonic()
+        running = set(self.library.running_ids())
+        for eid in list(self._cpu_hist):
+            if eid not in running:
+                self._cpu_hist.pop(eid, None)
+        for eid in running:
+            if eid in self.library._suspended or (self.library.session_seconds(eid) or 0) < 120:
+                continue
+            pids = await asyncio.to_thread(self.library.game_processes, eid)
+            ticks = await asyncio.to_thread(_exe_ticks, pids)
+            if ticks is None:
+                continue
+            hist = self._cpu_hist.setdefault(eid, [])
+            hist.append((now, ticks))
+            del hist[:-40]
+            old = [t for t in hist if now - t[0] >= self.FREEZE_IDLE_SECONDS]
+            if not old:
+                continue
+            idle = old[-1][1] == ticks
+            if idle and eid not in self._freezes:
+                snap = await asyncio.to_thread(crashes.snapshot, pids)
+                self._freezes[eid] = {"at": time.time(), "snap": snap}
+                try:
+                    title = self.library.get(eid).title
+                except Exception:
+                    title = "The game"
+                log.info("%s seems frozen: %s", title, snap.get("verdict"))
+                self.emit("notify", (f"{title} seems frozen", "It has used no processor time for a minute. If it "
+                                     "is stuck, stop it (Library → Stop): the app keeps what its threads were doing."))
+            elif not idle and eid in self._freezes and not self._freezes[eid].get("reported"):
+                self._freezes.pop(eid, None)                       # it came back by itself
+
+    # ------------------------------------------------- checking a new game before its first start (all hidden)
+    NEW_GAME_WAIT = 6 * 3600             # how long a check waits for no game to be running
+
+    def _checks_path(self) -> Path:
+        return self.paths.data / "new_game_checks.json"
+
+    def new_game_checks(self) -> dict:
+        try:
+            d = json.loads(self._checks_path().read_text("utf-8"))
+            return d if isinstance(d, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _set_check(self, entry_id: int, **state) -> None:
+        d = self.new_game_checks()
+        d[str(entry_id)] = {**d.get(str(entry_id), {}), **state, "at": time.time()}
+        try:
+            self._checks_path().write_text(json.dumps(d), "utf-8")
+        except OSError:
+            pass
+        self.emit("library_changed", entry_id)
+
+    async def check_new_game(self, entry_id: int) -> dict | None:
+        """A newly installed game is started once, hidden and muted, before anyone presses Play: if its picture
+        shows it reaching its menu (or it keeps running), it is ready; if not, the investigator follows the error
+        — also hidden — and keeps the fix. Only while no game is played; a game started meanwhile stops it."""
+        from ezgd.platform import hidden
+        from ezgd.platform.launcher import is_windows_binary
+        s = self.settings.settings
+        e = self.library.get(entry_id)
+        if not (s.check_new_games and s.hidden_tests and hidden.available() and e.executable
+                and is_windows_binary(Path(e.executable))):
+            return None
+        if self.new_game_checks().get(str(entry_id), {}).get("status") in ("ready", "fixed", "problem"):
+            return None
+        self._set_check(entry_id, status="waiting", detail="checked as soon as no game is running")
+        waited = 0
+        while self.library.running_ids() or getattr(self, "_investigating", False):
+            if waited >= self.NEW_GAME_WAIT:
+                self._set_check(entry_id, status="skipped", detail="a game was running the whole time")
+                return None
+            await asyncio.sleep(30)
+            waited += 30
+        self._investigating = True
+        self._trial_cancel = threading.Event()
+        guard = asyncio.get_running_loop().create_task(self._stop_check_when_played())
+        started = time.monotonic()
+        try:
+            self._set_check(entry_id, status="checking", detail="a quick look, out of sight")
+            fixed = await self._quick_static_fixes(entry_id)
+            r = await asyncio.to_thread(self.library.run_trial, entry_id, {"label": "First check", "overrides": {}},
+                                        1, self._trial_cancel, hidden=True, seconds=self.QUICK_SECONDS, early=True)
+            if self._trial_cancel.is_set():
+                self._set_check(entry_id, status="waiting", detail="paused — a game was started")
+                self._soon(self._check_later(entry_id))
+                return None
+            took = int(time.monotonic() - started)
+            if r["outcome"] == "ran" and (not r.get("stuck") or r.get("picture") in (None, "unknown", "moving")):
+                detail = r["detail"] + (f" (after: {'; '.join(fixed)})" if fixed else "")
+                self._set_check(entry_id, status="fixed" if fixed else "ready", detail=detail, seconds=took,
+                                picture=r.get("picture_file"))
+                self.emit("notify", ("Checked: ready to play", f"{e.title} was started once, out of sight: "
+                                     f"{detail}."))
+                return {"status": "ready"}
+            # it failed: one quick read of that start — a common cause with strong evidence is set right away
+            ev = self.library.trial_evidence.get(entry_id, {}).get(1)
+            guess = await self._quick_cause(entry_id, ev) if ev else None
+            took = int(time.monotonic() - started)
+            if guess is not None:
+                title, why = guess
+                self._set_check(entry_id, status="fixed", detail=f"{title} — {why} (set without a second test: "
+                                f"start it to see; Fix my game checks in depth)", seconds=took)
+                self.emit("notify", (f"{e.title}: fixed before its first start", f"Its first start failed "
+                                     f"({r['detail']}). Common cause found and set: {title}."))
+                return {"status": "fixed", "kept": title}
+            self._set_check(entry_id, status="problem", detail=r["detail"] + " — press Fix my game for a full check",
+                            seconds=took)
+            self.emit("notify", (f"{e.title}: its first start failed", f"{r['detail'][:200]}. Diagnose → Fix my game "
+                                 "looks into it in depth."))
+            return {"status": "problem"}
+        except Exception as exc:
+            log.exception("checking the new game failed")
+            self._set_check(entry_id, status="error", detail=str(exc)[:200])
+            return None
+        finally:
+            guard.cancel()
+            self._investigating = False
+
+    QUICK_SECONDS = 25                   # the new-game check's one start (it ends at the menu, or on a failure)
+    QUICK_KINDS = ("enable_fix", "set_overrides", "proton", "set_executable")   # quick to set, quick to undo
+
+    async def _quick_static_fixes(self, entry_id: int) -> list[str]:
+        """Common problems seen without starting the game (the game's own loader DLLs Wine would replace, a Proton
+        without a DLL the game imports, the wrong executable): set when the evidence is strong."""
+        d = await asyncio.to_thread(self.library.diagnose, entry_id, None, False)
+        done = []
+        for f in d["findings"]:
+            fx = f.get("fix") or {}
+            if f["confidence"] >= 0.85 and fx.get("kind") in self.QUICK_KINDS and len(done) < 2:
+                try:
+                    await self.apply_fix(entry_id, fx["kind"], fx["value"])
+                    done.append(fx.get("label") if fx.get("label") not in (None, "Apply") else f["title"])
+                except Exception as exc:
+                    log.info("quick fix %s not set: %s", fx.get("kind"), exc)
+        return done
+
+    async def _quick_cause(self, entry_id: int, ev: dict) -> tuple[str, str] | None:
+        """The failed first start, read once: a common cause with strong evidence (a replaced loader, a Proton
+        lacking a DLL, the game's own error naming a setting) is set; anything deeper is left to Fix my game."""
+        from ezgd.library import tracer
+        e = self.library.get(entry_id)
+        cur = self._trace(ev, Path(e.executable))
+        _chain, suspects = tracer.follow(cur, e)
+        suspects += tracer.recall(self._memory_path(), cur, None, e.title, self._shared_records())
+        for sx in sorted(suspects, key=lambda x: -x.confidence):
+            ov = sx.changes(e)
+            if sx.confidence < 0.88 or not ov or ov.get("winetricks") or ov.get("registry") or ov.get("edits"):
+                continue
+            await self.apply_trial(entry_id, ov, sx.gen_id)
+            return sx.title, sx.why
+        return None
+
+    async def new_game_check(self, entry_id: int) -> dict:
+        """The new-game check's state for the Library: waiting | checking | ready | fixed | problem | …"""
+        return self.new_game_checks().get(str(entry_id), {})
+
+    async def _check_later(self, entry_id: int) -> None:
+        await asyncio.sleep(300)
+        await self.check_new_game(entry_id)
+
+    async def _stop_check_when_played(self) -> None:
+        """A game started while a new game is checked: the check stops (it continues later)."""
+        while True:
+            await asyncio.sleep(2)
+            if self.library.running_ids():
+                self._trial_cancel.set()
+                return
+
+    # ------------------------------------------------- other DXVK / VKD3D versions (ezgd.library.dxlayers)
+    async def layer_variants(self, entry_id: int, module: str) -> list[tuple[str, str]]:
+        """The crash is inside a DirectX translation layer: Proton variants of the game's Proton with other
+        versions of that layer — made (downloaded, verified, linked) on first use. [(Proton name, version)]."""
+        from ezgd.downloads.models import DownloadKind, DownloadTask
+        from ezgd.library import dxlayers
+        kind = dxlayers.kind_for_module(module)
+        e = self.library.get(entry_id)
+        proton = self.library._proton_for(e)
+        if kind is None or proton is None or dxlayers.base_of(proton.path) is not None:
+            return []
+        try:
+            res = await self.fetcher.get(dxlayers.releases_url(kind), ttl=12 * 3600, max_bytes=2 * 1024 * 1024,
+                                         headers={"Accept": "application/vnd.github+json"})
+        except Exception as exc:
+            log.info("%s releases unavailable: %s", kind, exc)
+            return []
+        if res.status != 200:
+            return []
+        bundled = dxlayers.bundled_version(proton.path, kind)
+        out = []
+        root = self.paths.data / "dxlayers"
+        root.mkdir(parents=True, exist_ok=True)
+        for rel in dxlayers.pick(dxlayers.parse_releases(kind, res.body), bundled):
+            name = dxlayers.variant_name(proton.name, kind, rel["version"])
+            if any(p.name == name for p in self.library.protons()):
+                out.append((name, rel["version"]))
+                continue
+            try:
+                task = DownloadTask(id=None, kind=DownloadKind.HTTP, title=rel["name"], uri=rel["url"],
+                                    dest_dir=str(self.paths.cache / "dxlayers"), filename=rel["name"],
+                                    expected_checksum=f"sha256:{rel['sha256']}")
+                path = await self.http_engine.run(task, lambda _t: None, lambda _t: None)
+                layer = await asyncio.to_thread(dxlayers.unpack, Path(path), kind, rel["version"], root)
+                Path(path).unlink(missing_ok=True)
+                await asyncio.to_thread(dxlayers.make_variant, proton.path, proton.name, kind, rel["version"], layer,
+                                        self.paths.data / "proton-variants")
+                out.append((name, rel["version"]))
+                log.info("made %s (the game's crash is inside %s)", name, module)
+            except Exception as exc:
+                log.warning("could not prepare %s %s: %s", kind, rel["version"], exc)
+        if out:
+            self.library.protons(refresh=True)
+        return out
+
+    async def _layer_suspects(self, entry_id: int, cur) -> list:
+        from ezgd.library import dxlayers, tracer
+        c = cur.crash
+        if c is None or not c.module or dxlayers.kind_for_module(c.module) is None:
+            return []
+        label = dxlayers.KINDS[dxlayers.kind_for_module(c.module)]["label"]
+        out = []
+        for name, version in await self.layer_variants(entry_id, c.module):
+            out.append(tracer.Suspect(f"layer:{name}", f"Use {label} {version}",
+                                      f"The crash is inside {c.module}, part of {label}; another version of it "
+                                      "often starts a game the bundled one crashes in.", 0.55,
+                                      overrides={"proton_version": name}))
+        return out
+
+    async def report_freeze(self, entry_id: int) -> str:
+        """The user says the game froze: keep what its threads are doing, then stop it."""
+        from ezgd.library import crashes
+        pids = await asyncio.to_thread(self.library.game_processes, entry_id)
+        snap = await asyncio.to_thread(crashes.snapshot, pids)
+        self._freezes[entry_id] = {"at": time.time(), "snap": snap, "reported": True}
+        await asyncio.to_thread(self.library.stop, entry_id)
+        return snap.get("verdict") or "Kept what the game was doing."
 
     def _explain_soon(self, entry_id: int, played: int, code) -> None:
         try:
@@ -2462,7 +3412,9 @@ class AppCore:
 
     async def steam_open(self, url: str) -> None:
         """A steam:// link (join a lobby, accept an invite) handed to Steam inside the client — no window."""
-        from ezgd.platform.steambridge import BridgeError
+        from ezgd.platform.steambridge import BridgeError, allowed_url
+        if not allowed_url(url):
+            raise ValueError("Only Steam's join, chat and profile links are opened.")
         try:
             await self._bridge().open_url(url)
         except BridgeError:
@@ -2811,8 +3763,11 @@ class AppCore:
             prefix = dir_size(pfx) if pfx.exists() else 0
             sf = self.library.save_folder(e)
             saves = dir_size(sf) if sf.exists() else 0
+            sc = self.library.shader_cache_dir(e.id)
+            shaders = dir_size(sc) if sc.exists() else 0
             games.append({"entry_id": e.id, "title": e.title, "files": files, "downloads": dl, "prefix": prefix,
-                          "saves": saves, "total": files + dl + prefix, "install_path": e.install_path,
+                          "saves": saves, "shaders": shaders, "total": files + dl + prefix + shaders,
+                          "install_path": e.install_path,
                           "source": e.source, "running": self.library.is_running(e.id)})
         games.sort(key=lambda g: -g["total"])
         old_prefixes = []
@@ -2826,6 +3781,13 @@ class AppCore:
                 why = ("an older copy, kept when the prefix was rebuilt or Proton changed" if base in used_prefixes
                        else "its game is no longer in the Library")
                 old_prefixes.append({"path": str(d), "size": dir_size(d), "why": why})
+        shader_root = self.paths.data / "shadercache"
+        if shader_root.is_dir():
+            ids = {f"game-{g['entry_id']}" for g in games}
+            for d in sorted(shader_root.iterdir()):
+                if d.is_dir() and d.name not in ids:
+                    old_prefixes.append({"path": str(d), "size": dir_size(d),
+                                         "why": "built shaders of a game that is no longer in the Library"})
         leftovers = self._leftovers()
         archives = self._leftover_archives()
         cache = self.http_cache.size_bytes() + sum(p.stat().st_size for p in self.paths.covers.glob("*") if p.is_file())
@@ -2859,7 +3821,8 @@ class AppCore:
             for p in paths:
                 r = allowed.get(p)
                 d = Path(p)
-                if r is None or not is_within(d, self.paths.prefixes) or d.resolve() == self.paths.prefixes.resolve():
+                roots = (self.paths.prefixes, self.paths.data / "shadercache")   # (and unused built shaders)
+                if r is None or not any(is_within(d, root) and d.resolve() != root.resolve() for root in roots):
                     failed.append({"path": p, "why": "not an unused prefix"})
                     continue
                 shutil.rmtree(d, ignore_errors=True)

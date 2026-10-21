@@ -55,17 +55,17 @@ Built with Python 3.12, PySide6 (Qt 6), SQLite, httpx, Beautiful Soup and libtor
 | **Settings** | *Find a setting* search box; folders, queue, torrent network & bandwidth, extraction, sources on/off, cache TTL & clearing, logs, accent colour / contrast / card size / reduced motion, notifications, database backup & restore. |
 | **Runs on Linux?** | Every card, couch tile and game page shows how well the game runs under Proton — "Linux 92%" = 92 % of ProtonDB players' reports say it works (offline index; game pages add ProtonDB's own tier). |
 | **Organise** | Favourites (always on top), collections, hiding, and the order of the Library (recently played, A–Z, recently added, most played) — on the desktop and in couch mode. |
-| **Quick menu** | Hold the PS / Xbox / Steam button while playing (couch mode open): a panel slides in over the game — back to the game, **switch game** (the one you were playing is *suspended*: frozen, using no processor or graphics time, and it continues exactly where you left it), go to couch mode (suspending the game), the game's own volume, its settings, quit (press twice). Suspended games show in couch mode and the menu; A continues them. Only games the app runs — directly or through Steam for its overlay; a game started in Steam itself is never touched. Leaving couch mode or quitting the app lets every suspended game run again. |
+| **Quick menu** | Hold the PS / Xbox / Steam button while playing (couch mode open): a panel slides in over the game — back to the game, **switch game** (the one you were playing is *suspended*: frozen, using no processor or graphics time, and it continues exactly where you left it), go to couch mode (suspending the game), the game's own volume, its settings, quit (press twice). Suspended games show in couch mode and the menu; A continues them. Only games the app runs — directly or through Steam for its overlay; a game started in Steam itself is never touched. Over a game started from the desktop window the menu works the same, but couch mode never takes over by itself: quitting the game there (or the game ending) goes back to the desktop window, *Game settings* shows couch mode's settings screen only until you go back to the game, and only *Go to couch mode* opens couch mode. Leaving couch mode or quitting the app lets every suspended game run again. |
 | **Screens & controllers** | Couch mode reads each monitor's real resolution from the desktop (KDE's kscreen-doctor, GNOME's Mutter, xrandr) — a 4K monitor at 150 % is 3840 × 2160, not the 5120 × 2880 Qt can report. On Wayland a full-screen window's size is the compositor's answer: couch mode never leaves full screen to "fix" it (that shrank it to 800 × 500 on some desktops); on Wayland *Borderless* is full screen (the same picture — and the only window the compositor always sizes to the monitor), and the desktop window comes back from couch mode the size it was (some KDE versions handed it couch mode's full-screen size) — KWin is asked to size it, and the log records the compositor and every size it sent for the first seconds ("couch display trace"). Interface size up to 200 % fits every page (on a 1440-high window 200 % is about 180 %, the most that fits). "Keep above" is for couch mode only and is released from every window when it closes. A Steam Deck / Steam Controller shows its own buttons (LB/RB on the original controller, L1/R1 on the Deck and the new one), also when Steam hands it to the app as keyboard and mouse: which key is which button is read from the Desktop Configuration Steam itself loaded (named in Steam's controller log — Steam's defaults, or the user's own), so every button means what its prompt says, and prompts for buttons Steam turns into mouse clicks are left out. The Steam button is read from Steam's log too: outside a game a tap goes Home and Big Picture is put away at once; over a game with Steam's overlay a **tap** is Steam's (its overlay — friends, invites, the game's own *Invite* buttons) and a **hold** opens the quick menu (Steam skips long holds); over a game without the overlay a tap opens the quick menu. The first time the quick menu opens this way it says so, and the "Starting…" screen does too. With **Our overlay instead of Steam's** (Settings → Library & launching, and couch mode's Settings → Playing) games start without Steam's overlay and the button — tap or hold — always opens the quick menu, which sits in the middle between you and Steam: your Steam chats are in it (unread counts, the conversation, replies typed on the on-screen keyboard), **Invite** is one press (Steam's own *Invite to Game* — lobby or connect string; invites that keep coming to the same friend wait out a cool-down that doubles each time, from 15 s up to 5 minutes, while an invite a minute after the last is never held up), a friend's invite shows as **Join <name>** at the top of the menu, and joining goes through Steam — no Steam window opens. The friends list then comes from the Steam client itself too — live, without a Steam Web API key: in a game first (green ring), then online (blue; away / snooze dimmer), then offline (grey), like Steam; **X / △** (or typing a name) finds a friend, B shows everyone again. It talks to the Steam client itself, like Decky Loader: off by default; the first time it is switched on, two lines say what it does, Steam's debugging interface is switched on (`<Steam>/.cef-enable-remote-debugging`) and Steam restarts once (never while a game runs); switching it off removes that again (`ezgd/platform/steambridge.py`). A game's own *Invite* button needs Steam's overlay, so it does nothing with this on. (0.5.3 left the overlay out while a Valve controller was connected — that also stopped in-game invites.) Without Steam, a thumb resting on the left trackpad no longer scrolls. The on-screen keyboard has the same shortcuts on every controller, drawn along its bottom in that controller's own buttons: **B** (○) Backspace — on an empty box it closes —, **X / Y** (□ / △) Space, **Start** (Options / Menu) Enter; a Steam controller sent as keys types with A (its Enter) instead of finishing at once, and a held button presses once (only moving and Backspace repeat). The clock shows 12-hour time. Couch mode and the desktop stay in step: settings changed on either side show on the other at once, couch mode opens on the game selected on the desktop and the desktop selects the game couch mode was on, suspended games show on the desktop (Resume / Stop, and More → Suspend there too). |
 | **Couch mode = desktop** | Everything the desktop Library does, by controller: **Finish setup** (a checklist from download to Play, one button for the next step — unpack, the repack's installer, the base game in Steam, the game's program), every fix, Run with, Steam App ID, DLL overrides, winecfg / Winetricks / reset prefix, *See what's wrong* (the debugging assistant's findings with their fixes), collections, rename, update check, repack check, add to Steam, remove from the Library, delete a save backup; and in Settings → Library: check every game for updates, Storage, clean up leftovers, import a game folder. Fix my game's test starts can be stopped (B / *Stop testing*). |
-| **Steam friends** | The quick menu's *Friends* and couch mode's *Friends* tab: who is online, away or playing, and what — live from Steam's Web API with your own key (Settings → Library & launching → Steam friends; made once at steamcommunity.com/dev/apikey, kept on this computer and sent only to api.steampowered.com, never logged). Without a key, or with a private friends list, the friends Steam keeps on this computer are shown. A friend: **Chat** (Steam's chat window comes up), **Invite to <your game>** (while Steam shows you in a game — or, without a key, while one of the app's games is played: Steam has no link or API that sends an invite, so it opens Steam's chat with them and says to choose *Invite to Game* in the menu by their name; the game is named as in your Library, not Steam's "Spacewar" for OnlineFix games), **Join their game** (when they are in a joinable lobby or server — Steam starts it), **Play** the game they play (through Steam) and their **Steam profile**. |
+| **Steam friends** | The quick menu's *Friends* and couch mode's *Friends* tab: who is online, away or playing, and what — live from Steam's Web API with your own key (Settings → Library & launching → Steam friends; made once at steamcommunity.com/dev/apikey, kept on this computer and sent only to api.steampowered.com, never logged). Without a key, or with a private friends list, the friends Steam keeps on this computer are shown; with *Our overlay instead of Steam's* on, the list comes live from the Steam client itself (see *Screens & controllers*). A friend: **Chat** (Steam's chat window comes up), **Invite to <your game>** (while Steam shows you in a game — or, without a key, while one of the app's games is played: Steam has no link or API that sends an invite, so it opens Steam's chat with them and says to choose *Invite to Game* in the menu by their name; the game is named as in your Library, not Steam's "Spacewar" for OnlineFix games), **Join their game** (when they are in a joinable lobby or server — Steam starts it), **Play** the game they play (through Steam) and their **Steam profile**. |
 | **Game settings (couch)** | Manage → Game settings, or from the quick menu: Proton version, Steam overlay, launch options (on-screen keyboard with symbols and capitals), FPS limit (DirectX games), MangoHud, GameMode — from the game's next start. |
 | **GPU acceleration** | One switch (Settings → Interface, and couch mode's Settings → App), *recommended*, off by default. Couch mode is then drawn by the graphics card (OpenGL, the same picture; ~4× faster frames at 4K) from the next time it opens; after a restart the in-app browser draws pages and decodes video on it (desktop windows are not composed through OpenGL: on Wayland that drew menus garbled). Off, the processor does everything — one switch (the separate "frames through the graphics card" switch is part of it now). If OpenGL does not start, couch mode reopens drawn by the CPU and says so; if a start with it never reaches the window, the next start leaves it out. |
 | **Quick ways in** | Drop a `.torrent`, a magnet / download link, a game folder or an archive on the window; a magnet link on the clipboard is offered as a download; tray menu, progress on the taskbar icon, *Keep downloading in the tray* when closing; the app reopens where you left it (page, All Games filters, selected game). **Pin to the taskbar**: the app writes its own launcher (`~/.local/share/applications/ezgd.desktop`, pointing at wherever the app is, rewritten at every start) with the icon the window shows, in your accent colour — the pinned icon looks the same open or closed (a launcher from install.sh or a package is left alone). |
 
 ## Source integration notes (verified)
 
-Both sites were inspected live on **2026-10-09** before the adapters were written.
+The sites were inspected live before the adapters were written (OnlineFix and SteamRIP on **2026-10-09**).
 The parsers are tested against trimmed copies of the real pages
 (`tests/fixtures/`) and against the live sites (`pytest -m live`).
 
@@ -362,6 +362,28 @@ carries it into its container — and Steam's Vulkan layer, `ENABLE_VK_LAYER_VAL
 shows the friends list and Shift+Tab may not reopen it; once the game's shortcut is in Steam, its game id is passed
 too. Both can be switched off; *Fixes → Turn off the Steam overlay for this game* keeps it out of one game.
 
+### Controllers and the screen while playing
+
+**Controllers act as a gamepad, not as Steam's desktop mouse.** While Steam runs it drives the controllers it supports
+(always Valve's — Steam Controller, Steam Deck — and PlayStation / Xbox / Switch pads with Steam Input on) with its
+*desktop layout* (stick or trackpad = mouse, buttons = keys) until it knows a game is running. It knows the games it
+starts and the ones that sign in to it (OnlineFix games, as Spacewar 480) — never a game this app starts that does not
+talk to Steam: emulators (a friend's Bloodborne, shadPS4 from SteamRIP: "the mouse was moving with the controller"),
+most repacks. For those the app sends Steam `steam://forceinputappid/480` when the game starts — Spacewar's layout,
+the one OnlineFix games already get (Steam's gamepad template unless changed in Steam → Spacewar → Controller
+layout) — and `steam://forceinputappid/0` when the last such game ends, so Steam chooses again. Whether Steam took it
+is read back from Steam's `logs/controller.txt` ("Queueing activation for controller: 0 app: 480") and written to the
+game's log (`ezgd:steam-input …`). A layout still forced when the app quits — or left by a crash — is handed back
+(at the next start). Off: *Settings → Library & launching*; games with *Without Steam Input* are left alone
+(`ezgd/platform/steaminput.py`).
+
+**The screen stays on.** A controller is not activity to the desktop: KDE and GNOME dim and lock after their idle time
+while you play with one (Steam only prevents it for games it starts). While one of the app's games runs — not while it
+is suspended from the quick menu, not for hidden test starts — and while couch mode is open, the app holds an idle
+inhibitor (`systemd-inhibit --what=idle`, listed by KDE as "EZ Game Downloader: <game> is running"); it ends with the
+game, and the system drops it if the app quits or crashes (`ezgd/platform/awake.py`). Off: *Settings → Library &
+launching*.
+
 ### Uninstall
 
 Library → a game → *Uninstall…* (on the Files card or in the ⋯ menu) lists everything that belongs to the game,
@@ -399,9 +421,8 @@ focused game's artwork fills the background, with its playtime, a big **Play** a
   Steam does not know are hidden too. *Settings → Store* switches it off.
 * **Playing:** A starts the game the way Play does (the same confirmation, Proton setup and fixes). Couch mode
   steps aside while you play and comes back when the game ends ("Welcome back"). It never restarts Steam.
-* **Quit from the controller:** hold the PS / Xbox / Steam button (1.6 s) while playing a game started from couch
-  mode: couch mode comes to the front and asks *Quit <game>?* (*Keep playing* is focused; *Quit game* stops it
-  completely, like the ✕). Games started from the desktop are never touched.
+* **Quit from the controller:** hold the PS / Xbox / Steam button while playing to open the quick menu; its *Quit*
+  (press twice) stops the game completely, like the ✕. Only games the app runs are touched.
 * **Organise:** X (Manage) on a game: ★ favourite (favourites come first), hide it, and the Library's order.
 * **The ✕** (top right; B on the home shelf jumps to it): leaves couch mode and brings the normal window back. If a
   game you started from couch mode is still running it asks *Quit <game>?* first, then closes that game
@@ -495,8 +516,16 @@ starts the new version (if the swap fails, the old version is put back and start
 next to the app until the new one has run for a minute. Only packaged builds update themselves (Linux; on Windows
 the release page has the download).
 
+**Signed releases.** The checksum only proves the download is the file on the release page — not who put it there:
+whoever got hold of the GitHub account or a token could publish a "new version" that every copy installs by itself.
+So every release file is also signed (Ed25519) over its SHA-256, version and name with a private key that never leaves
+the developer's computer (`~/.local/share/ezgd-release-signing/ed25519.key` — back it up; not in the repository), and
+the app installs nothing whose `<file>.sig` does not verify against the public key it carries
+(`ezgd/core/release_keys.py`). A signature of one version cannot be passed off as another.
+
 Publishing a release: bump `__version__` in `ezgd/__init__.py`, then
-`packaging/build_linux.sh && packaging/publish_github.sh owner/name` (needs `gh auth login`).
+`packaging/build_linux.sh && packaging/publish_github.sh owner/name` (needs `gh auth login`; it signs with
+`packaging/sign_release.py`, made once with `--init`).
 
 ### Your own sites
 
@@ -513,12 +542,6 @@ and DODI (API switched off) are refused with their reasons. Added sites can be s
 
 ### Debugging assistant (Diagnose)
 
-*Learning on this computer:* every fix the assistant applies is followed up by the game's next start. A fix that
-did not help a game ranks lower for it next time ("✗ You tried this for this game before"); one that fixed other
-games — especially with the same engine or from the same source — ranks higher ("✓ This fixed 2 other games like
-this one").
-
-
 Library → a game → **Diagnose** explains why a game does not run, from evidence: the app's log of the last run
 (exit code and run time, Wine/Proton output), the engine's own log (Unity `Player.log`, Unreal `Saved/Logs`,
 Godot), crash markers, the game's files and the system (64/32-bit Vulkan drivers). *Run a diagnostic launch*
@@ -531,6 +554,11 @@ exits at once → the real game executable; the release's own checks (OnlineFix 
 renderer). It says plainly when a cause has **no fix under Proton** (anti-cheat, a CPU instruction the CPU
 lacks, an old crack patching Windows code — the Black Ops II case) and when **nothing** in the logs matches,
 instead of guessing.
+
+*Learning on this computer:* every fix the assistant applies is followed up by the game's next start. A fix that
+did not help a game ranks lower for it next time ("✗ You tried this for this game before"); one that fixed other
+games — especially with the same engine or from the same source — ranks higher ("✓ This fixed 2 other games like
+this one").
 
 **Error pop-ups are read, not guessed:** every Windows game is started with Wine's `msgbox` channel, so the text of
 any error box it shows ("VCRUNTIME140_1.dll was not found", "DirectX 12 is not supported" …) lands in the game's log.
@@ -581,6 +609,147 @@ answers in one line: *Fixed — kept running with …* or *Not fixed: …because
 outcome; No undoes the kept setup (file repairs stay) and shows the other options. The window shows your real
 fix rate ("fixed for you: 4 of 5 games"). It never resets a prefix, runs admin commands or downloads on its own —
 those stay as buttons (when nothing worked and a newer GE-Proton exists: *Install GE-Proton… and try again*). When no single setup works, it also tests up to three **combinations** of the ones that got furthest (e.g. a different Proton *and* DirectX 11 — some games need both); contradicting pairs (two Proton versions, the same variable or DLL set two ways) are skipped.
+
+**It follows the error, like a person debugging it** (`ezgd/library/tracer.py`). Instead of working through a list,
+Fix my game starts the game once with Wine's detailed logging and reads that run: which process is the game, what it
+loaded and from where, which of the game's own DLLs Wine swapped for its built-in ones (a mod loader, OnlineFix's
+loader), how it ended (the error message, or the crash — the module, the offset, a read of address 0), what it did
+just before, how far it got. From the end backwards it asks *why*, and writes the chain down: *crashed reading
+address 0 in the game → right after Steam's client loaded → the game's own winmm.dll and dwmapi.dll were replaced by
+Wine's → they are OnlineFix's and UE4SS's loaders, so OnlineFix64.dll and UE4SS.dll never loaded*. The suspect it ends
+on is tested in a throw-away copy, with a prediction of what the test must show if it is right (*both DLLs load from
+the game's folder, OnlineFix64.dll and UE4SS.dll load*). If the prediction comes true or the game gets further, the
+change is kept and the **next** error is followed the same way (Expedition 33: loader → OnlineFix's one-time notice →
+main menu); if nothing changes, the next suspect is tested. Only when the trail goes cold does it fall back to testing
+setups. What it kept is saved for real only after the game has run twice; the reasoning of every step is shown in the
+Diagnose window and in the answer.
+
+What it draws on, strongest first:
+* **Its memory of solved failures** (`crash_memory.json` in the data folder): every failure it solves is stored as a
+  fingerprint — where it crashed (module, offset, the game build), which loader DLLs were replaced, the error
+  message, missing DLLs or registry keys, the engine — with the fix. The same failure in any game is tried with that
+  fix first ("the very same crash", "the game's own dwmapi.dll replaced by Wine's, as in Expedition 33"). Changes
+  that did not help a game are remembered too and not tested on it again.
+* **The last run that worked** (`investigations/good-<id>.json`): what that run loaded — the game's own DLLs, OnlineFix,
+  UE4SS, Steam's DLLs — and which Proton build it used. A failing run is compared with it ("then it loaded its own
+  winmm.dll, now Wine's"; "it worked with GE-Proton11-5") — and when "Proton-GE Latest" was updated in place, the build
+  that worked is offered back if it is still installed under its own name. Files that were missing in the run that
+  worked are never blamed.
+* **The run itself** (above).
+* **A closer look** when the trail goes cold: one more run recording every file and registry key the game asks for.
+  What did not exist is worked out from the test copy afterwards (case-insensitively) and only that is kept — "just
+  before it crashed it looked for `Config\Engine.ini` and `HKLM\Software\Vendor\Game`", with the files every big
+  game probes (caches, locale data, crash reporters, GPU vendor probes) left out. A missing key that a `.reg` file of
+  the release creates becomes the next test (imported into the copy; into the real prefix once it worked). (Wine's own
+  "file not found" warnings cannot be used: with GE-Proton they pile up unterminated until Wine aborts.)
+* **Games that just quit** — no crash, no error, often exit code 0 or 1 — were the weakest case. Now: every log file the
+  game wrote during the run, whatever its engine (Source's console.log, Godot's, Ren'Py's traceback.txt, CryEngine's
+  Game.log, Unity's Player.log, a launcher's error.log …, in its folder and its Windows user folders; text files only,
+  installers' logs left out) is read, and its last error-like lines are quoted when the run failed (lines a run that
+  worked also had are not); what Steam's API said when it refused ("[S_API FAIL] SteamAPI_Init() failed", "No appID
+  found", "Steam must be running"); and in the closer look, **who ended the game** — Wine traces just the calls that
+  end a process or start another (`ExitProcess`, `TerminateProcess`, `CreateProcess`, `ShellExecute`), in the test
+  copy only, with the address they came from: "steam_api64.dll ended the game — it called ExitProcess(1): Steam's
+  API ends a game when Steam is not running for it…", "OnlineFix64.dll ended it", "Game.exe tried to start
+  …\Real-Win64-Shipping.exe, and that failed — it is a launcher" (then *Start Real-Win64-Shipping.exe directly* is
+  tested). Verified on Expedition 33: its launcher's `CreateProcessW` of the Unreal executable, the game still at its
+  menu under the trace.
+* **Patience**: a test still starting up after 45 s (shader compiling) gets one 120 s run before it counts as stuck.
+
+A fix that needed several changes is **trimmed**: each change is left out once, and kept only if the game fails without
+it. Every investigation is written to `reports/investigation-<game>-<time>.txt` (the Diagnose window's *Open the
+report*), so the reasoning can be read later.
+
+**Test starts out of sight** (KDE Plasma, `ezgd/platform/hidden.py`; *Settings → Library*): a KWin script loaded
+before a test takes every Proton window that appears (`steam_app_<id>`, `steam_proton`) — transparent first, off the
+taskbar, Alt+Tab and pager, out of full screen — and moves it beyond every monitor, where it is opaque again so the
+game keeps drawing at full speed (Expedition 33 reached its menu as fast as when shown). If the game moves itself back,
+it is made transparent at once and moved away again; if it takes the focus, the window you were using gets it back.
+Its sound is muted (its streams, found by process). A window that is not the test's is put back. Nothing to install:
+KWin, journald, busctl and pactl are part of the desktop; elsewhere tests are shown as before.
+
+**Judged by its picture** (`ezgd/library/picture.py`): the hidden window is photographed (KWin's ScreenShot2
+`CaptureWindow`, through busctl) a few times per test; each picture is checked for black, frozen (no change between
+looks), a menu (Tesseract reads the text — dim text is stretched to full contrast first: Expedition 33's grey
+"PRESS ANY BUTTON" on black is read) or an error the game drew itself. "Kept running 45 s" no longer passes a black
+screen or a frozen loading screen; a menu counts as having reached the game.
+
+**Crashes and freezes while playing** (`ezgd/library/crashes.py`): a test start lasts 45 seconds; a crash 20 minutes
+in only happens while someone plays. Every start records which DLLs were loaded from where (`+loaddll`, a few hundred
+lines), and when a session ends in a crash the app keeps, in `crashes/<id>/<time>/`, the session's log, the game's
+crash dumps (Unreal, Unity, Sentry's `.sentry-native`, Crashpad, Windows' CrashDumps — read by mapping, not loading:
+Sentry writes 1 GB dumps), its engine log and the traced cause, and says so. A game that uses no processor time for a
+minute is probably frozen: what each of its threads is doing is read from Linux itself (`/proc/<pid>/task`: name,
+state, the system call it waits in and on what — Proton's `ntsync` waits, the GPU driver, the disk) and summed up (a
+deadlock, an endless loop, a hang in the graphics driver, a disk stuck in the kernel). *It froze — stop it and keep
+what happened* (Library ⋯ menu, and the quick menu) does the same on request. *Fix my game* then starts from the real
+crash: each idea is checked with a hidden start (the game must still start as well as before), the first is applied
+**on trial**, and your next sessions judge it — played well past the old crash time: kept (and remembered); the same
+crash: undone and the next idea set; quit early: not judged yet.
+
+**New games get a quick check before their first start** (about 30 seconds): after a game is installed — as soon as
+no game is running (a game you start pauses it) — common problems are looked for without starting it (the game's own
+loader DLLs Wine would replace, a Proton without a DLL the game imports, the wrong executable) and strong, easily undone
+fixes are set; then it is started once, out of sight and muted, for at most 25 seconds (done at once when its picture
+shows its menu, or when it fails). If that start fails, one quick read of it may name a common cause that is set
+right away; anything deeper is left to *Fix my game*. The Library shows *Checked: ready to play*, *Fixed …* or
+*Its first start failed — Fix my game*. (Expedition 33: 28 s, and its OnlineFix loader was found before the start.)
+
+**Built shaders are kept** (`LibraryManager.shader_cache_env`): every game started by the app gets its own GPU-driver
+shader cache in the app's data folder (`shadercache/game-<id>`), 20 GB large and never cleaned up by the driver —
+NVIDIA's `__GL_SHADER_DISK_CACHE_*`, Mesa's `MESA_SHADER_CACHE_*` (AMD, Intel), as Steam does for its own games. Before,
+all of them shared the driver's one cache (755 MB on the developer's PC), and its size limit made big games push
+each other's shaders out and build them again on every start. A game's own caches (Unreal's pipeline caches …) live
+in its prefix and move with its saves when it gets another prefix. Storage shows each game's built shaders; uninstall
+removes them; caches of games no longer in the Library are offered for cleanup. (Expedition 33: 49 MB after its first
+start; the second start was at its menu in 40 s.)
+
+**Knowledge between computers**: every solved failure keeps the computer it happened on (`ezgd/platform/machine.py`:
+distro, kernel, desktop, Wayland/X11, GPU vendor, model and driver, CPU model and instruction sets, RAM,
+`vm.max_map_count`, audio server; the machine id hashed). A fix from a different kind of computer counts for less and
+says so ("solved in X on another computer (NVIDIA vs AMD graphics)"); a crash inside one GPU vendor's driver DLL
+(nvapi64, amdxc64 …) is never carried to another vendor's card. Each computer
+shares what it solved with everyone who uses the app (below).
+
+**Everyone's knowledge** (`ezgd/library/crowd.py`, `server/knowledge/`). When a game is fixed, what fixed it is sent to
+the app's server — a Cloudflare Worker with a D1 database — and every copy of the app fetches what everyone solved
+(every 12 hours) and tries those fixes first ("solved in games on 3 other computers"). Settings → *Share what fixed
+which crash with everyone* switches it off (then nothing is sent or used).
+
+* **What is sent:** the kind of failure without the game — exception code, the module it was in (`<game>` for the
+  game's own), which DLLs were replaced or missing, the error-box category — the fix as rebuilt from the allow-list
+  below (free text that could name a game or folder left out) and the GPU vendor. Not sent: game titles, the game's
+  build, registry keys, paths, machine ids, hardware models, the exact setup of a game, anything typed.
+* **Sealed with a new random key for every report:** an X25519 key made for that one report, agreed with the server's
+  public key (HKDF-SHA256 → AES-256-GCM). Only the server can open it — not the network, a proxy or other users.
+* **The server** checks every field against a strict schema, keeps no IP addresses (a salted hash of the network,
+  IPv4 /24, counts confirmations from different places and limits each network to 40 reports an hour), and publishes
+  failure pattern → fix → on how many networks it worked (top 5 fixes per pattern), **signed with Ed25519**. The app
+  uses nothing whose signature does not verify against the key it carries (`ezgd/core/crowd_keys.py`) and checks it
+  again whenever it reads it.
+* **Nobody can make your computer run anything through it**, not even with a poisoned report the server accepted:
+  whatever arrives is rebuilt from an allow-list before it is used (`tracer.clean_record`) — no launch-option lines,
+  no file edits, no per-game setups, game arguments without shell characters, only known Proton options and Fixes
+  switches, DLL overrides with plain names, winetricks verb names, and environment variables from a list of
+  graphics/Proton/audio settings, never ones that load code or name files (`LD_PRELOAD`, `*PATH*`, Vulkan ICDs/layers
+  …). The worst a forged fix can do is be tried, uselessly, in a test copy of a game. A fix confirmed in more places
+  counts for more.
+
+What the app can read, anyone who has the app can read: the published knowledge is public by design — which is why it
+holds nothing about anyone. The reports themselves only the server can read.
+
+**Running the server** (free tier: 100,000 reports a day): `cd server/knowledge && npm install`, `npx wrangler login`,
+`npx wrangler d1 create ezgd-knowledge` (put the printed id into `wrangler.toml`), `../../.venv/bin/python make_keys.py`
+(writes the public keys into `ezgd/core/crowd_keys.py`; the private ones go to
+`~/.local/share/ezgd-crowd-keys/secrets.json` — back it up), `../../.venv/bin/python make_keys.py --put` (hands them to
+Cloudflare as secrets), `npx wrangler deploy`, then put the worker's URL into `SERVER` in `ezgd/core/crowd_keys.py` and
+release. `npm run dev` runs it locally (test keys in `.dev.vars`, never the real ones).
+
+**Other DXVK / VKD3D-Proton versions** (`ezgd/library/dxlayers.py`): when the crash is inside the DirectX translation
+layer (d3d11/dxgi → DXVK, d3d12/d3d12core → VKD3D-Proton), versions around the bundled one are tested. Proton copies its
+own layer into the prefix on every start, so the app makes a **Proton variant** instead — a folder that mirrors the
+game's Proton through links with only that layer swapped (verified against GitHub's SHA-256), e.g. *Proton-GE Latest +
+VKD3D-Proton 3.0.1*; it shares the game's prefix and leaves the real Proton untouched.
 
 **Release repair.** *Integrity*: every archive the game was extracted from is compared with the installed files
 (the archive's own file list and sizes; later fix archives win; settings/save files and files the release's own
@@ -729,6 +898,28 @@ started. Not every Windows game works under Proton (anti-cheat, some launchers).
   security settings are changed.
 * **Privacy/logs**: no cookies, accounts or passwords are stored. The one exception you choose yourself: a Steam Web API key (Steam friends) — stored in the local settings database, sent only to api.steampowered.com, kept out of the logs. Logs strip
   query strings, URL credentials and magnet trackers. Problem reports are local text files.
+* **Archive tools**: 7-Zip and UnRAR get `--` before the archive, so a member named like a switch (`-spf`, `@list`)
+  stays a name when a repair passes member names to them.
+* **App updates**: installed only with a valid Ed25519 signature from the developer's release key (see *App updates*)
+  — a stolen GitHub account cannot ship an update.
+* **Other people's input**: everyone's crash knowledge is signed by the server and rebuilt from an allow-list (no
+  launch lines, file edits or code-loading variables — see *Everyone's knowledge*); ProtonDB launch lines are reduced
+  to safe parts and lose code-loading variables (`LD_PRELOAD`, `*PATH*`, Vulkan ICDs/layers). Steam chat invites only
+  offer *Join* when their connect string is a plain `+connect` / `+connect_lobby` / `-join` form (a friend's
+  message cannot start a game with `+exec` or `-game`), friends' server addresses must be addresses, and only Steam's
+  join, chat and profile links are ever handed to Steam.
+* **The synced save folder** is not trusted (anyone with access to it, and sync tools carry symlinks): nothing is
+  read or written through a link, writes go to a fresh random name first, sizes are capped, and each computer marks
+  its own backups with a key only it has — only those are ever pruned, so fake "newer" backups cannot get real ones
+  deleted. Restores stay inside the game's prefix (`users/…`) and refuse zip bombs.
+* **Local**: the app's single-instance socket only accepts its own user and only ever means "show the window". The
+  in-app browser keeps Chromium's sandbox (seccomp + its own user namespace — checked), denies camera, location and
+  notifications, and blocks program downloads.
+* **What remains**: the games themselves run as you, with your files visible through Wine's `Z:` drive — a malicious
+  release is the biggest risk, as with any launcher; download from sources you trust. *Our overlay* switches on
+  Steam's debugging port (127.0.0.1:8080; web pages cannot use it — Steam checks the Host header and the session
+  address is secret — but any program on the computer, including a game, could control Steam through it): switch it
+  off when you do not use it (Settings → Library & launching), then restart Steam.
 * **Database**: WAL mode, transactions for every write, integrity check on start
   (a damaged file is moved aside and a fresh one created), backup before every
   migration and on exit, manual backup/restore with validation.
@@ -800,8 +991,8 @@ See **TEST_REPORT.md** for the results of the last run.
   RAR extraction progress is estimated from bytes written.
 * **Add to Steam** writes the shortcut only; choosing the Proton version for it is done
   in Steam (*Properties → Compatibility*). Steam must be closed while adding.
-* **Proton launches** use `proton run` with a per-game prefix outside Steam; titles
-  needing the Steam runtime or Steamworks may require launching via the Steam shortcut.
+* **Proton launches** run outside Steam (Steam Linux Runtime + `proton waitforexitandrun`, one prefix per game);
+  titles needing Steamworks may require launching via the Steam shortcut.
 * Theme changes recolour most widgets live; a restart applies them everywhere.
 * No `.msi`/AppImage installer — PyInstaller folders/zip/tarball only (Linux builds update themselves from GitHub
   releases; see *App updates*).
@@ -827,10 +1018,16 @@ that PC can check:
   is shrunk back is now filled again (at most three times per showing) — look for "shrunk back … filling it again".
   Opening now also activates couch mode *before* checking its size (the order that already stuck when coming back
   from a game). If full screen still will not stay, Settings → Window → *Custom size* at the screen's resolution
-  filled his screen every time in the logs.
+  filled the tester's screen every time in the logs.
 
 * **Joining a friend's invite from the quick menu** (both PCs on this release, Our overlay on). An invite to the
   game being played no longer suspends it first — the suspended game was frozen while Steam handed it the lobby
   (Slay the Spire 2 froze on *Join*). Only an invite to a different game suspends the one being played.
+
+* **Bloodborne (SteamRIP, shadPS4) with the tester's Steam Controller.** Started from the app, the controller should
+  act as a gamepad (no mouse pointer moving) and the screen should not dim. The game's log shows whether Steam took the
+  game layout: `ezgd:steam-input Steam switched the controller to the game layout` — "no controller switched" means
+  Steam Input never switched (look in Steam's `logs/controller.txt`); "did not take" names what Steam used instead.
+  Checked on the developer's PC without a controller: Steam accepts the link (`ExecuteSteamURL` in console_log.txt).
 
 (The developer's PC had *Steam overlay in games* switched off, so in-game invite buttons could not work; it is on now.)

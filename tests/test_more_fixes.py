@@ -113,3 +113,53 @@ def test_trial_installs_into_the_copy_and_keep_installs_for_real(tmp_path, monke
         "kind": "winetricks", "value": "dotnet48", "label": "Install .NET"}}], [])
     assert not any("winetricks" in c["overrides"] for c in cands)        # far too slow for a test run
     _ = json
+
+
+def test_dotnet_winetricks_clears_protons_claim_and_dead_links_first(tmp_path):
+    """Proton prefixes claim .NET 4.8.1 is installed (Wine Mono) — Microsoft's installer then quit at "Same or higher
+    version … already installed" and winetricks failed on Proton-CachyOS's dead ngen.exe link (game-24, dotnet48)."""
+    import os
+    import subprocess
+    from ezgd.platform.proton import winetricks_command
+    fw = tmp_path / "pfx" / "drive_c" / "windows" / "Microsoft.NET" / "Framework" / "v4.0.30319"
+    fw.mkdir(parents=True)
+    (fw / "real.dll").write_bytes(b"x")
+    (fw / "fusion.dll").symlink_to(fw / "real.dll")
+    (fw / "ngen.exe").symlink_to(tmp_path / "proton" / "ngen.exe")              # Proton does not ship it
+    assert winetricks_command("/usr/bin/winetricks", ["vcrun2022"], tmp_path) == ["/usr/bin/winetricks", "-q",
+                                                                                  "vcrun2022"]
+    assert not (fw / "ngen.exe").is_symlink() and (fw / "fusion.dll").is_symlink()   # only dead links go
+    cmd = winetricks_command("/usr/bin/winetricks", ["d3dx9", "dotnet48"], tmp_path)
+    # the command really runs: a fake wine records the keys it deletes, then winetricks gets its verbs
+    fake = tmp_path / "wine"
+    fake.write_text('#!/bin/sh\necho "wine $*" >> "$OUT"\n')
+    fake.chmod(0o755)
+    out = tmp_path / "out.txt"
+    cmd[cmd.index("/usr/bin/winetricks")] = "echo"
+    subprocess.run(cmd, check=True, env=dict(os.environ, WINE=str(fake), OUT=str(out)), stdout=open(out, "a"))
+    lines = out.read_text().splitlines()
+    assert 'wine reg delete HKLM\\Software\\Wow6432Node\\Microsoft\\NET Framework Setup\\NDP\\v4 /f' in lines
+    assert 'wine reg delete HKLM\\Software\\Microsoft\\NET Framework Setup\\NDP\\v4 /f' in lines
+    assert lines[-1] == "-q d3dx9 dotnet48"
+
+
+def test_dotnet_is_refused_with_a_proton_that_has_no_dotnet_parts(tmp_path):
+    """Proton-CachyOS 11.0-20260703 ships no fusion.dll / mscorwks.dll / ngen.exe: Microsoft's .NET installer fails
+    with error 1603 there, while GE-Proton installs it into the same prefix."""
+    from ezgd.library.manager import LibraryManager
+    from ezgd.platform.steam import ProtonInstall
+
+    def proton(name, dlls):
+        d = tmp_path / name / "files" / "lib" / "wine" / "i386-windows"
+        d.mkdir(parents=True)
+        for n in dlls:
+            (d / n).write_bytes(b"MZ")
+        return ProtonInstall(name, tmp_path / name)
+
+    cachy = proton("Proton-CachyOS", ["kernel32.dll", "mscoree.dll"])
+    ge = proton("GE-Proton", ["kernel32.dll", "mscoree.dll", "fusion.dll"])
+    lib = SimpleNamespace(protons=lambda: [cachy, ge])
+    why = LibraryManager._dotnet_blocker(lib, cachy, ["d3dx9", "dotnet48"])
+    assert "Proton-CachyOS does not include Wine's .NET parts" in why and "switch this game to GE-Proton" in why
+    assert LibraryManager._dotnet_blocker(lib, cachy, ["vcrun2022"]) is None       # only .NET needs them
+    assert LibraryManager._dotnet_blocker(lib, ge, ["dotnet48"]) is None

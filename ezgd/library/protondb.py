@@ -29,6 +29,7 @@ _SAFE_WRAPPERS = {"gamemoderun", "mangohud", "game-performance", "obs-gamecaptur
 _ENV = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}=[A-Za-z0-9_.,:=/+@%\-]{0,200}$")
 _ARG = re.compile(r"^[-+/]?[A-Za-z0-9_.,:=/+@%\-]{1,120}$")
 _SHELL = re.compile(r"[;&|`$<>(){}\\\\!*?\[\]~#\n]")
+_ENV_NEVER = re.compile(r"PATH|PRELOAD|ICD|LOADER|DRIVER_FILES|LAYERS$")   # variables that load code
 _LOCK = threading.Lock()
 _CACHE: dict = {}
 
@@ -62,7 +63,7 @@ def sanitize(options: str) -> str | None:
     i = tokens.index("%command%")
     before, after = tokens[:i], tokens[i + 1:]
     for t in before:
-        if not (_ENV.match(t) or t in _SAFE_WRAPPERS):
+        if not (_ENV.match(t) or t in _SAFE_WRAPPERS) or (_ENV.match(t) and _ENV_NEVER.search(t.split("=", 1)[0])):
             return None
     for t in after:
         if not _ARG.match(t):

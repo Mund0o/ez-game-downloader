@@ -480,6 +480,9 @@ class _Couch:
         self.quick = None                        # the quick menu (couch_quick.QuickMenu), made when first opened
         self.background = False                  # made only for the quick menu over a desktop-started game: never
         self.on_promote = None                   #   shown unless asked (then on_promote, and it opens for real)
+        self.on_desktop = None                   # … and back to the desktop app when its game ends or is quit there
+        self._visiting = False                   # shown for a moment from the quick menu (game settings): put away
+        #                                          again when the player goes back to the game
         self._bpm_timer = QTimer(self)           # Steam controller + a game: its Steam button opens the quick menu
         self._bpm_timer.setInterval(1500)
         self._bpm_timer.timeout.connect(self._bpm_tick)
@@ -889,6 +892,8 @@ class _Couch:
             self.running.discard(gid)
             self.suspended.discard(gid)
             self._launch_at.pop(gid, None)
+            if self.background and gid not in self.launched and not (self.quick and self.quick.isVisible()):
+                QTimer.singleShot(400, self, self._dismiss_background)   # (the desktop game ended: nothing to keep)
             if gid in self.launched:
                 self._minimize_timer.stop()
                 played = int(payload.get("played") or 0)
@@ -954,8 +959,8 @@ class _Couch:
     def _come_back(self) -> None:
         if self._exiting:
             return
-        if self.background:                             # the quick menu's "couch mode": open it for real now
-            self._promote()
+        if self.background:                             # the quick menu over a desktop-started game: the game ended
+            self._back_to_desktop()                     # or was quit — back to the desktop app, never couch mode
             return
         _screen, _geo, mode = self.display_target()
         if mode == "fullscreen":
@@ -1036,14 +1041,18 @@ class _Couch:
     # ============================================================== showing
     def open(self, screen=None) -> None:
         self._target_screen = screen or QApplication.primaryScreen()
+        self._target_name = self._target_screen.name() if self._target_screen is not None else ""
         self._move_tries.clear()
         self._size_tries = 0
         self._refits = 0
         if not self.background:
             from ezgd.ui.display_trace import DisplayTrace
             DisplayTrace(self).start()               # the compositor's answers, in the log (display_trace)
+            if self.actions.settings.get("keep_awake", True):     # a controller is not activity to the desktop
+                from ezgd.platform import awake
+                awake.shared().hold("couch", "Couch mode is open")
         self.place_window(self, self.wc)
-        screen = self.screen() or self._target_screen
+        screen = self.screen() or self._live_target()
         self.raise_()
         self.activateWindow()
         self.setFocus(Qt.ActiveWindowFocusReason)
@@ -1098,6 +1107,7 @@ class _Couch:
     def _screen_changed(self, screen) -> None:
         if screen is not None:
             self._target_screen = screen
+            self._target_name = screen.name()
             screen.geometryChanged.connect(lambda _g: self._fit_screen())
             self._set_pace(screen)
         self._fit_screen()
@@ -1105,13 +1115,32 @@ class _Couch:
     def real_scale(self, screen) -> float:
         return real_scale(screen, self)
 
+    def _live_target(self):
+        """The screen couch mode was opened on — if it still exists. The desktop re-creates a monitor when its mode
+        changes (a game switching resolution, the screen waking up): Qt then deletes the old QScreen, and using it
+        crashed couch mode ("Internal C++ object (QScreen) already deleted", 2026-10-21). The same monitor under its
+        new object is found by name."""
+        import shiboken6
+        old = getattr(self, "_target_screen", None)
+        if old is None:
+            return None
+        screens = QApplication.screens()
+        if shiboken6.isValid(old) and old in screens:
+            return old
+        name = getattr(self, "_target_name", "")
+        found = next((x for x in screens if x.name() == name), None) if name else None
+        if found is None and len(screens) == 1:
+            found = screens[0]                       # (one monitor: it is that one, whatever its name)
+        self._target_screen = found
+        return found
+
     def display_target(self):
         """(screen, rectangle, mode) from the display settings: which screen, full screen / borderless / a custom
         size (given in the screen's real pixels — what people know as their resolution)."""
         st = self.actions.settings
         screens = QApplication.screens()
         name = st.get("couch_screen") or ""
-        screen = next((x for x in screens if x.name() == name), None) or getattr(self, "_target_screen", None) \
+        screen = next((x for x in screens if x.name() == name), None) or self._live_target() \
             or self.screen() or QApplication.primaryScreen()
         mode = st.get("couch_window") or "fullscreen"
         if mode == "borderless" and on_wayland():
@@ -1606,10 +1635,32 @@ class _Couch:
         """Couch mode made in the background for the quick menu becomes the real, full-screen couch mode."""
         self.background = False
         self._opened = True                            # (no intro: it is a step in the middle of playing)
-        cb, self.on_promote = self.on_promote, None
-        if cb is not None:
-            cb()
-        self.open(self._target_screen or QApplication.primaryScreen())
+        if self.on_promote is not None:
+            self.on_promote()
+        self.open(self._live_target() or QApplication.primaryScreen())
+
+    def visit_from_desktop(self) -> None:
+        """Couch mode's screens for a moment (game settings from the quick menu of a desktop-started game): shown
+        now, put away again when the player goes back to the game."""
+        self._visiting = True
+        self._promote()
+
+    def _end_visit(self, game_gone: bool = False) -> None:
+        self._visiting = False
+        self.background = True
+        self.wc.keep_above(False)
+        self.hide()
+        if self.on_desktop is not None:
+            self.on_desktop(game_gone)                  # (back to the game: the desktop app stays behind it)
+
+    def _back_to_desktop(self) -> None:
+        """The game of a desktop start ended (or was quit from the quick menu): the desktop app is where the player
+        came from. The hidden couch mode stays only while it holds a suspended game (closing it continues those)."""
+        if self._visiting:
+            self._end_visit(game_gone=True)
+        elif self.on_desktop is not None:
+            self.on_desktop(True)
+        QTimer.singleShot(400, self, self._dismiss_background)
 
     def _dismiss_background(self) -> None:
         """Back to the game from the quick menu of a desktop-started game: the hidden couch mode goes again (not
@@ -2029,6 +2080,8 @@ class _Couch:
         if self.stack:
             self.stack.pop()
             self.drop_layers("gameinfo")                # a game page's text column is big (12 MB at 4K)
+        if self._visiting and not self.stack:          # the visit is over (going back to the game ends it too)
+            QTimer.singleShot(0, self, lambda: self._back_to_desktop() if self._visiting and not self.stack else None)
         self.zone = "main"
         self.refresh_bg()
         self.update()
@@ -3167,6 +3220,8 @@ class _Couch:
 
         def front(_r=None) -> None:
             self.suspended.discard(e.id)
+            if self._visiting:
+                self._end_visit()
             if self.background:
                 QTimer.singleShot(400, self, self._dismiss_background)
             elif not self._exiting:
@@ -3223,7 +3278,7 @@ class _Couch:
             if i not in failed:
                 self.running.discard(i)
                 self.launched.discard(i)
-        if not failed:
+        if not failed and not self.background:
             self.overlay = None
             if then_exit:
                 self._finish_exit(close_starting=True)
@@ -3235,7 +3290,16 @@ class _Couch:
         left = sorted({p for i in failed for p in (results.get(i) or {}).get("left", [])})
         why = "it is still closing after 45 seconds" if timed_out else \
             (f"process{'es' if len(left) != 1 else ''} {', '.join(map(str, left[:6]))} would not stop" if left
-             else (results.get(failed[0]) or {}).get("error") or "it did not stop")
+             else (results.get(failed[0]) or {}).get("error") or "it did not stop") if failed else ""
+        if self.background:                              # quit from the quick menu of a desktop start: the desktop
+            self.overlay = None                          # app says how it went (this couch mode is never shown)
+            if failed:
+                self.actions.toasts.show(f"{names} could not be closed completely", f"{why[0].upper()}{why[1:]}.",
+                                         "error")
+            else:
+                self.actions.toasts.show("Game closed", "", "success")
+            self._back_to_desktop()
+            return
         buttons = [("Try again", lambda: self._stop(failed, then_exit), "danger")]
         if then_exit:
             buttons.append(("Leave anyway", self._finish_exit, "ghost"))
@@ -3270,6 +3334,8 @@ class _Couch:
 
     def _shutdown(self) -> None:
         self.sounds.stop()
+        from ezgd.platform import awake
+        awake.shared().release("couch")
         if self.quick is not None:
             self.quick.hide()
             self.quick.deleteLater()
@@ -3279,6 +3345,7 @@ class _Couch:
         if self.browser is not None and self.browser.active:
             browser, self.browser = self.browser, None
             browser.active = False                       # leaving couch mode closes its browser too
+            browser._tick.stop()                         # (the window outlives couch mode: no more stick steps)
             browser.overlay.hide()
             browser.dlg.close()                          # (a download keeps going: the window only hides)
         for t in (self._tick, self._clock, self._poll, self._minimize_timer, self._pump, self._idle_away,

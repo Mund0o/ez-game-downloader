@@ -83,6 +83,7 @@ class PostProcessor:
         self._sets_extracting: set[tuple[int, str]] = set()     # multi-part sets being extracted
         self.created = created                                  # CreatedPathsRepository (what the app made)
         self.choose_executable = None        # LibraryManager.auto_executable: Play works right after extracting
+        self.on_ready = None                 # (entry id) a game is installed and has its executable: checked next
         self.before_update = None            # LibraryManager.backup_saves: saves are zipped before an update
         self.resumable: list[dict] = []      # extractions the app was closed during (finished on the next start)
 
@@ -447,6 +448,11 @@ class PostProcessor:
             self.emit("notify", ("Ready to play", f"{entry.title} is installed — press Play in your Library. "
                                                   f"(It starts {chosen}; change that with “Choose executable” "
                                                   "if it is not the game.)"))
+            if self.on_ready is not None:
+                try:
+                    self.on_ready(entry.id)
+                except Exception:
+                    log.exception("the new-game check could not be scheduled")
         else:
             self.emit("notify", ("Extraction finished", f"{entry.title} is ready — choose its executable in Library."))
         return True

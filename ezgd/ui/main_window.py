@@ -713,6 +713,7 @@ class MainWindow(QMainWindow):
         couch._target_screen = self.screen() or QApplication.primaryScreen()
         couch.resize(couch._target_screen.geometry().size())   # (never shown: sizes the menu and its prompts)
         couch.on_promote = self._background_couch_shown
+        couch.on_desktop = self._back_from_quick_menu
         self.couch = couch
         couch.closed.connect(self._couch_closed)
         if hasattr(couch, "gpu_failed"):
@@ -731,6 +732,17 @@ class MainWindow(QMainWindow):
         self._main_toasts = self.toasts
         self.actions.toasts = couch.toasts
         self.hide()
+
+    def _back_from_quick_menu(self, game_gone: bool) -> None:
+        """The quick menu of a game started here is done with couch mode's screens (game settings), or the game ended:
+        this window again — couch mode never takes over from a desktop start unless asked for. Raised only when the
+        game is gone (not over a game the player goes back to)."""
+        self.actions.toasts = getattr(self, "_main_toasts", self.toasts)
+        if not self.isVisible():
+            self.showNormal()
+        if game_gone and not self._quitting:
+            self.raise_()
+            self.activateWindow()
 
     def _couch_gpu_failure(self, why: str) -> None:
         """Couch mode's OpenGL drawing did not start: open it again drawn by the CPU (for the rest of this run)."""

@@ -361,7 +361,7 @@ def _list_rar(path: Path, password: str | None, tool: str | None) -> list[Member
             raise _rar_error(text + res.stderr.decode("utf-8", "replace"), res.returncode)
         return _parse_unrar_technical(text)
     if kind == "7z":
-        res = _run([exe, "l", "-slt", "-ba", f"-p{password or ''}", str(path)])
+        res = _run([exe, "l", "-slt", "-ba", f"-p{password or ''}", "--", str(path)])
         text = res.stdout.decode("utf-8", "replace")
         if res.returncode != 0:
             raise _rar_error(text + res.stderr.decode("utf-8", "replace"), res.returncode)
@@ -537,7 +537,9 @@ def _extract_with_7zip(exe: str, archive: Path, staging: Path, password: str | N
     """Extract with 7-Zip in its own process: fast (C, every core) and it never holds Python's lock, so the app
     stays responsive however big the game is. Encrypted zips are ~40× faster than Python's zipfile."""
     files = names if names is not None and len(names) <= 400 else []    # long lists: extract all, move some
-    cmd = [exe, "x", "-y", "-bso0", "-bsp0", "-snl-", f"-p{password or ''}", f"-o{staging}", str(archive), *files]
+    # "--": member names after it are names, never switches or @lists (a member called "-spf" or "@/etc/x")
+    cmd = [exe, "x", "-y", "-bso0", "-bsp0", "-snl-", f"-p{password or ''}", f"-o{staging}", "--", str(archive),
+           *files]
     flags = subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                             creationflags=flags)
@@ -719,7 +721,7 @@ def _extract_rar(archive: Path, staging: Path, password: str | None, prog: _Prog
         cmd = [exe, "x", "-y", "-o+", "-ol-", "-idq", f"-p{pw}", "--", str(archive), *files, str(staging) + os.sep]
     elif kind == "7z":
         files = names if names is not None and len(names) <= 400 else []
-        cmd = [exe, "x", "-y", "-snl-", f"-p{password or ''}", f"-o{staging}", str(archive), *files]
+        cmd = [exe, "x", "-y", "-snl-", f"-p{password or ''}", f"-o{staging}", "--", str(archive), *files]
     else:
         cmd = [exe, "-xf", str(archive), "-C", str(staging), "--no-same-owner"]
     flags = subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0

@@ -357,6 +357,8 @@ class QuickMenu(QWidget):
                                 extra={"toggle": hud}))
             rows.append(Row("settings", "Game settings", "Proton, FPS limit, launch options — from its next start",
                             action=self.game_settings))
+            rows.append(Row("froze", "It froze — quit it", "Keeps what it was doing, so the cause can be found",
+                            action=self.froze))
             armed = time.monotonic() < self._confirm_quit
             rows.append(Row("quit", "Press again to quit" if armed else "Quit game",
                             "Progress the game has not saved is lost" if armed else "", "danger", action=self.quit))
@@ -871,7 +873,10 @@ class QuickMenu(QWidget):
         g = self.game
 
         def go() -> None:
-            self.couch._come_back()
+            if self.couch.background:                    # asked for: couch mode opens for real
+                self.couch._promote()
+            else:
+                self.couch._come_back()
             if g is not None:
                 self.couch.toasts.show(f"{g.title} is suspended", "A on it continues it right where you were — or "
                                        "hold the guide button.")
@@ -882,7 +887,10 @@ class QuickMenu(QWidget):
         self.couch.sounds.play("select")
 
         def go() -> None:
-            self.couch._come_back()
+            if self.couch.background:                    # a desktop start: couch mode only for these settings
+                self.couch.visit_from_desktop()
+            else:
+                self.couch._come_back()
             self.couch.open_game_settings(g, back_to_game=True)
         self.close_menu(go)
 
@@ -899,8 +907,24 @@ class QuickMenu(QWidget):
         self._confirm_quit = 0.0
 
         def go() -> None:
-            self.couch._come_back()
+            if not self.couch.background:                # (a desktop start: the desktop app, once the game is gone)
+                self.couch._come_back()
             self.couch._stop([g.id], then_exit=False)
+        self.close_menu(go)
+
+    def froze(self) -> None:
+        """The game hangs: what its threads are doing is kept first (ezgd.library.crashes), then it is stopped."""
+        g = self.game
+        if g is None or self.busy:
+            return
+        b = self.couch.bridge
+
+        def go() -> None:
+            if not self.couch.background:
+                self.couch._come_back()
+            b.call(b.core.report_freeze(g.id),
+                   lambda verdict: self.couch.toasts.show(f"{g.title} stopped", f"Kept what it was doing: {verdict}"),
+                   lambda err: self.couch.toasts.show("Could not stop the game", str(err), "error"), owner=self.couch)
         self.close_menu(go)
 
     def _toggle_mangohud(self) -> None:

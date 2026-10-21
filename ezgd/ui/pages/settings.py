@@ -417,6 +417,35 @@ class SettingsPage(QWidget):
         sync.setToolTip("Save backups are written into “EZ Game saves” in this folder, so another computer with the "
                         "same folder (and this app) can restore them. Backups made before stay here too. Leave it "
                         "empty to keep backups on this computer only.")
+        self._check(f, "steam_input_layout", "Controllers act as a gamepad in games, not as Steam's desktop mouse",
+                    "While Steam runs it drives the controller with its desktop layout (the stick moves the mouse) "
+                    "until it knows a game is running — and it never knows about a game this app starts that does "
+                    "not talk to Steam (emulators like Bloodborne's, most repacks). The app asks Steam for a game "
+                    "layout while such a game runs (Spacewar's: change it in Steam → Spacewar → Controller layout) "
+                    "and hands the choice back when it ends.")
+        self._check(f, "keep_awake", "Keep the screen on while a game runs (and in couch mode)",
+                    "A controller does not count as activity to the desktop, so a game played with one dimmed and "
+                    "locked after a few minutes. The app holds the screen on while one of its games runs (not while "
+                    "it is paused from the quick menu) and while couch mode is open.")
+        self._check(f, "hidden_tests", "Test starts out of sight (KDE Plasma)",
+                    "The debugging assistant's test starts run off-screen and muted: you can keep using the computer. "
+                    "Their pictures are read to tell a menu from a black or frozen screen. On other desktops tests "
+                    "are shown.")
+        self._check(f, "check_new_games", "Check each new game before its first start (out of sight)",
+                    "After a game is installed it is started once, hidden, while no game is running; if it fails, "
+                    "the assistant fixes it before you press Play. Needs test starts out of sight.")
+        self._check(f, "crash_reports", "Keep what happened when a game crashes or freezes while played",
+                    "Crash dumps, the game's log and what its threads were doing — so a crash 20 minutes in can be "
+                    "fixed (a test start only lasts 45 seconds). Stored per game in the app's data folder.")
+        self._check(f, "share_knowledge", "Share what fixed which crash with everyone who uses the app",
+                    "When a game is fixed, what fixed it is sent anonymously — the kind of failure (no game title), the "
+                    "setting that fixed it and the GPU vendor; nothing else about you or this computer. Each report is "
+                    "sealed with a new random key only the app's server can open, and what everyone shares comes "
+                    "back signed by the server: the assistant tries those fixes first. A shared fix can only switch "
+                    "known settings — never run anything.")
+        self.share_info = label("", "small", wrap=True)
+        f.addRow("", self.share_info)
+        self.bridge.call(self.bridge.core.crowd_status(), self._crowd_status, owner=self)
         own = QCheckBox("Our overlay instead of Steam's: chat, invites and joining in the quick menu")
         own.setToolTip("On: games start without Steam's overlay, and the PS / Xbox / Steam button (tap or hold) opens "
                        "the app's quick menu over the game — your Steam chats, one-click invites to your game, "
@@ -845,6 +874,15 @@ class SettingsPage(QWidget):
                                        self.bridge.call(self.bridge.core.ge_proton_status(), self._ge_status,
                                                         owner=self)),
                          lambda e: (self.ge_btn.setEnabled(True), self.actions.fail("GE-Proton", e)), owner=self)
+
+    def _crowd_status(self, st: dict) -> None:
+        if not st.get("server"):
+            self.share_info.setText("Everyone's knowledge: not available in this version yet.")
+        elif not st.get("on"):
+            self.share_info.setText("Everyone's knowledge: off — nothing is sent or used.")
+        else:
+            when = relative_time(st["updated"]) if st.get("updated") else "not yet"
+            self.share_info.setText(f"Everyone's knowledge: {st.get('entries', 0):,} fixes · updated {when}")
 
     def _adblock_status(self, st: dict) -> None:
         when = lambda ts: relative_time(ts) if ts else "never"          # noqa: E731

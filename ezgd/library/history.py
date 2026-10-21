@@ -216,7 +216,7 @@ _MILESTONES = [
     ("game window opened", r"(Presenter: Actual swap chain properties|Creating swapchain|SwapChain|"
                            r"DxvkSwapchain|Swapchain created|wined3d_swapchain)"),
     ("game loaded", r"(LogLoad: (Took|Game class)|Loading scene|UnloadTime|LogWorld: Bringing World|"
-                    r"Scene loaded|Main menu)"),
+                    r"Scene loaded|Main menu|\(level \w*Main_?Menu\w*\))"),     # (the last: UE4SS's log)
 ]
 
 

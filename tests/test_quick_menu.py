@@ -341,6 +341,50 @@ def test_quick_menu_over_a_desktop_game_with_couch_mode_closed(ui, qtbot, tmp_pa
     win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
 
 
+@linux_only
+def test_quitting_a_desktop_game_from_the_quick_menu_never_opens_couch_mode(ui, qtbot, tmp_path):
+    """Started from the desktop: the quick menu may be used, but leaving the game (Quit there, or the game ending)
+    goes back to the desktop app — couch mode opened by itself before."""
+    win, core, _ = ui
+    win.show()
+    a = _running(win, core, tmp_path, qtbot, "Desk Quit")
+    win._quick_menu_from_desktop()
+    couch = win.couch
+    opened = []
+    real = couch._promote
+    couch._promote = lambda: (opened.append(1), real())
+    qtbot.waitUntil(lambda: couch.quick is not None and couch.quick._shown >= 1.0, timeout=5000)
+    q = couch.quick
+    q.focus = next(k for k, r in enumerate(q.rows) if r.key == "quit")
+    q.command("a")                                                   # armed …
+    q.focus = next(k for k, r in enumerate(q.rows) if r.key == "quit")
+    q.command("a")                                                   # … and quit
+    qtbot.waitUntil(lambda: a.id not in win.pages["library"].running, timeout=20000)
+    qtbot.waitUntil(lambda: win.couch is None, timeout=5000)         # the hidden couch mode is gone …
+    assert opened == [] and win.isVisible()                          # … and never opened for real
+
+
+@linux_only
+def test_game_settings_from_a_desktop_games_quick_menu_is_only_a_visit(ui, qtbot, tmp_path):
+    """Game settings need couch mode's screens: shown for them, put away again on "Back to the game"."""
+    win, core, _ = ui
+    win.show()
+    a = _running(win, core, tmp_path, qtbot, "Desk Settings")
+    win._quick_menu_from_desktop()
+    couch = win.couch
+    qtbot.waitUntil(lambda: couch.quick is not None and couch.quick._shown >= 1.0, timeout=5000)
+    q = couch.quick
+    q.focus = next(k for k, r in enumerate(q.rows) if r.key == "settings")
+    q.command("a")
+    qtbot.waitUntil(lambda: couch.isVisible() and bool(couch.stack), timeout=5000)
+    assert couch._visiting
+    couch.command("b")                                               # B: back to the game
+    qtbot.waitUntil(lambda: not couch.isVisible(), timeout=5000)
+    assert couch.background and not couch._visiting
+    qtbot.waitUntil(lambda: win.couch is None and win.isVisible(), timeout=5000)
+    win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
+
+
 def test_a_game_that_ran_is_never_closed_when_started_again(ui, qtbot):
     """Leaving couch mode right after a game ended noted it as "still starting — close it when it appears", and
     starting it again a minute later closed it after two seconds."""

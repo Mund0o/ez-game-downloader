@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -14,14 +15,15 @@ from typing import Any, Callable
 
 from ezgd.core.fsutil import is_within, safe_dirname
 from ezgd.database.repositories import GameRepository, LibraryRepository
-from ezgd.library import advisor, errorbox, fixes, fixgen, repack, saves, screenread, steamrun
+from ezgd.library import advisor, crashes, errorbox, fixes, fixgen, picture, repack, saves, screenread, steamrun
 from ezgd.library.executables import Candidate, find_executables, rank
 from ezgd.library.models import CompatConfig, LaunchMethod, LibraryEntry, LibraryStatus
 from ezgd.platform import IS_LINUX
-from ezgd.platform import launcher, steam
+from ezgd.platform import hidden as hidden_mod
+from ezgd.platform import launcher, steam, steaminput
 from ezgd.platform.paths import AppPaths
 from ezgd.platform.proton import (OPTIONS_BY_KEY, prefix_ready, suggest_dll_overrides, validate_overrides,
-                                  winetricks_env)
+                                  winetricks_command, winetricks_env)
 
 log = logging.getLogger(__name__)
 
@@ -136,6 +138,9 @@ def merge_overrides(a: dict, b: dict) -> dict | None:
         return None                                        # two different Windows versions
     if wa or wb:
         out["winetricks"] = wa + [v for v in wb if v not in wa]
+    ra, rb = a.get("registry") or [], b.get("registry") or []
+    if ra or rb:
+        out["registry"] = ra + [f for f in rb if f not in ra]
     return out
 
 
@@ -180,9 +185,10 @@ class _BoxWatch:
 
     def __init__(self, log_path: Path, offset: int):
         self.path, self.pos, self.tail, self.found = log_path, offset, "", False
+        self.notice = False                         # a harmless notice (errorbox.is_notice) is waiting for OK
 
     def seen(self) -> bool:
-        if self.found:
+        if self.found or self.notice:
             return True
         try:
             with open(self.path, "rb") as fh:
@@ -196,10 +202,188 @@ class _BoxWatch:
         if errorbox.shown(text):
             self.found = True
             self.text = text
-        return self.found
+        elif errorbox.notice_shown(text):
+            self.notice = True
+            self.tail = ""                              # (read once, not again from the overlap)
+        return self.found or self.notice
 
     def messages(self) -> list[str]:
         return errorbox.messages(getattr(self, "text", ""))
+
+
+_DEEP_KEEP = re.compile(r":trace:(reg:(NtOpenKeyEx|NtCreateKey)|file:NtCreateFile)\b")
+_RELAY_NOISE = re.compile(r"^[0-9a-f]+:(Call|Ret) +(PE DLL|LDR notification|driver |TLS callback|window proc|"
+                          r"winevent hook|message callback|hook proc|timer proc|callback|thread proc)|:trace:relay:")
+_OPEN_EXISTING = re.compile(r'^([0-9a-f]+):trace:file:NtCreateFile handle=\S+ access=\S+ name=L"\\\\\?\?\\\\([^"]+)"'
+                            r'[^\n]*? disp=1 ')
+
+
+_ESSENTIAL = re.compile(r":trace:loaddll:|:ezgd:|:trace:msgbox:|:err:|Unhandled exception|not found|"
+                        r"virtual_unwind backtrace|dispatch_exception code=c")
+
+
+def _essentials(middle: str, limit: int = 512 * 1024) -> str:
+    """What the investigator needs from the middle of a long run (which DLLs loaded and from where, what was
+    missing, error boxes, crashes) — a working run's DLL list was cut out with the rest of the middle."""
+    out, size = [], 0
+    for ln in middle.splitlines(True):
+        if _ESSENTIAL.search(ln):
+            out.append(ln)
+            size += len(ln)
+            if size > limit:
+                break
+    return "".join(out)
+
+
+def _read_run(path: Path, offset: int, condense: bool = False, head: int = 2 << 20, tail: int = 6 << 20) -> str:
+    """One run's part of a log. Long logs: the start (what loaded) and the end (how it ended) — the crash is at
+    the end, and reading only the first 8 MB lost it. ``condense``: a "look closer" run, registry lines other than
+    key lookups dropped (they are most of it)."""
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            if condense:
+                keep = []
+                for raw in fh:
+                    ln = raw.decode("utf-8", "replace")
+                    if (":trace:reg:" in ln or ":trace:file:" in ln) and not _DEEP_KEEP.search(ln):
+                        continue
+                    if _RELAY_NOISE.search(ln):
+                        continue
+                    keep.append(ln)
+                text = "".join(keep)
+                if len(text) > head + tail:
+                    text = text[:head] + "\n…\n" + text[-tail:]
+                return text
+            if size - offset <= head + tail:
+                return fh.read().decode("utf-8", "replace")
+            first = fh.read(head).decode("utf-8", "replace")
+            fh.seek(max(offset, size - tail))
+            return first + "\n…\n" + fh.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+_REG_LINE = re.compile(r'^([0-9a-f]+):trace:reg:NtOpenKeyEx (?:\(([^,]+),L"([^"]*)"|<- (\(nil\)|0x[0-9a-f]+))')
+
+
+def _mark_missing_files(text: str, prefix: Path) -> str:
+    """A "look closer" run, reduced to what matters: after each request to open an existing file that does not
+    exist in the test copy (matched without regard to case, as Windows does) a line
+    ``<thread>:ezgd:missing-file L"<path>"``, after each registry key that was not there
+    ``<thread>:ezgd:missing-key L"<key>"``. The request lines themselves are dropped — thousands of them pushed
+    the DLL loads out of the kept evidence."""
+    dosdev = prefix / "pfx" / "dosdevices"
+    listing: dict[Path, dict[str, str]] = {}
+
+    def exists(win: str) -> bool | None:
+        if len(win) < 3 or win[1] != ":":
+            return None
+        base = dosdev / (win[0].lower() + ":")
+        if not base.exists():
+            return None
+        cur = base.resolve()
+        for part in [x for x in win[3:].split("\\") if x]:
+            if part in (".", ".."):
+                return None
+            names = listing.get(cur)
+            if names is None:
+                try:
+                    names = {n.lower(): n for n in os.listdir(cur)}
+                except OSError:
+                    names = {}
+                listing[cur] = names
+            real = names.get(part.lower())
+            if real is None:
+                return False
+            cur = cur / real
+        return True
+
+    out, seen = ["0000:ezgd:keys-traced\n"], set()
+    pending: dict[str, str] = {}
+    for ln in text.splitlines(True):
+        if ":trace:reg:" in ln:
+            rm = _REG_LINE.match(ln)
+            if rm is not None and rm.group(3) is not None:
+                pending[rm.group(1)] = rm.group(3)
+            elif rm is not None:
+                key = pending.pop(rm.group(1), None)
+                if key is not None and rm.group(4) == "(nil)":
+                    out.append(f'{rm.group(1)}:ezgd:missing-key L"{key}"\n')
+            continue
+        m = _OPEN_EXISTING.match(ln)
+        if m is None:
+            if ":trace:file:" not in ln:
+                out.append(ln)
+            continue
+        tid, win = m.group(1), m.group(2).replace("\\\\", "\\")
+        if (tid, win.lower()) in seen:
+            continue
+        seen.add((tid, win.lower()))
+        if exists(win) is False:
+            out.append(f'{tid}:ezgd:missing-file L"{win}"\n')
+    return "".join(out)
+
+
+ADDON_LOGS = ("ue4ss/UE4SS.log", "UE4SS.log", "BepInEx/LogOutput.log", "MelonLoader/Latest.log", "ReShade.log")
+GAMELOG = "ezgd-gamelog: "
+_LOG_NAME = re.compile(r"(\.log$|\.err$|^traceback\.txt$|^errors?\.txt$|^crash.*\.txt$|^hs_err_pid\d+\.log$|"
+                       r"(^|[_\-. ])(log|error|crash|debug|output|console|exception|trace|report)s?([_\-. ]|\.txt$))", re.I)
+_NOT_LOG = re.compile(r"(readme|license|licence|changelog|credits|eula|steam_appid|dlllist|mods\.txt|"
+                      r"vkd3d-proton\.cache|\.cache$|^dd_|^msi[0-9a-f]+\.log$|setupapi|winetricks)", re.I)
+_LOG_EXT = (".log", ".txt", ".err", ".out")
+
+
+def run_logs(exe: Path, prefix: Path | None, since: float, per_file: int = 64_000, limit: int = 10) -> str:
+    """What the game (any engine) and its mod loaders wrote into log files during a run — in its folders and its
+    Windows user folders of ``prefix`` — each as ``ezgd-gamelog: <file>`` and its last lines. Source's
+    console.log, Godot's, Ren'Py's traceback.txt, CryEngine's Game.log, REDengine's logs, Java's hs_err_pid…, a
+    launcher's error.log: the game's own words about why it stopped."""
+    import os as _os
+    from ezgd.platform.proton import game_binary_dirs
+    roots: list[tuple[Path, int]] = []
+    if exe.name:
+        dirs = game_binary_dirs(exe)
+        roots += [(dirs[0], 3)] + [(d, 2) for d in dirs[1:]]
+    if prefix is not None:
+        users = prefix / "pfx" / "drive_c" / "users" / "steamuser"
+        roots += [(users / "AppData" / "Local", 5), (users / "AppData" / "LocalLow", 5),
+                  (users / "AppData" / "Roaming", 4), (users / "Documents", 5), (users / "Temp", 2)]
+    found: list[tuple[float, Path]] = []
+    seen = 0
+    for root, depth in roots:
+        if not root.is_dir():
+            continue
+        base = len(root.parts)
+        for d, subdirs, files in _os.walk(root):
+            seen += len(files)
+            if seen > 150_000:
+                break
+            if len(Path(d).parts) - base >= depth:
+                subdirs[:] = []
+            subdirs[:] = [x for x in subdirs if x.lower() not in ("paks", "movies", "content", "microsoft", "nvidia",
+                                                                  "shadercache", "pipelinecaches", ".sentry-native")]
+            for f in files:
+                if not f.lower().endswith(_LOG_EXT) or not _LOG_NAME.search(f) or _NOT_LOG.search(f):
+                    continue                          # (text logs only; installers' own logs are not the game's)
+                p = Path(d) / f
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                if st.st_mtime >= since and 0 < st.st_size:
+                    found.append((st.st_mtime, p))
+    out = []
+    for _mt, p in sorted(found, reverse=True)[:limit]:
+        try:
+            with open(p, "rb") as fh:
+                fh.seek(max(0, p.stat().st_size - per_file))
+                text = fh.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        out.append(f"{GAMELOG}{p}\n{text}")
+    return "\n".join(out)
 
 
 _OF_INI_CACHE: dict[str, tuple[float, list]] = {}      # game folder → (when, OnlineFix.ini files found)
@@ -231,6 +415,18 @@ class LibraryManager:
         self._suspended: dict[int, dict] = {}        # frozen games: {"at": monotonic, "pids": [...]}
         self._frozen_seconds: dict[int, float] = {}  # time a running game spent frozen (not playtime)
         self.thaw_leftovers()
+        try:                                     # this computer's mark on the save backups it makes (saves.py)
+            from ezgd.platform import machine
+            saves.set_owner(machine.profile().get("id") or "", paths.config / "backup-key")
+        except Exception:
+            log.exception("save backups: no owner key")
+        self.input_layout = steaminput.Forced(paths.data / "steam-input-forced")
+        if self.input_layout.left_over() and steaminput.enabled():   # forced by an app that did not end cleanly
+            log.info("handing Steam's controller layout back (left forced by the last session)")
+            try:
+                self.input_layout.hand_back()
+            except Exception:
+                log.exception("could not hand the controller layout back to Steam")
 
     # ----------------------------------------------------------- environment
     def steam_root(self) -> Path | None:
@@ -238,7 +434,9 @@ class LibraryManager:
 
     def protons(self, refresh: bool = False) -> list[steam.ProtonInstall]:
         if self._protons is None or refresh:
-            self._protons = steam.find_proton_versions(self.steam_root())
+            from ezgd.library import dxlayers
+            self._protons = steam.find_proton_versions(self.steam_root()) \
+                + dxlayers.variants(self.paths.data / "proton-variants")     # (with another DXVK / VKD3D)
         return self._protons
 
     def environment(self) -> dict:
@@ -261,6 +459,29 @@ class LibraryManager:
 
     def prefix_dir(self, entry_id: int) -> Path:
         return self.paths.prefixes / f"game-{entry_id}"
+
+    SHADER_CACHE_GB = 20
+
+    def shader_cache_dir(self, entry_id: int) -> Path:
+        return self.paths.data / "shadercache" / f"game-{entry_id}"
+
+    def shader_cache_env(self, entry_id: int) -> dict[str, str]:
+        """The GPU driver's shader cache for this game alone, large and never cleaned up by the driver: shaders
+        are built once and kept. Games started by the app all shared the driver's one cache (755 MB here), whose
+        size limit made big games push each other's shaders out — and build them again on every start. (Steam
+        does the same for its own games: steamapps/shadercache/<id>.) NVIDIA reads __GL_SHADER_DISK_CACHE_*,
+        AMD / Intel (Mesa) MESA_SHADER_CACHE_*. The game's own caches (Unreal's pipeline caches …) live in its
+        prefix and move with its saves when it gets another prefix."""
+        d = self.shader_cache_dir(entry_id)
+        try:
+            (d / "nvidia").mkdir(parents=True, exist_ok=True)
+            (d / "mesa").mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return {}
+        size = self.SHADER_CACHE_GB << 30
+        return {"__GL_SHADER_DISK_CACHE": "1", "__GL_SHADER_DISK_CACHE_PATH": str(d / "nvidia"),
+                "__GL_SHADER_DISK_CACHE_SIZE": str(size), "__GL_SHADER_DISK_CACHE_SKIP_CLEANUP": "1",
+                "MESA_SHADER_CACHE_DIR": str(d / "mesa"), "MESA_SHADER_CACHE_MAX_SIZE": f"{self.SHADER_CACHE_GB}G"}
 
     # ---------------------------------------------------------------- CRUD
     def all(self) -> list[LibraryEntry]:
@@ -555,6 +776,11 @@ class LibraryManager:
             compat=e.compat_config, game_root=Path(e.install_path) if e.install_path else None,
             log_dir=self.paths.logs, fix_env=fx.env, fix_wrappers=fx.wrappers, fix_args=fx.args,
             fix_notes=fx.notes, steam_client=self.talks_to_steam_itself(e))
+        if IS_LINUX:                               # its shaders: built once, kept (see shader_cache_env)
+            cache = self.shader_cache_env(e.id)
+            plan.env = {**cache, **plan.env}             # (the game's own launch options and fixes still win)
+            if plan.env.get("PRESSURE_VESSEL_FILESYSTEMS_RW"):
+                plan.env["PRESSURE_VESSEL_FILESYSTEMS_RW"] += ":" + str(self.shader_cache_dir(e.id))
         live = self._mangohud_env(e)
         if live:
             plan.env = {**plan.env, **live}
@@ -647,7 +873,17 @@ class LibraryManager:
 
     # Wine debug channels for a diagnostic launch: errors from every component, DLL loading (module addresses
     # for crash locations) and exceptions — enough to explain a crash without flooding the log
+    # (not warn+file: GE-Proton's "Disabling case insensitive search" warning has no line end — they pile up in
+    # Wine's debug buffer until Wine aborts with "debugstr buffer overflow"; Expedition 33 died after 1 s with it)
     DIAGNOSTIC_WINEDEBUG = "err+all,warn+module,+loaddll,+seh,+msgbox,fixme-all"
+    # "look closer": every registry lookup and every file the game asks for (huge — its own log, condensed after;
+    # which requested files did not exist is worked out from the test copy itself: trace+file, not warn+file)
+    DEEP_WINEDEBUG = ",+reg,trace+file,+relay"
+    # … and who ended the game or started another program: Wine traces just these calls (RelayInclude, set in the
+    # test copy only) with the address they were called from — "OnlineFix64.dll called ExitProcess(1)", "the
+    # launcher started …\Game-Win64-Shipping.exe and quit"
+    RELAY_CALLS = ("ExitProcess;RtlExitUserProcess;TerminateProcess;NtTerminateProcess;exit;_exit;abort;"
+                   "CreateProcessW;CreateProcessA;ShellExecuteW;ShellExecuteA;ShellExecuteExW")
 
     def launch(self, entry_id: int, confirmed: bool, diagnostic: bool = False) -> launcher.LaunchPlan:
         """Start the game. ``confirmed`` must be True when the executable is not trusted yet.
@@ -682,6 +918,7 @@ class LibraryManager:
         self._processes[e.id] = (proc, time.monotonic(), plan, log_path)
         if diagnostic:
             self._watch_error_box(e.id, proc, log_path, start)
+        self._game_input_layout(e, log_path)
         e.executable_trusted = True
         e.last_played_at = time.time()
         e.play_count += 1
@@ -689,6 +926,37 @@ class LibraryManager:
         self.emit("game_state", {"id": e.id, "running": True})
         self.emit("library_changed", e.id)
         return plan
+
+    def _game_input_layout(self, e: LibraryEntry, log_path: Path) -> None:
+        """A game started here that never talks to Steam keeps Steam's desktop layout on the controller (the stick
+        moves the mouse, the game gets no gamepad): Steam is told to use a game layout until it ends. Whether
+        Steam switched is read back from its controller log and written to the game's log."""
+        if not (IS_LINUX and steaminput.enabled() and self.settings.settings.steam_input_layout):
+            return
+        if "no_steaminput" in e.compat_config.fixes or self.talks_to_steam_itself(e) or \
+                not steam.is_steam_running():
+            return                                # (OnlineFix games sign in to Steam: Steam switches by itself)
+        root = self.steam_root()
+        since = steaminput.log_size(root)
+        try:
+            self.input_layout.start(e.id)
+        except Exception:
+            log.exception("could not switch Steam's controller layout")
+            return
+
+        def check() -> None:
+            took = steaminput.took(root, since, steaminput.GAME_LAYOUT)
+            got = {a for _c, a in steaminput.activations(root, since)}
+            note = ("Steam switched the controller to the game layout (Spacewar 480)" if took else
+                    "no controller switched (none connected, or Steam Input is off for it)" if took is None else
+                    f"Steam did not take the game layout (switched to {sorted(got)})")
+            log.info("game %s: %s", e.id, note)
+            try:
+                with open(log_path, "a", encoding="utf-8") as fh:
+                    fh.write(f"ezgd:steam-input {note}\n")
+            except OSError:
+                pass
+        threading.Thread(target=check, daemon=True, name=f"steam-input-{e.id}").start()
 
     BOX_CLOSE_AFTER = 2.0          # seconds an error pop-up of a diagnostic run stays before the game is closed
     SCREEN_LOOKS = (8, 24, 40)     # seconds into a test / diagnostic run when the game's screen is read
@@ -709,10 +977,13 @@ class LibraryManager:
             began = time.monotonic()
             looks = list(self.SCREEN_LOOKS) + [70, 110]
             while proc.poll() is None:
-                if box.seen():
+                if box.seen() and box.found:
                     log.info("game %s showed an error box: %s", entry_id, "; ".join(box.messages()))
                     close()
                     return
+                if box.notice:                         # not an error: the player presses OK and the game goes on
+                    log.info("game %s showed a notice (not an error) — waiting for OK", entry_id)
+                    box.notice = False
                 if looks and time.monotonic() - began >= looks[0]:
                     looks.pop(0)                       # errors drawn by the game itself (not Wine's)
                     if screenread.stopped_on_error(screenread.look(log_path)):
@@ -807,6 +1078,11 @@ class LibraryManager:
                                  name=f"post-exit-{entry_id}", daemon=True).start()
             self._suspended.pop(entry_id, None)
             self._forget_suspension(entry_id)
+            try:
+                if self.input_layout.end(entry_id):
+                    log.info("game %s ended: Steam chooses the controller layout again", entry_id)
+            except Exception:
+                log.exception("could not hand the controller layout back to Steam")
             played = int(time.monotonic() - started - self._frozen_seconds.pop(entry_id, 0.0))
             try:                                       # the debugging assistant reads this back
                 with open(log_path, "a", encoding="utf-8") as fh:
@@ -1289,7 +1565,8 @@ class LibraryManager:
                         learned=fixgen.load_learned(self.learned_path), integrity=integrity,
                         methods=[m.to_dict() for m in (game.download_methods or [])] if game else [],
                         install_dest=Path(install_dest) if install_dest else None, community=community,
-                        steam_ref=self.steam_reference(e, game), evidence=evidence).to_dict()
+                        steam_ref=self.steam_reference(e, game), evidence=evidence,
+                        play_crashes=crashes.records(self.paths.data, e.id)[:5]).to_dict()
 
     # --------------------------------------------------------------- trials
     TRIAL_SECONDS = 45
@@ -1451,8 +1728,13 @@ class LibraryManager:
         _stop_prefix_processes(prefix)
         return prefix_ready(prefix)
 
-    def run_trial(self, entry_id: int, cand: dict, n: int, cancel: threading.Event | None = None) -> dict:
-        """Launch the game once with ``cand`` in a test prefix; report whether it crashed, exited or kept running."""
+    def run_trial(self, entry_id: int, cand: dict, n: int, cancel: threading.Event | None = None, *,
+                  seconds: int | None = None, deep: bool = False, hidden: bool | None = None,
+                  early: bool = False) -> dict:
+        """Launch the game once with ``cand`` in a test prefix; report whether it crashed, exited or kept running.
+        ``seconds``: how long it may run (a slow first start gets more); ``deep``: record registry lookups too;
+        ``hidden``: off-screen and muted, its pictures judged (default: the setting, where the desktop allows it);
+        ``early``: done as soon as its picture shows its menu (the quick check of a new game)."""
         if self.is_running(entry_id):
             raise LibraryError("Stop the game first.")
         prefix, how = self._trial_prefix(entry_id, n, cand["overrides"].get("proton_version"))
@@ -1477,40 +1759,111 @@ class LibraryManager:
                     result.update(outcome="error", seconds=0, detail=f"installing {' '.join(verbs)} into the test copy "
                                   f"failed: {self._winetricks_failure(entry_id, ' '.join(verbs), log_path)}")
                     return result
+            regs = cand["overrides"].get("registry") or []
+            if regs:                                   # the release's .reg files: into the copy, then test
+                if not prefix_ready(prefix):
+                    self.init_prefix(entry_id, prefix, cand["overrides"].get("proton_version"))
+                self.import_reg(entry_id, prefix, regs, cand["overrides"].get("proton_version"))
+            if deep:
+                self._trace_calls_in(entry_id, prefix, cand["overrides"].get("proton_version"))
             plan = self.launch_plan(entry_id, {**cand["overrides"], "prefix_dir": str(prefix)})
-            plan.env = {**plan.env, "WINEDEBUG": self.DIAGNOSTIC_WINEDEBUG}
-            with open(log_path, "a", encoding="utf-8") as fh:
-                fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} trial {n}: {cand['label']} · diagnostic run\n")
-                offset = fh.tell()
-            proc = self._spawn(plan, log_path)
-            code = None
-            box = _BoxWatch(log_path, offset)
-            looks = list(self.SCREEN_LOOKS)
-            on_screen = False
-            while time.monotonic() - started < self.TRIAL_SECONDS:
-                if cancel is not None and cancel.is_set():
-                    break
-                code = proc.poll()
-                if code is not None:
-                    break
-                if box.seen():                         # the game stopped on an error pop-up: read, close, done
-                    break
-                if looks and time.monotonic() - started >= looks[0]:
-                    looks.pop(0)                       # errors Wine does not know: read the game's screen
-                    if screenread.stopped_on_error(screenread.look(log_path)):
-                        on_screen = True
+            plan.env = {**plan.env, "WINEDEBUG": self.DIAGNOSTIC_WINEDEBUG + (self.DEEP_WINEDEBUG if deep else "")}
+            limit = seconds or self.TRIAL_SECONDS
+            run_log = self.paths.logs / f"trial-{entry_id}-deep.log" if deep else log_path
+            use_hidden = bool(hidden if hidden is not None else self.settings.settings.hidden_tests) and IS_LINUX \
+                and hidden_mod.available()
+            pics: list = []
+            last_img = None
+            for attempt in (1, 2):
+                if deep:
+                    run_log.write_text("")
+                with open(run_log, "a", encoding="utf-8") as fh:
+                    fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} trial {n}: {cand['label']} · diagnostic run"
+                             + (" · looking closer" if deep else "") + "\n")
+                    offset = fh.tell()
+                hs = hidden_mod.HiddenSession([Path(self.get(entry_id).executable or "x").name.lower()]) \
+                    if use_hidden else None
+                if hs is not None and not hs.start():
+                    hs = None
+                try:
+                    proc = self._spawn(plan, run_log)
+                except Exception:
+                    if hs is not None:
+                        hs.stop()
+                    raise
+                code = None
+                box = _BoxWatch(run_log, offset)
+                if early and limit <= 30:              # a quick check: a look every few seconds
+                    looks = [t for t in (6, 11, 16, 21) if t < limit - 1] + [limit - 2]
+                else:
+                    looks = list(self.SCREEN_LOOKS) + ([t for t in (60, 90, limit - 5) if t < limit] if limit > 50 else [])
+                on_screen = False
+                wins: list = []
+                checked = 0.0
+                while time.monotonic() - started < limit:
+                    if cancel is not None and cancel.is_set():
                         break
-                time.sleep(0.5)
+                    code = proc.poll()
+                    if code is not None:
+                        break
+                    if box.seen():                         # the game stopped on an error pop-up: read, close, done
+                        break
+                    if hs is not None and time.monotonic() - checked >= 1.0:
+                        checked = time.monotonic()         # the test's windows kept away, its sound muted
+                        ours = self._trial_pids(proc, prefix)
+                        wins = hs.check(ours)
+                        hs.mute(ours)
+                    if looks and time.monotonic() - started >= looks[0]:
+                        at = int(time.monotonic() - started)
+                        looks.pop(0)                       # errors Wine does not know: read the game's screen
+                        if hs is not None:
+                            win = next((w for w in wins if w["away"] and w["class"].startswith("steam_app_")),
+                                       next((w for w in wins if w["away"]), None))
+                            img = hidden_mod.capture(win["id"]) if win else None
+                            if img is not None:
+                                look = picture.analyze(img, at)
+                                pics.append(look)
+                                if not look.black:
+                                    last_img = img
+                                if look.errors:
+                                    with open(log_path, "a", encoding="utf-8") as fh:
+                                        fh.write("".join(screenread.PREFIX + ln + "\n" for ln in look.errors))
+                                    on_screen = True
+                                    break
+                                if early and look.menu:    # it reached its menu: nothing more to wait for
+                                    break
+                        elif screenread.stopped_on_error(screenread.look(log_path)):
+                            on_screen = True
+                            break
+                    time.sleep(0.5)
+                if hs is not None:
+                    hs.stop()
+                if box.notice and not box.found and attempt == 1 and not (cancel is not None and cancel.is_set()):
+                    # a one-time notice held the game (OnlineFix's greeting: "You will get this message only once")
+                    # — not an error: once it has been shown, the game starts without it. Test once more.
+                    launcher.terminate(proc)
+                    _stop_prefix_processes(prefix)
+                    with open(log_path, "a", encoding="utf-8") as fh:
+                        fh.write("=== a notice (not an error) held the game — testing again\n")
+                    started = time.monotonic()
+                    continue
+                break
             secs = int(time.monotonic() - started)
+            shown, shown_why = picture.judge(pics) if pics else ("unknown", "")
+            if last_img is not None:
+                result["picture_file"] = picture.thumbnail(
+                    last_img, self.paths.data / "investigations" / f"trial-{entry_id}-{n}.jpg")
+            result["picture"] = shown
             still = proc.poll() is None and not box.found and not on_screen
             if proc.poll() is None:
                 launcher.terminate(proc)
-            try:
-                with open(log_path, "rb") as fh:
-                    fh.seek(offset)
-                    text = fh.read(8 * 1024 * 1024).decode("utf-8", "replace")
-            except OSError:
-                text = ""
+            text = _read_run(run_log, offset, condense=deep)
+            if deep:                                   # which of the files it asked for were not there
+                text = _mark_missing_files(text, prefix)
+                with open(log_path, "a", encoding="utf-8") as fh:        # the condensed run into the trial log
+                    fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} trial {n}: {cand['label']} · diagnostic run"
+                             " · looking closer (condensed)\n" + text)
+                run_log.unlink(missing_ok=True)
             reason = _trial_reason(text)
             frames = _drew_frames(text)
             # how far it got: Wine's log plus the engine's own log (written inside the test prefix, or in the
@@ -1525,25 +1878,40 @@ class LibraryManager:
                     eng = ""                              # older than this test
             except Exception:
                 eng = ""
+            try:                                      # what the game itself logged (any engine), and mod loaders
+                eng += "\n" + run_logs(Path(self.get(entry_id).executable or ""), prefix, time.time() - secs - 5)
+            except Exception:
+                pass
+            if shown == "menu":                        # its picture showed a menu: it got into the game
+                eng += "\nezgd-picture: Main menu shown"
             progress = _hist.phase(text + "\n" + eng).reached
+            if shown in ("menu", "moving"):
+                frames = True
+            elif shown == "black" and frames is None:
+                frames = False
             result["progress"] = progress
             # the test's detailed Wine log is evidence the assistant analyses next (investigate / adaptive trials)
-            keep = text if len(text) < 1536 * 1024 else text[:512 * 1024] + "\n…\n" + text[-1024 * 1024:]
+            keep = text if len(text) < 1536 * 1024 else (
+                text[:512 * 1024] + "\n…\n" + _essentials(text[512 * 1024:-1024 * 1024]) + "\n…\n"
+                + text[-1024 * 1024:])
             ev = self.trial_evidence.setdefault(entry_id, {})
             ev[n] = {"text": keep, "exit_code": None if still else code, "seconds": secs, "label": cand["label"],
-                     "overrides": cand["overrides"]}
+                     "overrides": cand["overrides"], "extra": eng[-200_000:]}
             for old_n in sorted(ev)[:-8]:              # loader errors are early, crashes late: head + tail kept
                 del ev[old_n]
             result["frames"] = frames
             if cancel is not None and cancel.is_set() and still:
                 result.update(outcome="cancelled", seconds=secs, detail="stopped by you")
             elif still:
-                stuck = frames is not True and not any(m in progress for m in ("game window opened", "game loaded"))
+                stuck = (frames is not True and not any(m in progress for m in ("game window opened", "game loaded"))) \
+                    or shown in ("black", "frozen")
                 result.update(outcome="ran", seconds=secs, stuck=stuck,
                               detail=f"kept running for {secs}s without crashing"
-                              + {True: ", drawing frames", False: ", but drew no frames (black screen?)",
-                                 None: ""}[frames]
-                              + (" — got to the game" if "game loaded" in progress else
+                              + (f" — {shown_why}" if shown in ("menu", "black", "frozen") else
+                                 {True: ", drawing frames", False: ", but drew no frames (black screen?)",
+                                  None: ""}[frames])
+                              + ("" if shown == "menu" else " — got to the game" if "game loaded" in progress else
+                                 " — but it waits on a notice (press OK when you play)" if box.notice else
                                  " — but no sign it got past start-up" if stuck and progress else "")
                               + (f" ({reason})" if reason else ""))
             elif reason:
@@ -1721,12 +2089,11 @@ class LibraryManager:
         local = self.paths.save_backups / saves.key_for(e.title)
         if not local.is_dir():
             return
+        from ezgd.core import safefiles
         for z in local.glob("*.zip"):
             target = sync / z.name
-            if not target.exists():
-                tmp = target.with_suffix(".zip.part")
-                shutil.copy2(z, tmp)
-                os.replace(tmp, target)
+            if not target.exists() and not target.is_symlink() and not z.is_symlink():
+                safefiles.write_file(sync, z.name, z)    # (never through a link planted there)
 
     def backup_saves(self, entry_id: int, reason: str = "manual", quiet: bool = False,
                      max_bytes: int | None = None) -> dict | None:
@@ -1962,11 +2329,14 @@ class LibraryManager:
         wt = shutil.which("winetricks")
         if proton is None or not wt:
             raise LibraryError("winetricks is not installed (Settings → System check → Install missing tools).")
+        blocked = self._dotnet_blocker(proton, verbs)
+        if blocked:
+            raise LibraryError(blocked)
         env = winetricks_env(proton, prefix)
         log_path = self.paths.logs / f"game-{entry_id}.log"
         with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} winetricks {' '.join(verbs)}\n")
-        proc = self._spawn(launcher.LaunchPlan([wt, "-q", *verbs], str(prefix), env, "winetricks"), log_path)
+        proc = self._spawn(launcher.LaunchPlan(winetricks_command(wt, verbs, prefix), str(prefix), env, "winetricks"), log_path)
         if wait:                                     # "Fix my game" tests the game right after: wait for it
             try:
                 return proc.wait(timeout=1800)
@@ -1974,6 +2344,73 @@ class LibraryManager:
                 launcher.terminate(proc)
                 raise LibraryError(f"winetricks {' '.join(verbs)} did not finish within 30 minutes.")
         return None
+
+    @staticmethod
+    def _trial_pids(proc, prefix: Path) -> set[int]:
+        """A test's processes: its process group (it was started in a session of its own) and whatever runs on
+        its throw-away prefix."""
+        found = set(_prefix_processes(prefix))
+        if IS_LINUX:
+            for d in Path("/proc").iterdir():
+                if not d.name.isdigit():
+                    continue
+                try:
+                    if int((d / "stat").read_text().rsplit(")", 1)[1].split()[2]) == proc.pid:
+                        found.add(int(d.name))
+                except (OSError, ValueError, IndexError):
+                    continue
+        return found
+
+    def _trace_calls_in(self, entry_id: int, prefix: Path, proton_name: str | None = None) -> None:
+        """A closer look: in the test copy only, Wine is told which calls to trace (RELAY_CALLS)."""
+        e = self.get(entry_id)
+        proton = self._proton_named(e, proton_name)
+        if proton is None or not prefix_ready(prefix):
+            return
+        try:
+            env = {**os.environ, **winetricks_env(proton, prefix), "WINEDEBUG": "-all"}
+            subprocess.run([env["WINE"], "reg", "add", r"HKCU\Software\Wine\Debug", "/v", "RelayInclude", "/t",
+                            "REG_SZ", "/d", self.RELAY_CALLS, "/f"], env=env, capture_output=True, timeout=60)
+            subprocess.run([env["WINESERVER"], "-w"], env=env, capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError, FileNotFoundError) as exc:
+            log.info("could not set up call tracing for the closer look: %s", exc)
+
+    def import_reg(self, entry_id: int, prefix: Path, files: list[str], proton_name: str | None = None) -> None:
+        """Import .reg files (the release's own: what its installer would have written) into ``prefix`` — a test
+        copy, or the game's real prefix once the test showed they help. Only files inside the game's folder."""
+        e = self.get(entry_id)
+        root = Path(e.install_path or Path(e.executable or ".").parent)
+        proton = self._proton_named(e, proton_name)
+        if proton is None:
+            raise LibraryError("No Proton to import the registry file with.")
+        env = {**os.environ, **winetricks_env(proton, prefix), "WINEDEBUG": "-all"}
+        for f in files:
+            p = Path(f)
+            if not p.is_file() or not is_within(p, root):
+                raise LibraryError(f"{p.name} is not a file in the game's folder")
+            win = "Z:" + str(p.resolve()).replace("/", "\\")
+            r = subprocess.run([env["WINE"], "regedit", "/S", win], env=env, capture_output=True, timeout=120)
+            log.info("%s: imported %s into %s (exit %s)", e.title, p.name, prefix.name, r.returncode)
+        subprocess.run([env["WINESERVER"], "-w"], env=env, capture_output=True, timeout=60)
+
+    def _dotnet_blocker(self, proton, verbs: list[str]) -> str | None:
+        """Why the .NET Framework cannot be installed with this Proton, or None. Proton-CachyOS 11.0-20260703 ships
+        without Wine's .NET parts (fusion.dll, mscorwks.dll, ngen.exe): Microsoft's installer then fails registering
+        its assemblies (error 1603) — with GE-Proton the same prefix installs it (Avatar: Frontiers of Pandora,
+        2026-10-21)."""
+        if not any(v.startswith("dotnet") for v in verbs):
+            return None
+        from ezgd.library.diagnose import proton_dlls
+        have = proton_dlls(Path(proton.path), 32)
+        if not have or "fusion.dll" in have:
+            return None
+        other = next((p for p in self.protons() if p.name != proton.name
+                      and "fusion.dll" in proton_dlls(Path(p.path), 32)), None)
+        return (f"{proton.name} does not include Wine's .NET parts (fusion.dll), so the .NET Framework cannot be "
+                "installed with it. " + (f"{other.name} has them: switch this game to {other.name} (Properties → "
+                                         "Proton version) and install again." if other else
+                                         "Install GE-Proton (Settings → Library), use it for this game and install "
+                                         "again."))
 
     _WT_REASONS = [
         (r"err:msi:.*returned 1603",
@@ -2007,9 +2444,11 @@ class LibraryManager:
         wt = shutil.which("winetricks")
         if proton is None or not wt:
             return 127
+        if self._dotnet_blocker(proton, verbs):
+            return 3
         with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} winetricks {' '.join(verbs)} (test copy)\n")
-        proc = self._spawn(launcher.LaunchPlan([wt, "-q", *verbs], str(prefix), winetricks_env(proton, prefix),
+        proc = self._spawn(launcher.LaunchPlan(winetricks_command(wt, verbs, prefix), str(prefix), winetricks_env(proton, prefix),
                                                   "winetricks"), log_path)
         try:
             return proc.wait(timeout=self.TRIAL_WINETRICKS_SECONDS)

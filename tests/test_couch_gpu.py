@@ -108,6 +108,24 @@ def test_the_intro_video_is_drawn_by_opengl(intro_on, qtbot):
     couch.force_close()
 
 
+@pytest.mark.skipif(not couch_intro.VIDEO.is_file(), reason="intro video not built")
+def test_an_intro_frame_is_converted_without_taking_couch_modes_opengl_context(intro_on, qtbot):
+    """Qt converts video frames with an OpenGL context of its own and left it current: done while couch mode's
+    frame was drawn, the rest of the frame went elsewhere — the intro flickered."""
+    from PySide6.QtGui import QOpenGLContext
+    win, _core, _ = intro_on
+    win.open_couch()
+    qtbot.waitUntil(lambda: win.couch is not None and win.couch.isVisible(), timeout=5000)
+    couch = win.couch
+    gl = GL(couch)
+    qtbot.waitUntil(lambda: couch.intro is not None and couch.intro.state == "playing", timeout=3000)
+    frame = couch.intro._sink.videoFrame()
+    gl.ctx.makeCurrent(gl.surf)
+    assert not couch_intro._to_image(frame).isNull()
+    assert QOpenGLContext.currentContext() is gl.ctx
+    couch.force_close()
+
+
 def test_gpu_setting_chooses_the_window_and_falls_back_when_opengl_does_not_start(ui, qtbot, monkeypatch):
     win, core, _ = ui
     from ezgd.ui import couch as C
