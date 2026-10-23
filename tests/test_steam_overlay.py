@@ -236,7 +236,8 @@ def test_a_steam_controller_keeps_steams_overlay_and_the_app_sees_it(library, tm
 
 def test_our_overlay_instead_of_steams(library, tmp_path, monkeypatch):
     """Settings → "Our overlay instead of Steam's": games start without Steam's overlay and not through Steam — the
-    quick menu is the overlay (friends, chat, invites, carried out by Steam)."""
+    quick menu is the overlay (friends, chat, invites, carried out by Steam). They are still added to Steam (its
+    library), but Play starts them here."""
     root = fake_steam(tmp_path, monkeypatch, running=True)
     library.settings.set("steam_root", str(root))
     library.settings.set("launch_through_steam", True)
@@ -246,7 +247,7 @@ def test_our_overlay_instead_of_steams(library, tmp_path, monkeypatch):
     library.settings.set("own_overlay", True)
     assert "own overlay" in library.overlay_available()
     st = library.steam_overlay_status(e.id)
-    assert st["use"] is False and "own overlay" in st["reason"]
+    assert st.get("add_only") is True                     # into Steam's library, started here
     plan = library.launch(e.id, confirmed=True)
     assert "Steam overlay" not in plan.description and "LD_PRELOAD" not in plan.env
     assert "own overlay" in library.preview(e.id)["description"]
@@ -587,3 +588,34 @@ def test_two_library_copies_of_a_game_get_one_steam_entry(library, tmp_path, mon
     assert library.prepare_steam_shortcuts()["games"] == 1
     sc = steam.shortcuts_of(root, "1234")
     assert len(sc) == 1 and sc[0]["LaunchOptions"].endswith(f"--play {second.id}")
+
+
+def test_our_overlay_adds_the_game_to_steam_then_plays_it_here():
+    """With our overlay on, Play adds the game to Steam's library (while Steam is closed), starts Steam — it must
+    come up to keep the list, and the overlay and the controller's game layout need it — then the game directly."""
+    from types import SimpleNamespace
+    from ezgd.ui.actions import Actions
+    calls, shown = [], []
+
+    class Core:
+        def library_call(self, name, *args):
+            return (name, args)
+
+    class Bridge:
+        def call(self, coro, ok=None, err=None, owner=None):
+            calls.append(coro)
+            ok({"games": 1, "restarted": False, "skipped": []} if coro[0] == "prepare_steam_shortcuts" else True)
+    fake = SimpleNamespace(bridge=Bridge(), core=Core(), _told_in_steam=set(), settings={},
+                           toasts=SimpleNamespace(show=lambda *a: shown.append(a[0])), fail=lambda *a: None)
+    entry = SimpleNamespace(id=7, title="Dark Souls III")
+    started = []
+    Actions._add_then_play(fake, None, entry, {"use": True, "add_only": True, "ready": False,
+                                               "steam_running": False}, False, lambda note="": started.append(1))
+    assert calls == [("prepare_steam_shortcuts", (False,)), ("start_steam", ())] and started == [1]
+    calls.clear()
+    Actions._add_then_play(fake, None, entry, {"use": True, "add_only": True, "ready": True}, False,
+                           lambda note="": started.append(2))
+    assert calls == [] and started == [1, 2]                     # already in Steam: straight to the game
+    Actions._add_then_play(fake, None, entry, {"use": True, "add_only": True, "ready": False,
+                                               "steam_running": True}, True, lambda note="": started.append(3))
+    assert calls == [] and started[-1] == 3                      # couch mode never restarts Steam

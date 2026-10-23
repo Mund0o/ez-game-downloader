@@ -358,12 +358,16 @@ class BrowserDownloads(QObject):
         self._timer.setInterval(1000)
         self._timer.timeout.connect(self._tick)
 
-    @property
-    def dest(self) -> Path:
+    def dest_for(self, game) -> Path:
+        """Where a download from the in-app browser goes: like every download, the game's own folder in the
+        installation folder (or the download folder when that is switched off). It used to be one shared "Browser
+        downloads" folder, where the archives stayed after the game was installed."""
+        from ezgd.core.fsutil import safe_dirname
         st = self.actions.settings
         if st.get("downloads_in_game_folder", True) and st.get("install_dir"):
-            return Path(st["install_dir"]) / "Browser downloads"      # one folder for everything
-        return Path(st.get("download_dir") or Path.home() / "Downloads") / "Browser downloads"
+            base = Path(st["install_dir"])
+            return base / safe_dirname(game.title) if game is not None and game.title else base / "Browser downloads"
+        return Path(st.get("download_dir") or Path.home() / "Downloads")
 
     def active(self) -> int:
         return sum(1 for d in self.items.values() if d.state in ("downloading", "paused"))
@@ -390,8 +394,9 @@ class BrowserDownloads(QObject):
             req.cancel()                              # already downloading it (a double click, a page asking twice)
             log.info("browser download: %s is already downloading — the second request was dropped", name)
             return
-        self.dest.mkdir(parents=True, exist_ok=True)
-        req.setDownloadDirectory(str(self.dest))
+        dest = self.dest_for(session.game)
+        dest.mkdir(parents=True, exist_ok=True)
+        req.setDownloadDirectory(str(dest))
         req.accept()
         d = BrowserDownload(self._next, req, session.game, _host(req.url()) or session.host_label, session)
         self._next += 1
@@ -476,7 +481,8 @@ class BrowserDownloads(QObject):
         if entry_id is not None and not any(volume_of(x.path) for x in files):   # e.g. the fix, later
             coro = self._extract_into(entry_id, [str(x.path) for x in files])
         else:
-            coro = core.import_downloaded_files(game.id, [str(x.path) for x in files])
+            # the archives are only the way in: deleted once the game is extracted from them
+            coro = core.import_downloaded_files(game.id, [str(x.path) for x in files], delete_after=True)
         self.actions.bridge.call(coro, ok, failed)
 
     def _start_torrent(self, game, x: BrowserDownload) -> None:
@@ -501,7 +507,7 @@ class BrowserDownloads(QObject):
         core = self.actions.core
         e = core.library.get(entry_id)
         for p in paths:
-            await core.extract_entry(entry_id, p)
+            await core.extract_entry(entry_id, p, delete_archive=True)
         return {"entry_id": entry_id, "title": e.title, "verified": None, "extracting": False}
 
     # commands from the Downloads page
@@ -854,7 +860,11 @@ class BrowserDownloadDialog(QDialog):
             self._drop(page)
 
     def _page_crashed(self, page, status) -> None:
-        if status == QWebEnginePage.NormalTerminationStatus or page is not self.current:
+        if status == QWebEnginePage.NormalTerminationStatus:
+            return
+        log.warning("browser: the page process of %s ended (%s)%s", page.url().toString()[:200],
+                    getattr(status, "name", status), "" if page is self.current else " — a background tab")
+        if page is not self.current:
             return
         self._show_notice("The page crashed.", "Reload", lambda: self._replace_current(True))
 

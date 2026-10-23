@@ -412,6 +412,10 @@ class SettingsPage(QWidget):
                                             "uninstalls)",
                     "Zips each game's saves from its Proton prefix (caches and logs left out). Backups are kept per "
                     "game title in the app's data folder, so a reinstall finds them again.")
+        self._check(f, "keep_more_save_backups", "Keep more than 3 save backups per game",
+                    "Off: each game keeps its newest 3 backups — when a new one is made, the oldest is deleted. On: "
+                    "10 automatic, 10 safety (before updates, uninstalls, restores) and 20 you made yourself. Only "
+                    "this computer's backups are ever deleted.")
         sync = self._folder(f, "save_sync_dir", "Synced save folder")
         sync.setPlaceholderText("optional — a Syncthing / Nextcloud / Google Drive folder: your saves on every PC")
         sync.setToolTip("Save backups are written into “EZ Game saves” in this folder, so another computer with the "
@@ -462,9 +466,10 @@ class SettingsPage(QWidget):
                     "(same Proton setup and fixes), so Steam gives them the whole overlay and Steam Input. Steam has "
                     "to restart once for that (the app asks first); the change is verified and backed up, and put "
                     "back automatically if Steam does not start normally. OnlineFix games do not see Steam's game "
-                    "ids (they trigger OnlineFix's activation message).")
-        for key in ("steam_overlay", "launch_through_steam"):          # (ours replaces Steam's while it is on)
-            own.toggled.connect(lambda on, w=self.widgets[key]: w.setEnabled(not on))
+                    "ids (they trigger OnlineFix's activation message). With our overlay on, games are still added "
+                    "to Steam, but Play starts them here (with the quick menu instead of Steam's overlay).")
+        # ours replaces Steam's overlay while it is on (the games are still added to Steam)
+        own.toggled.connect(lambda on, w=self.widgets["steam_overlay"]: w.setEnabled(not on))
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(button("Remove the app's games from Steam…", "trash", "ghost",

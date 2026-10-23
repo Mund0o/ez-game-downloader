@@ -589,18 +589,32 @@ def test_with_our_overlay_a_steam_tap_is_the_quick_menu(ui, qtbot, tmp_path, mon
     monkeypatch.setattr(core.library, "has_steam_overlay", lambda gid: True)
     monkeypatch.setitem(couch.actions.settings, "own_overlay", True)
     monkeypatch.setitem(couch.actions.settings, "steam_button_tip_seen", False)
+    from PySide6.QtGui import QColor, QImage
+    from ezgd.platform import hidden
+    shot = QImage(1600, 1600, QImage.Format_RGB32)
+    shot.fill(QColor("red"))
+    monkeypatch.setattr(hidden, "capture_screen", lambda name=None, timeout=1.0: shot)   # the game, just before
+    holds = []
+    monkeypatch.setattr(core.library, "input_hold", holds.append)
     couch.pads._steam_guide(False)                                   # a tap Steam logged
     qtbot.waitUntil(lambda: couch.quick is not None and couch.quick._shown >= 1.0, timeout=5000)
     q = couch.quick
     assert q.rows[0].key == "resume" and couch.actions.settings["steam_button_tip_seen"] is False
     assert "friends, chat and invites" in couch._starting_text()
+    assert q._still is not None                    # a game that minimizes itself: its picture stays behind the menu
+    img = q.grab().toImage()
+    assert img.pixelColor(5, img.height() // 2).red() > 60          # (dimmed red at the far left, not the desktop)
+    qtbot.waitUntil(lambda: holds == [True], timeout=3000)           # Steam's layout left alone while it is open
     q.command("b")
     qtbot.waitUntil(lambda: not q.isVisible(), timeout=3000)
+    qtbot.waitUntil(lambda: holds[-1] is False, timeout=3000)        # closed: the game layout comes back
+    assert q._still is None
     page = win.pages["settings"]
     own, steam_ov = page.widgets["own_overlay"], page.widgets["steam_overlay"]
     page._loading = True                                             # (shown, not saved)
     own.setChecked(True)
-    assert not steam_ov.isEnabled() and not page.widgets["launch_through_steam"].isEnabled()
+    assert not steam_ov.isEnabled()
+    assert page.widgets["launch_through_steam"].isEnabled()          # (the games are still added to Steam)
     own.setChecked(False)
     assert steam_ov.isEnabled()
     page._loading = False

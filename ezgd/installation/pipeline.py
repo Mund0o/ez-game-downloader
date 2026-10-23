@@ -177,7 +177,7 @@ class PostProcessor:
         return vol.expected_parts(names, set_key)
 
     async def add_volume(self, entry: LibraryEntry, part: Path, volume, password: str | None, *,
-                         extract: bool = True, dest: Path | None = None) -> dict:
+                         extract: bool = True, dest: Path | None = None, delete_archive: bool | None = None) -> dict:
         """Record one finished part; extract the set from its first volume once every part is present."""
         status = vol.set_status(part.parent, volume.set_key, self.expected_parts(entry.game_id, volume.set_key))
         entry.download_path = str(part.parent / volume.first_name)
@@ -203,7 +203,7 @@ class PostProcessor:
 
         try:
             ok = await self.extract(entry, status.first, dest or self.default_extract_dest(entry, status.first),
-                                    password, download_root=part.parent)
+                                    password, download_root=part.parent, delete_archive=delete_archive)
         finally:
             self._sets_extracting.discard(key)
         return {"complete": True, "summary": status.summary, "extracting": True, "extracted": ok}
@@ -337,7 +337,9 @@ class PostProcessor:
 
     # ------------------------------------------------------------ extraction
     async def extract(self, entry: LibraryEntry, archive: Path, dest: Path, password: str | None = None,
-                      download_root: Path | None = None) -> bool:
+                      download_root: Path | None = None, delete_archive: bool | None = None) -> bool:
+        """Extract ``archive`` into ``dest`` for ``entry``. ``delete_archive``: delete it (and its other volumes)
+        afterwards — None: as Settings say (in-app browser downloads always go: they were only ever the way in)."""
         ext_id = self.extractions.create(entry.download_id, entry.id, str(archive), str(dest))
         cancel = threading.Event()
         self._cancel[ext_id] = cancel
@@ -425,7 +427,7 @@ class PostProcessor:
             entry.notes = " ".join(filter(None, [entry.notes, *notes]))
         installer = await asyncio.to_thread(self._mark_installer, entry)
         self.library.update(entry)
-        if self.settings.settings.delete_archive_after_extract:
+        if delete_archive if delete_archive is not None else self.settings.settings.delete_archive_after_extract:
             root = download_root if download_root is not None else self.app_folder_of(archive)
             if root is not None:
                 self._delete_archive(archive, root)

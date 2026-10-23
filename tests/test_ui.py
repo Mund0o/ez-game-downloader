@@ -330,6 +330,9 @@ def test_in_app_browser_download_to_library(ui, qtbot, server, tmp_path):
     m = browser.manager(win.actions)
     [d] = [d for d in m.items.values() if d.game.id == g.id]
     assert d.state == "completed" and e.download_path == str(d.path) and d.path.name == "Game.zip"
+    assert d.path.parent.name == "Browser Game"                                      # the game's own folder   # the game's own folder
+    qtbot.waitUntil(lambda: core.library.get(e.id).install_path is not None and not d.path.exists(),
+                    timeout=20000)                       # extracted, then the archive is gone
     qtbot.waitUntil(lambda: "added to your Library" in next(iter(page.browser_rows.values())).info.text(),
                     timeout=5000)
     if os.environ.get("EZGD_SHOTS"):

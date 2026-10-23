@@ -749,7 +749,8 @@ class AppCore:
                    "remove_steam_shortcuts", "last_run_status", "start_steam", "stop_completely",
                    "backup_saves", "save_backups", "restore_save_backup", "delete_save_backup",
                    "suspend", "resume", "resume_all", "suspended_ids", "game_volume", "set_game_volume", "protons",
-                   "session_seconds", "game_processes", "has_steam_overlay", "auto_executable", "set_mangohud"}
+                   "session_seconds", "game_processes", "has_steam_overlay", "auto_executable", "set_mangohud",
+                   "input_hold"}
         if method not in allowed:
             raise ValueError(f"unknown library call {method}")
         fn = getattr(self.library, method)
@@ -810,12 +811,13 @@ class AppCore:
         return sorted(set(found))
 
     async def extract_entry(self, entry_id: int, archive: str, dest: str | None = None,
-                            password: str | None = None) -> bool:
+                            password: str | None = None, delete_archive: bool | None = None) -> bool:
         e = self.library.get(entry_id)
         pw = password if password is not None else await self.entry_password(entry_id)
         dest_p = Path(dest) if dest else self.post.default_extract_dest(e, Path(archive))
         return await self.post.extract(e, Path(archive), dest_p, pw,
-                                       download_root=Path(e.download_path) if e.download_path else None)
+                                       download_root=Path(e.download_path) if e.download_path else None,
+                                       delete_archive=delete_archive)
 
     async def import_downloaded_file(self, game_id: str, path: str, *, verify: bool = True,
                                      extract: bool = True) -> dict:
@@ -827,8 +829,10 @@ class AppCore:
         return await self.import_downloaded_files(game_id, [path], verify=verify, extract=extract)
 
     async def import_downloaded_files(self, game_id: str, paths: list[str], *, verify: bool = True,
-                                      extract: bool = True) -> dict:
-        """Several files from one browser session (game + fix, multi-part archives) → one library entry."""
+                                      extract: bool = True, delete_after: bool = False) -> dict:
+        """Several files from one browser session (game + fix, multi-part archives) → one library entry.
+        ``delete_after``: the files are deleted once the game is extracted from them (the in-app browser's
+        downloads — files the user picked are left to the "delete the archive" setting)."""
         g = self.games.get(game_id)
         if g is None:
             raise SourceError("Open the game's page again, then import the file.")
@@ -862,7 +866,7 @@ class AppCore:
         volumes = {p: v for p in files if (v := volume_of(p)) is not None}
         if volumes:
             return await self._import_volumes(g, volumes, [p for p in files if p not in volumes], verified,
-                                              extract)
+                                              extract, delete_after)
         main = max(files, key=lambda p: p.stat().st_size)
         updating = self.post.updating_entry(g.id, g.title)
         if updating is not None:                  # the new version of a game in the Library: it goes over that one
@@ -891,7 +895,8 @@ class AppCore:
             async def run() -> None:
                 for a in archives:                # one after another into the same game folder
                     # the folder the file was imported from: "delete the archive after extraction" applies here too
-                    if not await self.post.extract(entry, a, dest, password, download_root=a.parent):
+                    if not await self.post.extract(entry, a, dest, password, download_root=a.parent,
+                                                   delete_archive=True if delete_after else None):
                         break
             self._watch_task(asyncio.create_task(run()), "Installing failed", entry.title, entry.id)
         try:
@@ -918,7 +923,8 @@ class AppCore:
             self.emit("notify", (what, f"{title}: {exc}" if title else str(exc), extra))
         task.add_done_callback(done)
 
-    async def _import_volumes(self, g: Game, volumes: dict, others: list[Path], verified, extract: bool) -> dict:
+    async def _import_volumes(self, g: Game, volumes: dict, others: list[Path], verified, extract: bool,
+                              delete_after: bool = False) -> dict:
         entry = None
         summaries, extracting, complete = [], False, True
         by_set: dict[str, list[Path]] = {}
@@ -940,12 +946,13 @@ class AppCore:
                 extracting = True
             # record the parts and, once complete, extract in the background (it can take minutes)
             dest = self.post.update_dest(entry) if (entry.release or {}).get("updating") else None
-            self._watch_task(asyncio.create_task(self.post.add_volume(entry, part, volumes[part], password,
-                                                                      extract=extract, dest=dest)),
+            self._watch_task(asyncio.create_task(self.post.add_volume(
+                entry, part, volumes[part], password, extract=extract, dest=dest,
+                delete_archive=True if delete_after else None)),
                              "Installing failed", entry.title, entry.id)
         for p in others:                            # e.g. a separately downloaded fix archive
             if entry is not None and detect_format(p):
-                await self.extract_entry(entry.id, str(p))
+                await self.extract_entry(entry.id, str(p), delete_archive=True if delete_after else None)
         try:
             await self.lookup_steam_app_id(entry.id)
         except Exception as exc:

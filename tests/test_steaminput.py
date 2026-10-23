@@ -43,6 +43,57 @@ def test_switches_are_read_from_steams_log(tmp_path):
     assert steaminput.took(root2, steaminput.log_size(root2), 480, wait=0.3) is None      # no controller
 
 
+def test_the_game_layout_comes_back_after_the_steam_button(tmp_path, monkeypatch):
+    """Steam drops a forced layout when its Steam button is pressed: the chord layout, then the desktop one — the
+    virtual pad goes and the game has no controller (a friend's Dark Souls III). The game layout is asked for again,
+    but not while the quick menu is open (it runs on the desktop layout's keys)."""
+    root, sent, opener = fake_steam(tmp_path)
+    monkeypatch.setattr(steaminput.Forced, "WATCH_SECONDS", 0.05)
+    monkeypatch.setattr(steaminput.Forced, "RETRY_SECONDS", 0.0)
+    log = root / "logs" / "controller.txt"
+
+    def steam_switches(*apps):
+        with open(log, "a") as fh:
+            for a in apps:
+                fh.write(f"[2026-10-23 03:19:49] Queueing activation for controller: 0 app: {a}\n")
+    f = steaminput.Forced(tmp_path / "marker", opener, root=lambda: root)
+    f.start(1)
+    assert sent == ["steam://forceinputappid/480"]
+    time.sleep(0.2)
+    f.hold(True)                                       # the quick menu opened with the Steam button
+    steam_switches(443510, 413080)
+    time.sleep(0.3)
+    assert sent == ["steam://forceinputappid/480"]     # the menu runs on the desktop layout meanwhile
+    f.hold(False)                                      # closed: the game layout again (and Steam takes it)
+    deadline = time.monotonic() + 3
+    while len(sent) < 2 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert sent[1:] == ["steam://forceinputappid/480"]
+    time.sleep(0.2)
+    steam_switches(443510, 413080)                     # a tap without the menu: back by itself
+    while len(sent) < 3 and time.monotonic() < deadline + 3:
+        time.sleep(0.02)
+    assert sent[2:] == ["steam://forceinputappid/480"]
+    time.sleep(0.2)
+    steam_switches(4000)                               # a game Steam started itself: its layout is left alone
+    time.sleep(0.3)
+    assert len(sent) == 3
+    assert f.end(1) and sent[-1] == "steam://forceinputappid/0"
+
+
+def test_a_line_steam_is_still_writing_is_read_next_time(tmp_path):
+    root, _sent, _opener = fake_steam(tmp_path)
+    log = root / "logs" / "controller.txt"
+    pos = steaminput.log_size(root)
+    with open(log, "a") as fh:
+        fh.write("[x] Queueing activation for controller: 0 app: 480\n[x] Queueing activation for contr")
+    got, pos = steaminput.read_activations(root, pos)
+    assert got == [(0, 480)]
+    with open(log, "a") as fh:
+        fh.write("oller: 0 app: 413080\n")
+    assert steaminput.read_activations(root, pos)[0] == [(0, 413080)]
+
+
 @pytest.fixture
 def steam_here(core, tmp_path, monkeypatch):  # noqa: F811
     root, sent, opener = fake_steam(tmp_path)

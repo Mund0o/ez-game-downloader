@@ -17,10 +17,12 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-# the in-app browser (Chromium): draw pages and decode video on the graphics card, also on drivers Chromium is
-# unsure about
-CHROMIUM_FLAGS = ("--enable-gpu-rasterization", "--enable-zero-copy", "--ignore-gpu-blocklist",
-                  "--enable-features=VaapiVideoDecoder,VaapiVideoDecodeLinuxGL")
+# the in-app browser (Chromium): decode video on the graphics card. Pages are drawn on it wherever Chromium trusts
+# the driver — its own blocklist decides. Overriding that (--ignore-gpu-blocklist, --enable-zero-copy, forced GPU
+# rasterization) left a friend's pop-up browser frozen on his laptop (2026-10-23): the page's script still answered
+# (no "not responding" in his log) while nothing was drawn any more — the GPU side, on a driver Chromium would not
+# have used.
+CHROMIUM_FLAGS = ("--enable-features=VaapiVideoDecoder,VaapiVideoDecodeLinuxGL",)
 MARKER = "gpu-start"                  # in the data folder while a GPU start is under way
 
 

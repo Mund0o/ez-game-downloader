@@ -13,6 +13,14 @@ back to Steam. The app uses Spacewar's (480): the layout OnlineFix games already
 the player changed it (Steam → Spacewar → Controller layout). Whether Steam took the switch is read back from
 controller.txt and logged, not assumed. A marker file remembers a forced layout, so one left by a crashed app is
 handed back at the next start (else the controller would stay a gamepad on the desktop).
+
+Steam does not keep a forced layout through its own Steam button: pressing it switches to the guide-chord layout
+(443510) and, on release, to the **desktop** one (413080) — not back to the forced app. Steam's virtual pad goes away
+with it and the game has no controller until it ends (a friend's Dark Souls III, 2026-10-23: "controller
+disconnected" 14 ms after the button, never back; controller.txt here: 480 → 443510 → 413080 within a second).
+While a forced game runs, :class:`Forced` watches controller.txt and asks for the game layout again when Steam fell
+back to its desktop or Big Picture layout — except while the app's quick menu is over the game (``hold``): that
+menu is driven by the keys of Steam's desktop layout, and gets the game layout back as soon as it closes.
 """
 
 from __future__ import annotations
@@ -20,13 +28,17 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
+from typing import Callable
 
 log = logging.getLogger(__name__)
 
 GAME_LAYOUT = 480                # Spacewar: what OnlineFix games already get
 DESKTOP = 413080                 # Steam's desktop configuration
+BIG_PICTURE = 413090             # Steam's Big Picture configuration
+CHORD = 443510                   # Steam's guide-chord configuration (while the Steam button is held)
 ACTIVATED = re.compile(r"Queueing activation for controller: (\d+) app: (-?\d+)")
 
 
@@ -47,15 +59,24 @@ def log_size(root: Path | None) -> int:
 
 def activations(root: Path | None, since: int) -> list[tuple[int, int]]:
     """(controller, app) of each layout Steam switched to since byte ``since`` of controller.txt."""
+    return read_activations(root, since)[0]
+
+
+def read_activations(root: Path | None, since: int) -> tuple[list[tuple[int, int]], int]:
+    """:func:`activations` and the byte the log was read up to (where to go on from next time)."""
     if root is None:
-        return []
+        return [], since
     try:
         with open(root / "logs" / "controller.txt", "rb") as fh:
-            fh.seek(since if since <= fh.seek(0, 2) else 0)
-            text = fh.read(512 * 1024).decode("utf-8", "replace")
+            fh.seek(since if since <= fh.seek(0, 2) else 0)        # (a new, shorter log: from its start)
+            data = fh.read(512 * 1024)
+            end = fh.tell()
     except OSError:
-        return []
-    return [(int(c), int(a)) for c, a in ACTIVATED.findall(text)]
+        return [], since
+    cut = data.rfind(b"\n") + 1                     # a line Steam is still writing is read next time
+    if 0 < cut < len(data):
+        data, end = data[:cut], end - (len(data) - cut)
+    return [(int(c), int(a)) for c, a in ACTIVATED.findall(data.decode("utf-8", "replace"))], end
 
 
 def took(root: Path | None, since: int, appid: int, wait: float = 6.0) -> bool | None:
@@ -74,13 +95,22 @@ def took(root: Path | None, since: int, appid: int, wait: float = 6.0) -> bool |
 class Forced:
     """The layout the app forced, per game; handed back (``/0``) when the last of them ends."""
 
-    def __init__(self, marker: Path, opener=None):
+    WATCH_SECONDS = 1.0            # how often controller.txt is looked at while a forced game runs
+    RETRY_SECONDS = 3.0            # between two requests for the game layout
+    MAX_TRIES = 3                  # requests in a row that Steam did not answer with the game layout: give up
+
+    def __init__(self, marker: Path, opener=None, root: Callable[[], Path | None] | None = None):
         self.marker = marker
         self.games: set[int] = set()
         if opener is None:
             from ezgd.platform.steam import open_steam_url
             opener = open_steam_url
         self._open = opener
+        self._root = root                  # Steam's folder (its controller log); None: no watching
+        self.held = False                  # the app's quick menu is over the game: leave Steam's layout alone
+        self._wake = threading.Event()
+        self._watcher: threading.Thread | None = None
+        self._appid = GAME_LAYOUT
 
     def start(self, entry_id: int, appid: int = GAME_LAYOUT) -> None:
         first = not self.games
@@ -91,7 +121,46 @@ class Forced:
                 self.marker.write_text(str(appid), "utf-8")
             except OSError:
                 pass
+        self._appid = appid
         self._open(url(appid))
+        if self._root is not None and (self._watcher is None or not self._watcher.is_alive()):
+            self._watcher = threading.Thread(target=self._watch, name="steam-input-watch", daemon=True)
+            self._watcher.start()
+
+    def hold(self, on: bool) -> None:
+        """The quick menu opened (``True``) or closed over a forced game. Closed: the game layout comes back at once
+        if Steam dropped it."""
+        self.held = bool(on)
+        if not on:
+            self._wake.set()
+
+    def _watch(self) -> None:
+        root = self._root() if self._root else None
+        if root is None:
+            return
+        pos = log_size(root)
+        last, tries, next_try = self._appid, 0, 0.0
+        while self.games:
+            self._wake.wait(self.WATCH_SECONDS)
+            self._wake.clear()
+            got, pos = read_activations(root, pos)
+            if got:
+                last = got[-1][1]
+                if last == self._appid:
+                    tries = 0
+            if not self.games or self.held or last not in (DESKTOP, BIG_PICTURE):
+                continue                   # (the chord while the button is held; another game Steam started)
+            now = time.monotonic()
+            if tries >= self.MAX_TRIES or now < next_try:
+                continue
+            tries += 1
+            next_try = now + self.RETRY_SECONDS
+            log.info("Steam went back to its %s controller layout while a game runs (its Steam button) — asking "
+                     "for the game layout again", "desktop" if last == DESKTOP else "Big Picture")
+            try:
+                self._open(url(self._appid))
+            except Exception:
+                log.exception("could not ask Steam for the game layout")
 
     def end(self, entry_id: int) -> bool:
         """True when this was the last game: Steam chooses the layout again."""

@@ -168,6 +168,7 @@ class QuickMenu(QWidget):
         self._pending_art = False
         self.opened_at = 0.0
         self._steam_tip = False            # this time the menu shows the one-time Steam-button tip
+        self._still = None                 # the game's picture taken just before the menu opened (a QPixmap)
         self._anim = QVariantAnimation(self)
         self._anim.setEasingCurve(QEasingCurve.OutCubic)
         self._anim.valueChanged.connect(self._shown_step)
@@ -213,6 +214,8 @@ class QuickMenu(QWidget):
         if self._own_overlay():
             self._chat_tick.start()
         screen = self.couch._target_screen or self.couch.screen() or QApplication.primaryScreen()
+        if not self.isVisible():
+            self._still = self._picture_of_game(screen) if game is not None else None
         if self.windowHandle() is None:
             self.create()
         if self.windowHandle() is not None and screen is not None:
@@ -220,6 +223,7 @@ class QuickMenu(QWidget):
         if screen is not None:
             self.setGeometry(screen.geometry())
         self.showFullScreen()
+        self._input_hold(True)
         self.raise_()
         self.activateWindow()
         self.wc.keep_above(True)
@@ -235,6 +239,38 @@ class QuickMenu(QWidget):
         self._tick.start()
         self.couch.sounds.play("select")
         log.info("quick menu opened for %s", game.title if game else "the suspended games")
+
+    def _picture_of_game(self, screen):
+        """The screen as it is right before the menu opens — the game. Some games minimize themselves the moment
+        another window takes the focus (Dark Souls III in full screen): the see-through menu then showed the desktop
+        (a friend, 2026-10-23). The picture stays behind the menu instead. None: not possible here (not KDE)."""
+        from PySide6.QtGui import QPixmap
+        from ezgd.platform import hidden
+        try:
+            img = hidden.capture_screen(screen.name() if screen is not None else None)
+        except Exception:
+            log.exception("quick menu: the picture of the game could not be taken")
+            return None
+        if img is None or img.isNull() or screen is None:
+            return None
+        g = screen.geometry()
+        dpr = max(1.0, img.width() / max(1, g.width()))
+        pm = QPixmap.fromImage(img)
+        pm.setDevicePixelRatio(dpr)                  # the screen's real pixels: drawn 1:1, no scaling per frame
+        return pm
+
+    def _input_hold(self, on: bool) -> None:
+        """While the menu is open Steam's controller layout is left alone; closed, the game gets its layout back
+        (Steam drops it when its Steam button is pressed — see steaminput)."""
+        if self.game is None and on:
+            return
+        b = self.couch.bridge
+        b.call(b.core.library_call("input_hold", on), None, lambda _e: None, owner=self)
+
+    def hideEvent(self, event) -> None:
+        self._still = None
+        self._input_hold(False)
+        super().hideEvent(event)
 
     def _first_steam_tip(self) -> bool:
         """Once ever, with a Steam-held Steam Controller: say that a tap of its Steam button is Steam's overlay
@@ -1136,6 +1172,8 @@ class QuickMenu(QWidget):
             p.setCompositionMode(QPainter.CompositionMode_Source)
             p.fillRect(self.rect(), Qt.transparent)
             p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+            if self._still is not None:                 # the game as it was (it may have minimized): from frame one
+                p.drawPixmap(self.rect(), self._still)
             if t <= 0.001:
                 return
             self._paint_backdrop(p, t)

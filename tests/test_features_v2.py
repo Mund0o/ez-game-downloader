@@ -144,6 +144,7 @@ def test_save_restore_needs_the_prefix_and_backups_are_pruned(tmp_path):
     from ezgd.library import saves
     with pytest.raises(saves.SaveBackupError):
         saves.restore(tmp_path / "x.zip", tmp_path / "nothing")
+    saves.set_owner("me", tmp_path / "backup-key")              # only this computer's backups are pruned
     prefix = tmp_path / "game-2"
     save = make_saves(prefix)
     folder = tmp_path / "bk"
@@ -152,6 +153,28 @@ def test_save_restore_needs_the_prefix_and_backups_are_pruned(tmp_path):
         os.utime(save, (time.time() + i, time.time() + i))
         assert saves.backup(prefix, folder, title="G", reason="auto") is not None
     assert len(saves.list_backups(folder)) == saves.KEEP["auto"]
+
+
+def test_save_backups_keep_the_newest_3_and_never_the_one_being_restored(tmp_path):
+    from ezgd.library import saves
+    saves.set_owner("me", tmp_path / "backup-key")
+    prefix = tmp_path / "game-3"
+    save = make_saves(prefix)
+    folder = tmp_path / "bk"
+    made = []
+    for i, reason in enumerate(["auto", "manual", "before-update", "auto", "auto"]):
+        save.write_bytes(f"v{i}".encode())
+        os.utime(save, (time.time() + i, time.time() + i))
+        made.append(saves.backup(prefix, folder, title="G", reason=reason, keep=saves.KEEP_FEW))
+        time.sleep(0.01)
+    assert [b.path for b in saves.list_backups(folder)] == [b.path for b in reversed(made[-3:])]
+    oldest = saves.list_backups(folder)[-1].path                 # restoring the oldest: its safety backup keeps it
+    save.write_bytes(b"before restore")
+    saves.backup(prefix, folder, title="G", reason="before-restore", keep=saves.KEEP_FEW, protect=oldest)
+    assert oldest.exists() and len(saves.list_backups(folder)) == 4
+    save.write_bytes(b"after")
+    saves.backup(prefix, folder, title="G", reason="auto", keep=saves.KEEP_FEW)
+    assert len(saves.list_backups(folder)) == 3 and not oldest.exists()
 
 
 def test_umu_style_prefix_layout(tmp_path):

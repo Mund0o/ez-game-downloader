@@ -57,3 +57,15 @@ def test_the_dialog_installs_what_is_ticked(ui, qtbot, monkeypatch):
     qtbot.waitUntil(lambda: asked == [["umu"]], timeout=5000)
     dlg._live.stop()
     dlg.reject()
+
+
+def test_the_rar_check_says_when_unrar_itself_is_not_installed(monkeypatch):
+    """A ✔ next to "UnRAR / 7-Zip" read as "unrar is installed" when only the app's own 7-Zip was there."""
+    from ezgd.installation import archives
+    from ezgd.platform import deps
+    monkeypatch.setattr(archives, "bundled_7zip", lambda: "/app/tools/7zzs")
+    monkeypatch.setattr(archives, "find_rar_tool", lambda explicit=None: ("7z", "/app/tools/7zzs"))
+    assert deps.tool_detail("rar").startswith("UnRAR is not installed — the 7-Zip that comes with the app")
+    assert next(t for t in deps.LINUX_TOOLS if t.key == "rar").name == "RAR extractor"
+    monkeypatch.setattr(archives, "find_rar_tool", lambda explicit=None: ("unrar", "/usr/bin/unrar"))
+    assert deps.tool_detail("rar") == "UnRAR at /usr/bin/unrar"

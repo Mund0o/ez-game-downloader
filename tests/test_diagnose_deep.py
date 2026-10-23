@@ -267,3 +267,32 @@ def test_a_dll_this_proton_lacks_suggests_another_proton(tmp_path):
     r = dg.diagnose(e, tmp_path / "pfx", log, protons=[cachy, ge], proton_name=cachy.name).to_dict()
     keys = [f["key"] for f in r["findings"]]
     assert "proton-lacks:uiautomationcore.dll" in keys and "missing-file:uiautomationcore.dll" not in keys
+
+
+def test_vulkaninfo_runs_once_however_many_ask_at_once(monkeypatch):
+    """Every Diagnose ran vulkaninfo, several at once when the Library asked for many games — and bursts of it made
+    the NVIDIA driver freeze the whole screen for seconds. Now once per run of the app, never two at the same time."""
+    import threading
+    import time
+    monkeypatch.setenv("EZGD_VULKANINFO", "1")
+    monkeypatch.setattr(syscheck, "_gpus_found", None)
+    monkeypatch.setattr(syscheck.shutil, "which", lambda name: "/usr/bin/vulkaninfo")
+    runs = []
+
+    class Done:
+        stdout = "Devices:\n========\nGPU0:\n\tapiVersion = 1.4.351\n\tdeviceName = NVIDIA GeForce RTX 4090\n\tdriverName = NVIDIA\n"
+
+    def run(cmd, **kw):
+        runs.append(cmd)
+        time.sleep(0.2)                                    # (slow, like the real one)
+        return Done()
+    monkeypatch.setattr(syscheck.subprocess, "run", run)
+    got = []
+    threads = [threading.Thread(target=lambda: got.append(syscheck.gpus())) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(runs) == 1 and len(got) == 6
+    assert all(g[1] and g[0][0].name == "NVIDIA GeForce RTX 4090" for g in got)
+    assert syscheck.gpus()[0][0].name == "NVIDIA GeForce RTX 4090" and len(runs) == 1

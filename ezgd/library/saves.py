@@ -44,7 +44,8 @@ SKIP_SUFFIXES = (".log", ".dmp", ".mdmp", ".dxvk-cache", ".dxvk.bin", ".dxvk.lut
                  ".shadercache", ".pipelinecache")
 MAX_FILE = 512 * 1024 * 1024                  # a single "save" bigger than this is not a save
 AUTO_MAX_BYTES = 768 * 1024 * 1024            # automatic backups skip games whose saves are larger
-KEEP = {"auto": 10, "safety": 10, "manual": 20}
+KEEP = {"auto": 10, "safety": 10, "manual": 20}  # with "Keep more save backups" on
+KEEP_FEW = 3                                     # otherwise: the newest 3 per game, of every kind together
 MAX_MANIFEST = 256 * 1024
 MAX_LISTED = 400
 MAX_RESTORE = 16 * 1024 ** 3                     # a zip that unpacks to more is not a save backup
@@ -213,15 +214,17 @@ def _klass(reason: str) -> str:
     return "auto" if reason == "auto" else "manual" if reason == "manual" else "safety"
 
 
-def prune(folder: Path) -> int:
+def prune(folder: Path, total: int | None = None, protect: Path | None = None) -> int:
+    """Delete this computer's oldest backups: past ``KEEP`` per kind, or past ``total`` of every kind together.
+    ``protect`` is never deleted (the backup being restored)."""
     removed = 0
     count: dict[str, int] = {}
     for b in list_backups(folder):                       # newest first
         if not b.mine:
             continue                                     # another computer's (or planted): never deleted here
-        k = _klass(b.reason)
+        k = "all" if total is not None else _klass(b.reason)
         count[k] = count.get(k, 0) + 1
-        if count[k] > KEEP[k]:
+        if count[k] > (total if total is not None else KEEP[k]) and b.path != protect:
             try:
                 b.path.unlink()
                 removed += 1
@@ -231,9 +234,11 @@ def prune(folder: Path) -> int:
 
 
 def backup(prefix: Path, folder: Path, *, title: str, reason: str, entry_id: int | None = None,
-           max_bytes: int | None = None, force: bool = False) -> SaveBackup | None:
+           max_bytes: int | None = None, force: bool = False, keep: int | None = None,
+           protect: Path | None = None) -> SaveBackup | None:
     """Zip the prefix's saves into ``folder``. Returns None when there is nothing to save, nothing changed since the
-    newest backup (unless ``force``), or the saves are larger than ``max_bytes``."""
+    newest backup (unless ``force``), or the saves are larger than ``max_bytes``. Afterwards the oldest backups are
+    pruned (see :func:`prune`: ``keep`` is its ``total``)."""
     files = collect(prefix)
     if not files:
         return None
@@ -277,7 +282,7 @@ def backup(prefix: Path, folder: Path, *, title: str, reason: str, entry_id: int
     except OSError as exc:
         tmp.unlink(missing_ok=True)
         raise SaveBackupError(f"Could not write the save backup: {exc.strerror or exc}") from exc
-    prune(folder)
+    prune(folder, keep, protect)
     log.info("saves of %s backed up (%s): %d files, %d bytes → %s", title, reason, written, total, target.name)
     return SaveBackup(path=target, created=now, reason=reason, files=written, bytes=total, title=title,
                       entry_id=entry_id, fingerprint=fp, folders=manifest["folders"], mine=_made_here(manifest))

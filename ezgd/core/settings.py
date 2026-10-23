@@ -83,6 +83,7 @@ class Settings:
     check_game_updates: bool = True              # re-check installed games' pages for newer versions (every 6 h)
     auto_update_games: bool = False              # download and install new versions by themselves
     auto_backup_saves: bool = True               # back up saves after playing and before updates/uninstalls
+    keep_more_save_backups: bool = False         # off: the newest 3 per game; on: 10 automatic, 10 safety, 20 manual
     save_sync_dir: str = ""                      # save backups go here too (a Syncthing / Nextcloud / Drive folder)
     steam_input_layout: bool = True              # games started here: Steam's game controller layout, not the desktop one
     keep_awake: bool = True                      # no screen dimming / locking while a game runs or couch mode is open

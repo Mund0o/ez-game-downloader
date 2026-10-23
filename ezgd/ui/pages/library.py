@@ -737,7 +737,10 @@ class LibraryPage(QWidget):
         auto = self.actions.settings.get("auto_backup_saves", True)
         cl.addWidget(label(("Backed up automatically after every session, and before updates, uninstalls and prefix "
                             "rebuilds. " if auto else "Automatic backups are off (Settings → Library). ")
-                           + "Backups are kept per game title, so a reinstall finds them again.", "small", wrap=True))
+                           + "Backups are kept per game title, so a reinstall finds them again"
+                           + ("." if self.actions.settings.get("keep_more_save_backups", False) else
+                              " — the newest 3; a new one deletes the oldest (Settings → Library to keep more)."),
+                           "small", wrap=True))
         if not backups:
             cl.addWidget(label("No backups yet.", "muted"))
         for b in backups[:6]:

@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -71,7 +72,26 @@ def _free(path: Path) -> int | None:
         return None
 
 
+_gpus_lock = threading.Lock()
+_gpus_found: tuple[list[GPU], bool] | None = None
+
+
 def gpus() -> tuple[list[GPU], bool]:
+    """The GPUs as Vulkan sees them — ``vulkaninfo`` runs once per run of the app, and never twice at once.
+
+    It ran for every Diagnose (the Library asks for several games at once): bursts of up to six ``vulkaninfo`` within a
+    second made the NVIDIA driver hold KWin's page flips — the whole screen froze for 1–14 s ("Pageflip timed out",
+    RTX 4090, driver 615.78, 2026-10-23). Without them, none in the same runs. GPUs do not change while the app runs."""
+    global _gpus_found
+    with _gpus_lock:
+        if _gpus_found is None:
+            _gpus_found = _read_gpus()
+        return list(_gpus_found[0]), _gpus_found[1]
+
+
+def _read_gpus() -> tuple[list[GPU], bool]:
+    if os.environ.get("EZGD_VULKANINFO", "1") == "0":
+        return [], False                         # (tests: never the real GPU driver)
     exe = shutil.which("vulkaninfo")
     if not exe:
         return [], False

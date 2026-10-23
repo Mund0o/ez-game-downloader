@@ -222,11 +222,26 @@ class HiddenSession:
 
 def capture(window_id: str, timeout: float = 8.0):
     """The picture of one window (a QImage), drawn by KWin even though it is off-screen; None when not possible."""
+    return _screenshot("CaptureWindow", "sa{sv}h", [window_id], timeout)
+
+
+def capture_screen(name: str | None = None, timeout: float = 1.0):
+    """What a monitor shows right now (a QImage; ``name``: its connector, e.g. "eDP-1" — else the monitor with the
+    active window); None when KWin cannot (another desktop, or it refused)."""
+    if os.environ.get("EZGD_HIDDEN", "1") == "0" or not shutil.which("busctl") or \
+            "KDE" not in os.environ.get("XDG_CURRENT_DESKTOP", "").upper():
+        return None                              # (tests: never the real screen)
+    img = _screenshot("CaptureScreen", "sa{sv}h", [name], timeout) if name else None
+    return img if img is not None else _screenshot("CaptureActiveScreen", "a{sv}h", [], timeout)
+
+
+def _screenshot(method: str, signature: str, args: list[str], timeout: float):
+    """One KWin ScreenShot2 call (through busctl: PySide cannot read its a{sv} answer) → a QImage, or None."""
     from PySide6.QtGui import QImage
     r, w = os.pipe()
     try:
         p = subprocess.Popen(["busctl", "--user", "--json=short", "call", "org.kde.KWin", "/org/kde/KWin/ScreenShot2",
-                              "org.kde.KWin.ScreenShot2", "CaptureWindow", "sa{sv}h", window_id, "1",
+                              "org.kde.KWin.ScreenShot2", method, signature, *args, "1",
                               "native-resolution", "b", "true", str(w)], pass_fds=(w,), stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True)
     except OSError:

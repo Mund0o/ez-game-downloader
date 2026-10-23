@@ -62,7 +62,7 @@ def _proton_capable() -> bool:
 
 
 LINUX_TOOLS: list[Tool] = [
-    Tool("rar", "UnRAR / 7-Zip", "Extracts RAR archives — both sources ship games as RAR", _rar_tool,
+    Tool("rar", "RAR extractor", "Extracts RAR archives — both sources ship games as RAR", _rar_tool,
          {"arch": ["unrar", "7zip"], "debian": ["unrar", "7zip"], "fedora": ["7zip", "unrar"],
           "suse": ["7zip", "unrar"]}, "required",
          {"debian": "unrar is in the non-free (Debian) / multiverse (Ubuntu) component; 7zip covers RAR too.",
@@ -128,8 +128,9 @@ def tool_detail(key: str) -> str:
         kind, path = tool
         if kind == "bsdtar":
             return f"Only bsdtar was found ({path}) — it cannot open password-protected RAR archives (OnlineFix)."
-        if path == bundled_7zip():
-            return "7-Zip bundled with the app."
+        if path == bundled_7zip():                # (a ✔ next to "UnRAR" read as "unrar is installed" — it was not)
+            return ("UnRAR is not installed — the 7-Zip that comes with the app extracts RAR archives instead "
+                    "(password-protected ones too), so nothing more is needed.")
         return f"{'UnRAR' if kind == 'unrar' else '7-Zip'} at {path}"
     if key == "steam":
         from ezgd.platform.steam import find_steam_root
@@ -280,6 +281,8 @@ def run_setup_cli(assume_yes: bool = False) -> int:
         mark = "✔" if st.installed else ("✘" if st.importance == "required" else "–")
         star = " (highly recommended)" if st.importance == "highly_recommended" and not st.installed else ""
         print(f"  {mark} {st.name:<15} {st.purpose}{star}")
+        if st.key == "rar" and st.detail:
+            print(f"    {'':<15} {st.detail}")
     p = plan()
     print()
     for n in p.notes:

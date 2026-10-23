@@ -2223,6 +2223,7 @@ TOGGLES = [
                    ("download_hours", "Only download during the download hours (set on the desktop)")]),
     ("Playing", [("confirm_before_launch", "Ask before starting a game"),
                  ("auto_backup_saves", "Back up saves automatically (after playing, before updates)"),
+                 ("keep_more_save_backups", "Keep more than 3 save backups per game"),
                  ("check_game_updates", "Check installed games for new versions"),
                  ("auto_update_games", "Install game updates automatically"),
                  ("own_overlay", "Our overlay instead of Steam's: friends, chat, invites in the quick menu"),

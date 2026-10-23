@@ -253,6 +253,8 @@ class Actions(QObject):
                              lambda e: (self.toasts.show("Steam did not take it", f"{e} — starting it directly.",
                                                          "warning"), direct()))
 
+        if st.get("use") and st.get("add_only"):
+            return self._add_then_play(parent, entry, st, couch, direct)
         if not st.get("use"):
             if st.get("in_steam_as") and entry.id not in self._told_in_steam:
                 self._told_in_steam.add(entry.id)       # (once per session)
@@ -295,6 +297,61 @@ class Actions(QObject):
             self.bridge.call(self.core.set_setting("launch_through_steam", False))
             direct("you can switch the Steam overlay back on in Settings")
         elif clicked is without:
+            direct()
+
+    def _add_then_play(self, parent: QWidget, entry, st: dict, couch: bool, direct) -> None:
+        """Our overlay: the game goes into Steam's library, but starts here (see steam_overlay_status). Steam reads
+        its list only when it starts, so the games are added while it is closed — or, once a session, after asking
+        to restart it (never from couch mode)."""
+        if st.get("ready"):
+            return direct()
+
+        def added(r=None) -> None:
+            skipped = (r or {}).get("skipped") if isinstance(r, dict) else None
+            if skipped:
+                names = ", ".join(f"{x['title']} (as “{x['in_steam_as']}”)" for x in skipped[:4])
+                self.toasts.show("Already in Steam — not added twice", names + (" …" if len(skipped) > 4 else ""),
+                                 "info")
+            # Steam is started (and waited for) before the game: it must come up to keep the list (else the safety
+            # watch puts the old one back), and our overlay and the controller's game layout need it running
+            self.toasts.show("Starting Steam…", f"{entry.title} starts as soon as Steam is up.", "info")
+            st["steam_running"] = True
+            self.bridge.call(self.core.library_call("start_steam"), lambda _ok: direct(), lambda _e: direct())
+
+        def not_added(e: BaseException) -> None:
+            self.fail("Could not add the game to Steam", e)
+            direct()
+        if not st.get("steam_running"):
+            self.bridge.call(self.core.library_call("prepare_steam_shortcuts", False), added, not_added)
+            return
+        if couch or entry.id in self._told_in_steam:
+            return direct()
+        self._told_in_steam.add(entry.id)            # (asked once per session)
+        box = QMessageBox(parent)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Add to Steam")
+        box.setText(f"Add “{entry.title}” to Steam?")
+        box.setInformativeText(
+            "Your games go into Steam's library as non-Steam games (they start with this app's Proton setup and "
+            "fixes). Play here still starts them directly, with the app's quick menu instead of Steam's overlay. "
+            "Steam only reads that list when it starts, so it is closed and opened again now; its list is checked "
+            "and backed up first, and put back automatically if Steam does not start normally.\n\n"
+            "Close any game that is running in Steam first.")
+        restart = box.addButton("Restart Steam, add and play", QMessageBox.AcceptRole)
+        later = box.addButton("Just play", QMessageBox.RejectRole)
+        never = box.addButton("Never add games to Steam", QMessageBox.DestructiveRole)
+        box.setDefaultButton(restart)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is restart:
+            self.toasts.show("Restarting Steam…", f"Adding your games to Steam, then starting {entry.title}.",
+                             "info")
+            self.bridge.call(self.core.library_call("prepare_steam_shortcuts", True), added, not_added)
+        elif clicked is never:
+            self.settings["launch_through_steam"] = False
+            self.bridge.call(self.core.set_setting("launch_through_steam", False))
+            direct()
+        elif clicked is later:
             direct()
 
     # --------------------------------------------------------------- report

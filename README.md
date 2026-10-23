@@ -60,7 +60,7 @@ Built with Python 3.12, PySide6 (Qt 6), SQLite, httpx, Beautiful Soup and libtor
 | **Couch mode = desktop** | Everything the desktop Library does, by controller: **Finish setup** (a checklist from download to Play, one button for the next step — unpack, the repack's installer, the base game in Steam, the game's program), every fix, Run with, Steam App ID, DLL overrides, winecfg / Winetricks / reset prefix, *See what's wrong* (the debugging assistant's findings with their fixes), collections, rename, update check, repack check, add to Steam, remove from the Library, delete a save backup; and in Settings → Library: check every game for updates, Storage, clean up leftovers, import a game folder. Fix my game's test starts can be stopped (B / *Stop testing*). |
 | **Steam friends** | The quick menu's *Friends* and couch mode's *Friends* tab: who is online, away or playing, and what — live from Steam's Web API with your own key (Settings → Library & launching → Steam friends; made once at steamcommunity.com/dev/apikey, kept on this computer and sent only to api.steampowered.com, never logged). Without a key, or with a private friends list, the friends Steam keeps on this computer are shown; with *Our overlay instead of Steam's* on, the list comes live from the Steam client itself (see *Screens & controllers*). A friend: **Chat** (Steam's chat window comes up), **Invite to <your game>** (while Steam shows you in a game — or, without a key, while one of the app's games is played: Steam has no link or API that sends an invite, so it opens Steam's chat with them and says to choose *Invite to Game* in the menu by their name; the game is named as in your Library, not Steam's "Spacewar" for OnlineFix games), **Join their game** (when they are in a joinable lobby or server — Steam starts it), **Play** the game they play (through Steam) and their **Steam profile**. |
 | **Game settings (couch)** | Manage → Game settings, or from the quick menu: Proton version, Steam overlay, launch options (on-screen keyboard with symbols and capitals), FPS limit (DirectX games), MangoHud, GameMode — from the game's next start. |
-| **GPU acceleration** | One switch (Settings → Interface, and couch mode's Settings → App), *recommended*, off by default. Couch mode is then drawn by the graphics card (OpenGL, the same picture; ~4× faster frames at 4K) from the next time it opens; after a restart the in-app browser draws pages and decodes video on it (desktop windows are not composed through OpenGL: on Wayland that drew menus garbled). Off, the processor does everything — one switch (the separate "frames through the graphics card" switch is part of it now). If OpenGL does not start, couch mode reopens drawn by the CPU and says so; if a start with it never reaches the window, the next start leaves it out. |
+| **GPU acceleration** | One switch (Settings → Interface, and couch mode's Settings → App), *recommended*, off by default. Couch mode is then drawn by the graphics card (OpenGL, the same picture; ~4× faster frames at 4K) from the next time it opens; after a restart the in-app browser decodes video on it and draws pages on it wherever Chromium trusts the driver (its own blocklist decides — forcing it past that froze a friend's browser) (desktop windows are not composed through OpenGL: on Wayland that drew menus garbled). Off, the processor does everything — one switch (the separate "frames through the graphics card" switch is part of it now). If OpenGL does not start, couch mode reopens drawn by the CPU and says so; if a start with it never reaches the window, the next start leaves it out. |
 | **Quick ways in** | Drop a `.torrent`, a magnet / download link, a game folder or an archive on the window; a magnet link on the clipboard is offered as a download; tray menu, progress on the taskbar icon, *Keep downloading in the tray* when closing; the app reopens where you left it (page, All Games filters, selected game). **Pin to the taskbar**: the app writes its own launcher (`~/.local/share/applications/ezgd.desktop`, pointing at wherever the app is, rewritten at every start) with the icon the window shows, in your accent colour — the pinned icon looks the same open or closed (a launcher from install.sh or a package is left alone). |
 
 ## Source integration notes (verified)
@@ -181,7 +181,7 @@ after one password prompt (Arch/CachyOS/Manjaro, Debian/Ubuntu/Mint, Fedora/Noba
 
 | Tool | Why |
 |---|---|
-| UnRAR / 7-Zip (**required**) | Both sources ship games as RAR archives |
+| RAR extractor: UnRAR or 7-Zip (**required**) | Both sources ship games as RAR archives (the release bundles 7-Zip; the System check says which one is used) |
 | umu-launcher | Runs Windows games with Proton even without Steam — downloads GE-Proton and the Steam Runtime itself |
 | Steam | Only where umu-launcher is not packaged (Debian/Ubuntu, openSUSE): provides Proton |
 | Winetricks (+ zenity) | Windows runtimes in a game's prefix |
@@ -293,7 +293,8 @@ part**: do the “I'm not a robot” check if one appears and click the site's o
 closes by itself; the transfer continues in the background under **Downloads → In-app browser downloads**
 (progress, speed, time left, pause / resume / cancel) and, when it finishes, is **added to your Library
 automatically** (SHA-256 checked when the site publishes one, extracted with the password, launch files
-detected). Nothing is automated, faked or bypassed: the app never solves checks, never sends a fake Referer and
+detected). The file is saved in the game's own folder, like every download, and **deleted once the game is
+extracted from it** (it is kept if extracting fails). Nothing is automated, faked or bypassed: the app never solves checks, never sends a fake Referer and
 never copies the browser's pass or cookies into its own downloader — the transfer is done by the same browser
 you used. Pop-ups to unrelated sites are blocked unless you clicked them (links that open the host in a new tab work; **Back** returns), and
 program downloads (`.exe`, `.msi` … — the fake download buttons on file hosts) are refused; sites cannot
@@ -356,6 +357,11 @@ is; Play then starts the game directly with the friends-list overlay and says wh
 in place, also after the app has moved, extra copies of it from older versions are removed, and the leftover shortcut of
 a game removed from the Library is reused rather than doubled.
 
+**With *Our overlay instead of Steam's*** the games are still added to Steam (in its library, the same shortcut — asked
+once per session when Steam has to restart for it, never from couch mode), but Play starts them directly: started by
+Steam, Steam would load its own overlay and take the Steam button away from the quick menu. *Never add games to
+Steam* in that question switches it off.
+
 **Quick overlay (fallback)** — for a game Steam does not know yet (you chose *Just play* instead of restarting
 Steam), the app loads Steam's overlay into the game itself (`gameoverlayrenderer.so` preloaded — Steam Linux Runtime
 carries it into its container — and Steam's Vulkan layer, `ENABLE_VK_LAYER_VALVE_steam_overlay_1`). Steam then only
@@ -376,6 +382,13 @@ is read back from Steam's `logs/controller.txt` ("Queueing activation for contro
 game's log (`ezgd:steam-input …`). A layout still forced when the app quits — or left by a crash — is handed back
 (at the next start). Off: *Settings → Library & launching*; games with *Without Steam Input* are left alone
 (`ezgd/platform/steaminput.py`).
+
+Steam does not keep that layout through its own **Steam button**: pressing it switches to the button's chord layout
+and, on release, back to the *desktop* layout — Steam's virtual pad disappears and the game has no controller until it
+ends (a friend's Dark Souls III after opening the quick menu; Steam's `controller.txt`: 480 → 443510 → 413080). While
+such a game runs the app watches `controller.txt` and asks for the game layout again when Steam fell back to the
+desktop or Big Picture layout — except while the quick menu is open (it is driven by the desktop layout's keys); it
+comes back as soon as the menu closes.
 
 **The screen stays on.** A controller is not activity to the desktop: KDE and GNOME dim and lock after their idle time
 while you play with one (Steam only prevents it for games it starts). While one of the app's games runs — not while it
@@ -423,6 +436,9 @@ focused game's artwork fills the background, with its playtime, a big **Play** a
   steps aside while you play and comes back when the game ends ("Welcome back"). It never restarts Steam.
 * **Quit from the controller:** hold the PS / Xbox / Steam button while playing to open the quick menu; its *Quit*
   (press twice) stops the game completely, like the ✕. Only games the app runs are touched.
+* **The game behind the quick menu:** some games minimize themselves when another window takes the focus (Dark Souls III
+  in full screen), and the see-through menu showed the desktop. On KDE the screen is photographed (KWin, ~30 ms) just
+  before the menu opens and stays behind it; *Back to the game* brings the game itself to the front again.
 * **Organise:** X (Manage) on a game: ★ favourite (favourites come first), hide it, and the Library's order.
 * **The ✕** (top right; B on the home shelf jumps to it): leaves couch mode and brings the normal window back. If a
   game you started from couch mode is still running it asks *Quit <game>?* first, then closes that game
@@ -489,8 +505,10 @@ Windows games keep their saves in their Proton prefix (`AppData`, `Documents`, `
 `users/Public/Documents` for OnlineFix/RUNE/CODEX releases). The app zips those folders — without shader/DXVK
 caches, logs, crash dumps and Windows' own folders — **after every play session** (sessions over a minute), and
 **before an update, an uninstall, a prefix rebuild, a fix that changes the prefix and every restore**. Unchanged
-saves are not zipped again; the newest 10 automatic and 10 safety backups (20 manual) are kept, per game
-*title* — so a reinstall finds them. Library → a game → **Saves**: *Back up now*, *Restore…* (your current saves
+saves are not zipped again; each game keeps its newest **3** backups — a new one deletes the oldest (never the one
+being restored). *Settings → Library → Keep more than 3 save backups per game* (also in couch mode's Settings → Playing)
+keeps the newest 10 automatic and 10 safety backups (20 manual) instead. Backups are kept per game *title* — so a
+reinstall finds them. Library → a game → **Saves**: *Back up now*, *Restore…* (your current saves
 are backed up first), delete, open the folder. Backups live in the app's data folder (`save-backups/`).
 
 **Synced save folder** (*Settings → Library*): choose a folder that Syncthing, Nextcloud, Google Drive … keeps in

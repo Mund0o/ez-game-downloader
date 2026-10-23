@@ -420,7 +420,8 @@ class LibraryManager:
             saves.set_owner(machine.profile().get("id") or "", paths.config / "backup-key")
         except Exception:
             log.exception("save backups: no owner key")
-        self.input_layout = steaminput.Forced(paths.data / "steam-input-forced")
+        self.input_layout = steaminput.Forced(paths.data / "steam-input-forced",
+                                              root=lambda: self.steam_root())
         if self.input_layout.left_over() and steaminput.enabled():   # forced by an app that did not end cleanly
             log.info("handing Steam's controller layout back (left forced by the last session)")
             try:
@@ -957,6 +958,11 @@ class LibraryManager:
             except OSError:
                 pass
         threading.Thread(target=check, daemon=True, name=f"steam-input-{e.id}").start()
+
+    def input_hold(self, on: bool) -> None:
+        """The quick menu is over a game (``True``) or gone: Steam's controller layout is left alone meanwhile (the
+        menu is driven by its desktop layout's keys), and the game layout is asked for again when it closes."""
+        self.input_layout.hold(on)
 
     BOX_CLOSE_AFTER = 2.0          # seconds an error pop-up of a diagnostic run stays before the game is closed
     SCREEN_LOOKS = (8, 24, 40)     # seconds into a test / diagnostic run when the game's screen is read
@@ -2096,7 +2102,7 @@ class LibraryManager:
                 safefiles.write_file(sync, z.name, z)    # (never through a link planted there)
 
     def backup_saves(self, entry_id: int, reason: str = "manual", quiet: bool = False,
-                     max_bytes: int | None = None) -> dict | None:
+                     max_bytes: int | None = None, protect: Path | None = None) -> dict | None:
         """Zip this game's saves (see ezgd.library.saves). Returns the backup, or None when there was nothing new.
         ``quiet``: a failure is logged instead of raised (automatic backups must never block anything)."""
         try:
@@ -2108,7 +2114,9 @@ class LibraryManager:
                 raise LibraryError("This game has no saves to back up yet: it has its own Proton prefix only after "
                                    "it was started once (Linux).")
             b = saves.backup(pfx, self.save_folder(e), title=e.title, reason=reason, entry_id=e.id,
-                             max_bytes=max_bytes, force=reason == "manual")
+                             max_bytes=max_bytes, force=reason == "manual",
+                             keep=None if getattr(self.settings.settings, "keep_more_save_backups", False)
+                             else saves.KEEP_FEW, protect=protect)
         except (saves.SaveBackupError, OSError) as exc:
             if quiet:
                 log.warning("save backup of entry %s (%s) failed: %s", entry_id, reason, exc)
@@ -2147,7 +2155,7 @@ class LibraryManager:
         if self.is_running(entry_id):
             raise LibraryError("Quit the game first — it would overwrite the restored saves.")
         z = self._own_backup(e, path)
-        safety = self.backup_saves(entry_id, "before-restore", quiet=True)
+        safety = self.backup_saves(entry_id, "before-restore", quiet=True, protect=z)   # (z may be the oldest)
         try:
             n = saves.restore(z, self.prefix_dir(entry_id))
         except saves.SaveBackupError as exc:
@@ -2620,10 +2628,11 @@ class LibraryManager:
         if not self.settings.settings.launch_through_steam:
             out["reason"] = "switched off in Settings"
             return out
-        if self.settings.settings.own_overlay:          # (started by Steam, Steam would add its overlay itself)
-            out["reason"] = "the app's own overlay is used instead of Steam's (Settings)"
-            return out
-        if "no_steam_overlay" in e.compat_config.fixes:
+        if self.settings.settings.own_overlay:
+            # our overlay: the game is still added to Steam (it is in the Steam library), but Play starts it here —
+            # started by Steam, Steam would load its own overlay and take the Steam button from the quick menu
+            out["add_only"] = True
+        elif "no_steam_overlay" in e.compat_config.fixes:
             out["reason"] = "the Steam overlay is off for this game"
             return out
         root = self.steam_root()
