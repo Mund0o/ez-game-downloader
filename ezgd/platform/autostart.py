@@ -55,6 +55,12 @@ def enabled() -> bool:
 
 def apply(on: bool) -> None:
     """Add or remove the autostart entry (best effort: a failure is logged, never raised)."""
+    from ezgd.library import steamrun
+    if steamrun.HOME:
+        # a portable run (--home) keeps to its folder: its entry would start the desktop's app with that folder's
+        # data (a scratch copy's test runs once left the real app starting a copy, hidden in the tray)
+        log.debug("portable run: the desktop's autostart entry is left alone")
+        return
     try:
         if IS_WINDOWS:
             import subprocess

@@ -226,6 +226,8 @@ class DiagnoseDialog(QDialog):
             head = label(v.get("reason", ""), wrap=True, selectable=True)
         elif v["status"] in ("changed",):
             head = label("Repairs applied — start the game to see if it works now", "h2", wrap=True)
+        elif v["status"] == "seen":                   # the test run showed the problem's cause: no game fix for it
+            head = label(f"What the test showed: {v.get('reason', '')}", "h2", wrap=True)
         else:
             head = label(f"✗ Not fixed: {v.get('reason', '')}", "h2", wrap=True)
             head.setStyleSheet(f"color: {theme.CURRENT.danger};")
@@ -252,7 +254,9 @@ class DiagnoseDialog(QDialog):
                                  "primary", on_click=lambda: self._install_ge(ge["tag"]))
             cl.addWidget(self.ge_btn)
         if v["status"] == "fixed":
-            cl.addWidget(label("“Kept running” means it did not crash. Play it — did it actually work?", "small",
+            cl.addWidget(label(f"The test checked the problem itself: {v['checked']}. Play it — did it actually work?"
+                               if v.get("checked") else
+                               "“Kept running” means it did not crash. Play it — did it actually work?", "small",
                                wrap=True))
             row = QHBoxLayout()
             row.addWidget(button("Yes, it works", "check", "primary", on_click=lambda: self._answer(True)))
@@ -617,8 +621,8 @@ class DiagnoseDialog(QDialog):
         self.stop_btn.show()
         self.summary.setText("Testing candidate fixes one after another…")
         gen = self._generated + (self._generated_deep if deep else [])
-        trials = (self.core.run_trials(self.entry.id, self._findings, gen, deep=True) if deep else
-                  self.core.run_trials(self.entry.id, self._findings, gen))
+        trials = (self.core.run_trials(self.entry.id, self._findings, gen, deep=True, symptom=self._symptom) if deep
+                  else self.core.run_trials(self.entry.id, self._findings, gen, symptom=self._symptom))
         self.bridge.call(trials, self._trials_done,
                          lambda e: (self._trials_finished(), self.actions.fail("Could not run the trials", e)),
                          owner=self)
@@ -686,7 +690,8 @@ class DiagnoseDialog(QDialog):
             row.setText(f"{p['index']}/{p['total']} · {p['label']} — running…")
         else:
             r = p["result"]
-            mark = {"ran": "✓", "crashed": "✗", "exited": "✗", "error": "!", "cancelled": "–"}.get(r["outcome"], "?")
+            mark = {"ran": "✓", "crashed": "✗", "exited": "✗", "error": "!", "cancelled": "–",
+                    "symptom": "✗"}.get(r["outcome"], "?")
             row.setText(f"{mark} {p['label']} — {r['detail']}")
             color = theme.CURRENT.success if r["outcome"] == "ran" else theme.CURRENT.danger if r["outcome"] in (
                 "crashed", "exited", "error") else theme.CURRENT.muted

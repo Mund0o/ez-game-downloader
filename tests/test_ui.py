@@ -639,7 +639,10 @@ def test_try_fixes_flow(ui, qtbot, tmp_path, monkeypatch):
     (core.paths.logs / f"game-{e.id}.log").write_text(
         "\n=== 2026-10-10 10:00:00 Proton\nD3D12CreateDevice failed\n=== exited with code 1 after 3s\n")
 
-    async def fake_trials(entry_id, findings, generated=None):
+    asked = []
+
+    async def fake_trials(entry_id, findings, generated=None, symptom=""):
+        asked.append(symptom)                 # (the reported problem goes with the trials: they watch for it)
         results = [
             {"label": "Current setup (Proton)", "overrides": {}, "outcome": "crashed", "seconds": 3,
              "detail": "stopped after 3s: access violation"},
@@ -659,6 +662,7 @@ def test_try_fixes_flow(ui, qtbot, tmp_path, monkeypatch):
     dlg.try_btn.click()
     qtbot.waitUntil(lambda: "1 setup(s) kept the game running" in dlg.summary.text(), timeout=10000)
     texts = [w.text() for w in dlg._trial_rows.values()]
+    assert asked == [""]
     assert any(t.startswith("✗ Current setup") for t in texts) and any(t.startswith("✓ Start with DirectX 11")
                                                                        for t in texts)
     if os.environ.get("EZGD_SHOTS"):

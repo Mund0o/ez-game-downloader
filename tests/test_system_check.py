@@ -18,6 +18,7 @@ def _fake_tools(monkeypatch, installed: set[str]):
             for t in deps.LINUX_TOOLS]
     monkeypatch.setattr(deps, "LINUX_TOOLS", fake)
     monkeypatch.setattr(deps, "available_packages", lambda fam, pkgs: (list(pkgs), []))
+    monkeypatch.setattr(deps, "_rar_bundled", lambda: False)
     return deps
 
 
@@ -69,3 +70,41 @@ def test_the_rar_check_says_when_unrar_itself_is_not_installed(monkeypatch):
     assert next(t for t in deps.LINUX_TOOLS if t.key == "rar").name == "RAR extractor"
     monkeypatch.setattr(archives, "find_rar_tool", lambda explicit=None: ("unrar", "/usr/bin/unrar"))
     assert deps.tool_detail("rar") == "UnRAR at /usr/bin/unrar"
+
+
+def test_the_apps_own_7zip_is_not_reported_as_installed(monkeypatch):
+    """A fresh computer without UnRAR: the check showed a ✔ for the RAR extractor (the app's 7-Zip extracts RAR, but
+    nothing was installed). Now: not installed, covered by the app's copy — not "missing", not pushed on anyone."""
+    from ezgd.installation import archives
+    from ezgd.platform import deps
+    monkeypatch.setattr(deps, "detect_family", lambda os_release=None: "arch")
+    monkeypatch.setattr(deps, "available_packages", lambda fam, pkgs: (list(pkgs), []))
+    monkeypatch.setattr(deps, "_proton_capable", lambda: True)
+    monkeypatch.setattr(archives, "bundled_7zip", lambda: "/app/tools/7zzs")
+    monkeypatch.setattr(archives, "find_rar_tool", lambda explicit=None: ("7z", "/app/tools/7zzs"))
+    rar = next(s for s in deps.status() if s.key == "rar")
+    assert not rar.installed and rar.bundled
+    assert "unrar" not in deps.plan().install                      # nothing more needed …
+    assert deps.plan(only=["rar"]).install == ["unrar", "7zip"]     # … but it can be installed when ticked
+    monkeypatch.setattr(archives, "find_rar_tool", lambda explicit=None: ("unrar", "/usr/bin/unrar"))
+    rar = next(s for s in deps.status() if s.key == "rar")
+    assert rar.installed and not rar.bundled
+    monkeypatch.setattr(archives, "find_rar_tool", lambda explicit=None: ("bsdtar", "/usr/bin/bsdtar"))
+    rar = next(s for s in deps.status() if s.key == "rar")
+    assert not rar.installed and not rar.bundled                   # bsdtar cannot open OnlineFix's archives
+
+
+def test_the_dialog_shows_the_apps_own_7zip_without_a_tick(ui, qtbot, monkeypatch):
+    from ezgd.ui.dialogs.system import SystemCheckDialog
+    win, core, _ = ui
+    deps = _fake_tools(monkeypatch, {"umu", "steam", "winetricks", "gamemode", "mangohud", "gamescope"})
+    monkeypatch.setattr(deps, "_rar_bundled", lambda: True)
+    dlg = SystemCheckDialog(win.actions, win)
+    qtbot.addWidget(dlg)
+    qtbot.waitUntil(lambda: bool(dlg.checks), timeout=5000)
+    assert set(dlg.checks) == {"rar"} and not dlg.checks["rar"].isChecked()     # offered, not ticked
+    texts = [w.text() for w in dlg.findChildren(type(dlg.plan_label))]
+    assert any(t.startswith("RAR extractor  —  not installed (the app's own copy is used)") for t in texts)
+    assert "Nothing selected" in dlg.plan_label.text()
+    dlg._live.stop()
+    dlg.reject()

@@ -78,6 +78,10 @@ def register(icon_png: bytes, accent: str, cmd: list[str] | None = None) -> bool
     or already right; best effort — a failure is logged, never raised."""
     if not IS_LINUX:
         return False
+    from ezgd.library import steamrun
+    if steamrun.HOME:                       # a portable run (--home) keeps to its folder (see autostart.apply)
+        log.debug("portable run: the desktop's launcher entry is left alone")
+        return False
     try:
         path = entry_path()
         if not _ours_or_missing(path):

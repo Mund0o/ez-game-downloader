@@ -26,6 +26,7 @@ SYMPTOMS = {
     "no_sound": "No sound",
     "slow": "Runs badly / stutters",
     "controller": "Controller / gamepad doesn't work",
+    "online": "Can't play online / with friends",
 }
 
 # DLLs that are usually add-ons injected into the game (overlays, ReShade, mod loaders) when found in its folder
@@ -322,7 +323,50 @@ def _audio(ctx, symptom: str) -> list[GeneratedFix]:
         out.append(GeneratedFix("audio:native-xaudio", "Use the game's own XAudio2",
                                 f"The game ships {', '.join(shipped)}; loading it instead of Wine's version fixes "
                                 "sound in some games.", dll_overrides={n[:-4]: "n,b" for n in shipped}))
+    from ezgd.library import probes
+    seen = probes.from_text(ctx.everything) or {}
+    wine = " ".join((seen.get("facts") or {}).get("wine_errors") or [])
+    if seen.get("cause") == "no-stream" and re.search(r"xaudio|xact|x3daudio", wine + ctx.everything[-200_000:], re.I):
+        verb = "xact" if getattr(ctx, "is32", None) else "xact_x64"
+        out.append(GeneratedFix("audio:xact", "Install DirectX audio (XACT / XAudio2)",
+                                "The game opened no audio stream and Wine's log names DirectX audio; Microsoft's own "
+                                "XACT / XAudio2 replaces Wine's.", winetricks=[verb]))
     return out
+
+
+# what each measured cause of "runs badly" points at (ezgd.library.probes.causes), by fix id prefix
+_PERF_FIXES = {"shaders": ("cache:", "vkd3d:", "sync:"), "stutter": ("sync:", "cpu:", "cache:"),
+               "memory": ("ue:config-low", "mem:", "heap:"), "gpu": ("ue:config-low", "gpu:", "vkd3d:"),
+               "cpu": ("sync:", "cpu:", "toggle:"), "cpu-busy": ("cache:", "sync:", "cpu:")}
+
+
+def _by_evidence(ctx, symptom: str, fixes: list[GeneratedFix]) -> list[GeneratedFix]:
+    """What the test run saw of the reported problem (ezgd.library.probes) orders the fixes — and drops those it rules
+    out: no controller connected, or sound going to a muted / other output, is nothing a game setting changes."""
+    from ezgd.library import probes
+    text = getattr(ctx, "everything", "") or ""
+    seen = probes.from_text(text) or {}
+    cause = seen.get("cause", "")
+    first: tuple[str, ...] = ()
+    if symptom == "controller":
+        if cause == "none-connected":
+            return [f for f in fixes if not f.gen_id.startswith("input:")]
+        first = {"doubled": ("input:no-hidraw", "input:no-steaminput"), "doubled-steam": ("input:no-steaminput",),
+                 "none-seen": ("input:sdl", "input:no-hidraw")}.get(cause, ())
+    elif symptom == "no_sound":
+        if cause in ("muted-output", "muted-stream", "other-output"):
+            return [f for f in fixes if not f.gen_id.startswith("audio:")]
+        first = ("audio:xact", "audio:native-xaudio", "audio:latency") if cause in ("no-stream", "silent") else ()
+    elif symptom == "slow":
+        perf = probes.perf_from_text(text)
+        for key, _words in probes.causes(perf) if perf else []:
+            first += _PERF_FIXES.get(key, ())
+    if not first:
+        return fixes
+
+    def rank(f: GeneratedFix) -> int:
+        return next((i for i, pre in enumerate(first) if f.gen_id.startswith(pre)), len(first))
+    return sorted(fixes, key=rank)
 
 
 def _memory(ctx, symptom: str, findings: list[dict]) -> list[GeneratedFix]:
@@ -387,15 +431,25 @@ def _sync(ctx, symptom, findings, deep) -> list[GeneratedFix]:
     return out
 
 
+_CPU_EVIDENCE = re.compile(r"(too many (?:cores|processors|cpus|threads)|processor count|NUMBER_OF_PROCESSORS|"
+                           r"GetLogicalProcessorInformation\w* failed|thread (?:limit|count) (?:exceeded|too)|"
+                           r"(?:CreateThread|pthread_create) failed|Failed to create (?:worker |job )?thread|"
+                           r"resource temporarily unavailable.*thread|Unsupported (?:CPU|processor) (?:count|topology)|"
+                           r"affinity mask)", re.I)
+
+
 def _cpu_cores(ctx, symptom, findings, deep) -> list[GeneratedFix]:
-    """Older games crash on CPUs with many cores (thread-count overflows)."""
+    """Older games crash on CPUs with many cores (thread-count overflows). Offered when the run's logs talk about
+    processor or thread counts — or, on a big CPU, as one guess among the generic fixes."""
     import os
     n = os.cpu_count() or 0
-    if n < 16 or not _troubled(ctx, symptom, findings, deep):
+    m = _CPU_EVIDENCE.search(getattr(ctx, "everything", "") or "") if n > 8 else None
+    if m is None and (n < 16 or not _troubled(ctx, symptom, findings, deep)):
         return []
-    return [GeneratedFix("cpu:8", "Show the game only 8 CPU cores",
-                         f"This computer has {n} CPU threads; some (mostly older) games crash or hang when they "
-                         "see that many. WINE_CPU_TOPOLOGY makes the game see 8.",
+    why = (f"The game's log says “{m.group(0)}” and this computer has {n} CPU threads — games written for fewer "
+           "trip over that many. " if m else
+           f"This computer has {n} CPU threads; some (mostly older) games crash or hang when they see that many. ")
+    return [GeneratedFix("cpu:8", "Show the game only 8 CPU cores", why + "WINE_CPU_TOPOLOGY makes the game see 8.",
                          env={"WINE_CPU_TOPOLOGY": "8:" + ",".join(str(i) for i in range(8))})]
 
 
@@ -609,6 +663,8 @@ def generate(ctx, findings: list[dict], symptom: str = "", learned: list[dict] |
     fixes += _nvapi(ctx, findings)
     fixes += _renderers(ctx, symptom, findings)
     fixes += _windowed(ctx, symptom)
+    if any(f["key"] == "display-mode" for f in findings):      # it could not switch the screen mode: windowed
+        fixes += _windowed(ctx, "black_screen")
     fixes += _unity_graphics_jobs(ctx, symptom, findings)
     fixes += _audio(ctx, symptom)
     fixes += _memory(ctx, symptom if not deep else "crash_later", findings)
@@ -641,6 +697,10 @@ def generate(ctx, findings: list[dict], symptom: str = "", learned: list[dict] |
         if f.gen_id not in seen:
             seen.add(f.gen_id)
             out.append(f)
+    try:
+        out = _by_evidence(ctx, symptom, out)
+    except Exception:                          # the order is a hint; never lose the fixes over it
+        pass
     return out
 
 

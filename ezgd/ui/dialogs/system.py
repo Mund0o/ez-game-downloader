@@ -94,14 +94,19 @@ class SystemCheckDialog(QDialog):
         self.checks = {}
         missing = {t["key"] for t in st["tools"] if not t["installed"] and t.get("packages")}
         optional = {t["key"] for t in st["tools"] if t["importance"] == "optional"}
-        # a newly missing tool starts ticked — not an optional one (Steam: umu-launcher covers it)
-        self.selected = (self.selected & missing) | (missing - self._seen - optional)
+        bundled = {t["key"] for t in st["tools"] if t.get("bundled")}
+        # a newly missing tool starts ticked — not an optional one (Steam: umu-launcher covers it), nor one the app's
+        # own copy covers (RAR: its 7-Zip)
+        self.selected = (self.selected & missing) | (missing - self._seen - optional - bundled)
         self._seen |= missing
         for t in st["tools"]:
             row = QHBoxLayout()
             ok = t["installed"]
-            color = theme.CURRENT.success if ok else (theme.CURRENT.danger if t["importance"] == "required"
-                                                      else theme.CURRENT.warning)
+            # not installed, but the app's own copy does the job: no ✔ (that read as "UnRAR is installed" on a
+            # computer without it), an unticked box to install it anyway
+            covered = not ok and t.get("bundled")
+            color = theme.CURRENT.success if ok else theme.CURRENT.muted if covered else \
+                (theme.CURRENT.danger if t["importance"] == "required" else theme.CURRENT.warning)
             if ok:
                 ic = QLabel()
                 ic.setPixmap(icon("check", color, 18).pixmap(18, 18))
@@ -119,7 +124,8 @@ class SystemCheckDialog(QDialog):
             col.setSpacing(1)
             head = QHBoxLayout()
             head.setSpacing(8)
-            name = label(t["name"] + ("" if ok else "  —  missing"))
+            name = label(t["name"] + ("" if ok else "  —  not installed (the app's own copy is used)" if covered
+                                      else "  —  missing"))
             name.setStyleSheet("font-weight: 650;")
             head.addWidget(name)
             imp = label(IMPORTANCE.get(t["importance"], ""), "small")

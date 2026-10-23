@@ -113,10 +113,16 @@ def last_run(log_path: Path) -> LastRun:
     run = LastRun(started=_HEADER.match(lines[start]).group(1), description=_HEADER.match(lines[start]).group(2))
     run.diagnostic = "diagnostic run" in run.description
     body = []
-    for ln in lines[start + 1:]:
+    for i, ln in enumerate(lines[start + 1:], start + 1):
         m = _EXIT.match(ln)
         if m:
             run.exit_code, run.seconds = int(m.group(1)), int(m.group(2))
+            # what the system logged about the session is added once it has ended (ezgd.library.syslog)
+            for after in lines[i + 1:]:
+                if _HEADER.match(after):
+                    break
+                if after.startswith(("ezgd:sys ", "ezgd:sys-unreadable", "ezgd:net ")):
+                    body.append(after)
             break
         if _HEADER.match(ln):
             break
@@ -265,6 +271,7 @@ class Context:
     steam_ref: dict | None = None         # how Steam itself runs this game (ezgd.library.steamref.reference)
     investigated: bool = False            # the run analysed is the assistant's own diagnostic test run
     play_crashes: list = field(default_factory=list)   # crashes / freezes while played (ezgd.library.crashes)
+    measured: dict | None = None          # a play session's frame times ("runs badly", ezgd.library.probes)
 
     @property
     def wine(self) -> str:
@@ -1671,6 +1678,34 @@ def r_display(c: Context) -> list[Finding]:
                        "desktop session. Log out and in again, or try another Proton."), 0.7, ev)]
 
 
+def r_display_mode(c: Context) -> list[Finding]:
+    """The game could not switch the screen's mode, or could not turn HDR on (Wine's and DXVK's own lines) — under a
+    Wayland desktop Wine cannot change the real resolution, and HDR needs the desktop's HDR plus Wine's Wayland
+    driver."""
+    out = []
+    mode = _lines(c.everything, r"(ChangeDisplaySettings\w*[^\n]*(?:fail|BADMODE)|DISP_CHANGE_(?:BADMODE|FAILED|RESTART)|"
+                                r"Failed to (?:set|change) (?:the )?(?:display )?(?:mode|resolution)|"
+                                r"No matching (?:display|video) mode|unsupported (?:display mode|resolution)|"
+                                r"SetDisplayMode failed|err:(?:x11drv|winex11|winewayland):[^\n]*\bmode\b)")
+    if mode:
+        out.append(Finding("display-mode", "The game could not switch the screen mode",
+                           "It asked for a screen mode the desktop would not give it — under Wayland, Wine cannot "
+                           "change the real resolution. Windowed or borderless mode at the desktop's resolution "
+                           "avoids it (and the game's own resolution setting then scales).", 0.65, mode))
+    hdr = _lines(c.everything, r"(HDR (?:is )?(?:not supported|unavailable|disabled)|colou?r ?space[^\n]*not supported|"
+                               r"Failed to (?:enable|set|activate) HDR|HDR10[^\n]*(?:fail|not available)|"
+                               r"swapchain[^\n]*HDR[^\n]*(?:fail|unsupported))")
+    if hdr:
+        wayland = "wayland" in c.entry.compat_config.options
+        out.append(Finding("display-hdr", "HDR could not be turned on",
+                           "The game found no HDR output. Under Proton HDR needs: HDR switched on for the screen in "
+                           "the desktop's display settings, Wine's Wayland driver ("
+                           + ("on for this game" if wayland else "the “Native Wayland” fix — off for this game now")
+                           + ") and a Proton build with HDR support (Proton 10+, GE-Proton).", 0.6, hdr,
+                           fixable=False))
+    return out
+
+
 def r_disk(c: Context) -> list[Finding]:
     import shutil
     out = []
@@ -1849,17 +1884,215 @@ def _reason(c: Context, findings: list[Finding]) -> list[dict]:
     return out
 
 
+def r_system_log(c: Context) -> list[Finding]:
+    """What the kernel and the graphics driver logged about the run (ezgd.library.syslog markers): the game killed
+    for lack of memory, a GPU fault under it, a crash Wine could not catch — causes the game's own logs cannot show."""
+    from ezgd.library import syslog
+    from ezgd.library.tracer import _GPU_LIBS
+    events, readable = syslog.from_text(c.wine)
+    failed = c.run.exit_code not in (None, 0, -15, 143) or bool(re.search(r"Unhandled exception", c.wine))
+    out: list[Finding] = []
+    for e in events:
+        if not (e.ours or failed) or e.code == "nvidia:45":
+            continue
+        if e.kind in ("oom", "oomd"):
+            mem = syslog.memory_facts()
+            advice = "Close other programs while playing (a browser can hold several GB) and lower the game's " \
+                     "texture quality."
+            if mem and not mem.get("SwapTotal"):
+                advice = "This computer has no swap space, so Linux had nothing to fall back on — adding swap or zram " \
+                         "is the lasting fix. " + advice
+            out.append(Finding("sys-oom", "Linux stopped the game: the computer ran out of memory",
+                               f"{e.describe().capitalize()}. A game stopped this way leaves no error and no crash "
+                               "report of its own. " + advice, 0.92, [e.describe()], fixable=False))
+        elif e.kind == "gpu":
+            whose = syslog.XID.get(int(e.code.split(":")[1]), ("", ""))[1] if e.code.startswith("nvidia:") else ""
+            if whose == "hardware":
+                out.append(Finding("sys-gpu-hardware", "The graphics card reported a hardware fault",
+                                   f"The driver says: {e.detail} ({e.code}). That is not something a game setting "
+                                   "causes: check the card's power cables, the power supply under load, and that the "
+                                   "card sits firmly in its slot.", 0.8, [e.describe()], fixable=False))
+                continue
+            fix = Fix("add_args", "-dx11", "Start it with DirectX 11") if c.engine == "Unreal Engine" and \
+                re.search(r"d3d12\.dll", c.wine, re.I) else None
+            out.append(Finding("sys-gpu", "The graphics driver reported a GPU fault",
+                               f"During the run the driver logged {e.code}: {e.detail}. The game's renderer failed on "
+                               "the GPU — usually how its DirectX is translated (DXVK / VKD3D-Proton) or a driver bug "
+                               "it triggers. “Fix my game” tests another DXVK / VKD3D version"
+                               + (" and DirectX 11" if fix else "") + ".", 0.8 if e.ours else 0.55, [e.describe()],
+                               fix))
+        elif e.kind in ("segfault", "core"):
+            gpu = e.lib.startswith(_GPU_LIBS)
+            out.append(Finding("sys-crash", "It crashed in a way Wine could not catch" + (" (in the graphics driver)"
+                                                                                          if gpu else ""),
+                               f"The kernel logged: {e.describe()}. "
+                               + ("The crash is inside the graphics driver's own library — a driver update, or "
+                                  "another DXVK / VKD3D version, is where to look." if gpu else
+                                  "Such crashes happen in Wine itself or in a native library, not in the game's "
+                                  "Windows code — another Proton is worth a try."), 0.7, [e.describe()]))
+    if not readable and failed and not out and not re.search(r"Unhandled exception", c.wine):
+        out.append(Finding("sys-unreadable", "The system log could not be checked",
+                           "The game quit without an error, and the system log — where Linux notes a game it stopped "
+                           "for lack of memory, or a graphics driver fault — is not readable for your user. Adding "
+                           "yourself to the systemd-journal group (then logging out and in) lets the assistant check "
+                           "it.", 0.3, [], Fix("command", "sudo usermod -aG systemd-journal $USER",
+                                               "Copy the command")))
+    return out
+
+
+def r_probe(c: Context) -> list[Finding]:
+    """What a test run saw of the reported problem itself (ezgd.library.probes): the game's audio streams, the
+    controllers it opened."""
+    from ezgd.library import probes
+    seen = probes.from_text(c.wine)
+    if not seen:
+        return []
+    cause, detail = seen.get("cause", ""), seen.get("detail", "")
+    facts = seen.get("facts") or {}
+    ev = [detail] + list(facts.get("wine_errors") or [])[:3]
+    if seen.get("symptom") == "no_sound":
+        if cause == "no-stream":
+            return [Finding("sound-none", "The game's sound system did not start",
+                            "In the test run the game never opened an audio stream, so nothing can reach your "
+                            "speakers. Wine's audio errors (below, if any) say where it stopped; “Fix my game” tests "
+                            "Microsoft's DirectX audio and the game's own audio files.", 0.8, ev)]
+        if cause == "silent":
+            return [Finding("sound-silent", "The game opened its sound but played nothing",
+                            "Its audio stream stayed paused for the whole test run. Some games are silent in a menu; "
+                            "if it stays silent in the game too, its audio engine is waiting on something.", 0.5, ev)]
+        if cause == "muted-output":
+            return [Finding("sound-muted-output", "Its sound goes to a muted output",
+                            f"{detail.capitalize()}. Unmute that output in your system's sound settings.", 0.9, ev,
+                            Fix("command", f"pactl set-sink-mute {facts.get('output_name') or '@DEFAULT_SINK@'} 0",
+                                "Copy the command to unmute it") if facts.get("output_name") else None,
+                            fixable=bool(facts.get("output_name")))]
+        if cause == "muted-stream":
+            return [Finding("sound-muted-stream", "The game's own sound is muted",
+                            "In the volume mixer (your system's sound settings, or pavucontrol) the game's stream is "
+                            "muted or at 0 % — turn it up there; no game setting changes it.", 0.85, ev, fixable=False)]
+        if cause == "other-output":
+            return [Finding("sound-other-output", "Its sound goes to another output",
+                            f"{detail.capitalize()}. Move the game to your output in the volume mixer (pavucontrol "
+                            "remembers it per program) — this is the sound setup, not the game.", 0.85, ev,
+                            fixable=False)]
+        if cause == "ok":
+            return [Finding("sound-ok", "The game does play sound",
+                            f"In the test run {detail}. If you still hear nothing, look at the game's own audio "
+                            "options (output device, volume) and that output's volume.", 0.4, ev, fixable=False)]
+        return []
+    if seen.get("symptom") == "controller":
+        if cause == "none-connected":
+            return [Finding("pad-none-connected", "No controller was connected",
+                            "The test could not check the controller: none was plugged in or switched on. Connect it "
+                            "and run “Fix my game” again.", 0.9, ev, fixable=False)]
+        if cause == "none-seen":
+            return [Finding("pad-not-seen", "The game does not see the controller", detail.capitalize() + ". Wine "
+                            "reaches controllers through SDL, raw HID or the event devices; another route usually "
+                            "makes it visible.", 0.8, ev)]
+        if cause in ("doubled", "doubled-steam"):
+            return [Finding("pad-doubled", "The game sees the controller twice", detail.capitalize() + ". One of the "
+                            "two routes has to go (Steam Input's pad, or raw HID access).", 0.85, ev)]
+        if cause == "ok":
+            return [Finding("pad-ok", "The game sees the controller", f"In the test run {detail}. If it still does not "
+                            "react: some games only take input while their window is in front, or want an Xbox "
+                            "layout (Steam Input).", 0.4, ev, fixable=False)]
+    return []
+
+
+_PERF_TITLES = {"shaders": ("Stutter from shaders being built",
+                            "It fades as the game runs: each new effect is compiled once. The app keeps every game's "
+                            "shader cache, so the next starts stutter less."),
+                "stutter": ("Regular hitches", "Hitches all through the run, not only at the start — synchronisation "
+                            "(esync / fsync / ntsync) or the CPU's cores are where “Fix my game” looks first."),
+                "memory": ("Memory is short", "The computer moved data into swap while the game ran, which shows as "
+                           "hitches. Close other programs, or lower the game's texture quality."),
+                "gpu": ("The graphics card is the limit", "Lower the resolution or the graphics settings, or use the "
+                        "game's upscaling (FSR / DLSS)."),
+                "cpu": ("The processor (or the game's engine) is the limit", "The graphics card waits for frames: "
+                        "fewer background programs and GameMode help; graphics settings barely do."),
+                "cpu-busy": ("The processor is fully busy", "At a first start this settles once the shaders are "
+                             "built (the app keeps them per game); if it stays, close background programs."),
+                "fine": ("It ran smoothly", "")}
+
+
+def r_performance(c: Context) -> list[Finding]:
+    """Measured frame times (ezgd.library.probes): a play session when one was measured — a test run only sees the
+    menu — else the test run's."""
+    from ezgd.library import probes
+    play = c.measured
+    perf = play or probes.perf_from_text(c.wine)
+    if not perf:
+        return []
+    where = "your last measured session" if play else "the test run (its menu)"
+    out = []
+    for key, words in probes.causes(perf):
+        title, advice = _PERF_TITLES.get(key, (key, ""))
+        conf = (0.75 if play else 0.55) if key != "fine" else 0.45
+        out.append(Finding(f"perf-{key}", title + ("" if key != "fine" else f" in {where}"),
+                           f"Measured in {where}: {words}." + (f" {advice}" if advice else ""), conf,
+                           [f"{perf['fps']:.0f} FPS on average, 1 % low {perf['low1']:.0f}, "
+                            f"{perf['spikes']} hitches in {perf['seconds']:.0f}s"], fixable=key not in ("fine", "gpu")))
+    if not play:
+        out.append(Finding("perf-measure", "Measure a real play session",
+                           "A test run only sees the menu. The app can log your next session's frame times (no "
+                           "overlay, nothing to set up) and show here where the time goes.", 0.4, [],
+                           Fix("measure", "next", "Measure my next session")))
+    return out
+
+
+def r_network(c: Context) -> list[Finding]:
+    """Online play (ezgd.library.netprobe): the firewall's blocks of the game's ports during a played session or a
+    test run, and what a test run watching for "can't play online" saw."""
+    from ezgd.library import netprobe, probes
+    out: list[Finding] = []
+    for d in netprobe.from_text(c.wine):
+        b = (d.get("blocks") or [{}])[0]
+        if not b:
+            continue
+        fw = d.get("firewall") or "the firewall"
+        out.append(Finding("net-firewall", f"{fw} blocked connections to the game",
+                           f"While it ran, {fw} turned away {b['packets']} incoming packet(s) from {b['sources']} "
+                           f"address(es) to the game's {b['proto'].upper()} port {b['port']} — friends joining you "
+                           "directly could not reach it. Allowing that port lets them in; many games pick a new port "
+                           "each start, and Steam's relay (on by default) needs none.", 0.7,
+                           [f"{x['packets']} blocked → {x['proto']}/{x['port']}" for x in d["blocks"][:3]],
+                           Fix("command", netprobe.allow_command(d.get("firewall", ""), b),
+                               "Copy the command to allow the port")))
+    seen = probes.from_text(c.wine) or {}
+    if seen.get("symptom") != "online":
+        return out
+    cause, detail = seen.get("cause"), seen.get("detail", "")
+    errs = list((seen.get("facts") or {}).get("net_errors") or [])[:3]
+    if cause == "steam-off":
+        out.append(Finding("net-steam-off", "Steam was not running", "OnlineFix plays online through Steam: start "
+                           "Steam and sign in (any account) before the game.", 0.85, [detail], fixable=False))
+    elif cause == "tls" and not out:
+        out.append(Finding("wine-tls", "Secure connections fail under this Proton", f"{detail.capitalize()}. The "
+                           "game's online services refuse to talk without them; another Proton build (newer GnuTLS / "
+                           "schannel) usually works.", 0.75, errs))
+    elif cause == "no-network":
+        out.append(Finding("net-quiet", "The test run did not reach the online part", f"{detail.capitalize()}. Play "
+                           "until it fails to connect, then open Diagnose: the app checks the firewall for that "
+                           "session.", 0.4, [], fixable=False))
+    elif cause == "ok" and not out:
+        out.append(Finding("net-ok", "Its connections worked in the test run", f"In the test run {detail}. If joining "
+                           "friends still fails, both of you need the same game version and the same OnlineFix.", 0.4,
+                           [], fixable=False))
+    return out
+
+
 RULES = [r_error_box, r_screen_text, r_integrity, r_emulator, r_fix_archive, r_missing_dll, r_unimplemented, r_imports, r_dotnet, r_steam, r_steam_client, r_anticheat, r_vulkan, r_dx12, r_media,
          r_crash, r_minidump, r_prefix, r_quick_exit, r_native, r_system, r_protondb, r_old_prefix, r_advisor,
-         r_overlay, r_fonts, r_display, r_disk, r_writable, r_onlinefix_missing, r_regression, r_exit_code, r_override_files,
-         r_steam_reference, r_redist, r_engine_crash, r_mixed_prefix, r_heap, r_filesystem, r_play_crash]
+         r_overlay, r_fonts, r_display, r_display_mode, r_disk, r_writable, r_onlinefix_missing, r_regression, r_exit_code, r_override_files,
+         r_steam_reference, r_redist, r_engine_crash, r_mixed_prefix, r_heap, r_filesystem, r_play_crash, r_system_log, r_probe, r_performance, r_network]
 
 
 def diagnose(entry: LibraryEntry, prefix_dir: Path, log_path: Path, *, protons: list, proton_name: str,
              game_extra: dict | None = None, system=None, protondb: dict | None = None, symptom: str = "",
              learned: list[dict] | None = None, integrity: dict | None = None, methods: list | None = None,
              install_dest: Path | None = None, community: dict | None = None, steam_ref: dict | None = None,
-             evidence: dict | None = None, play_crashes: list | None = None) -> Diagnosis:
+             evidence: dict | None = None, play_crashes: list | None = None,
+             measured: dict | None = None) -> Diagnosis:
     """``evidence``: the assistant's own diagnostic test run ({"text", "exit_code", "seconds", "label"}), analysed
     instead of the last run in the game's log."""
     exe = Path(entry.executable) if entry.executable else None
@@ -1899,7 +2132,7 @@ def diagnose(entry: LibraryEntry, prefix_dir: Path, log_path: Path, *, protons: 
                 v64, v32, game_extra or {}, system=system, proton_dir=getattr(proton, "path", None),
                 protondb=protondb, run_started=started, integrity=integrity, methods=list(methods or []),
                 install_dest=install_dest, community=community, history=hist, steam_ref=steam_ref,
-                investigated=bool(evidence), play_crashes=list(play_crashes or []))
+                investigated=bool(evidence), play_crashes=list(play_crashes or []), measured=measured)
     findings: list[Finding] = []
     for rule in RULES:
         try:
@@ -1926,6 +2159,13 @@ def diagnose(entry: LibraryEntry, prefix_dir: Path, log_path: Path, *, protons: 
         reasoning = _reason(c, findings)          # (also raises findings the exit code agrees with)
     except Exception as exc:
         reasoning = [{"kind": "what", "text": f"(The reasoning step failed: {exc})"}]
+    if symptom == "slow" and not any(f.key.startswith("perf-") for f in findings):
+        # "runs badly" with nothing measured yet: a test run sees only the menu — measuring a real session is the step
+        findings.append(Finding("perf-measure", "Measure a real play session",
+                                "Nothing has been measured for this game yet. The app can log your next session's frame "
+                                "times (no overlay, nothing to set up) and show here where the time goes — stutter "
+                                "from shaders, a full graphics card, the processor, or memory.", 0.5, [],
+                                Fix("measure", "next", "Measure my next session")))
     # strongest evidence first; the same fix is offered once
     findings = [f for f in findings if f.confidence > 0]
     findings.sort(key=lambda f: (-f.confidence, not f.fix))

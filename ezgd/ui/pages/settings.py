@@ -928,9 +928,13 @@ class SettingsPage(QWidget):
 
     def _system(self, st: dict) -> None:
         missing = [t["name"] + (" (highly recommended)" if t["importance"] == "highly_recommended" else "")
-                   for t in st["tools"] if not t["installed"]]
-        self.system_label.setText("All tools are installed." if not missing else
-                                  f"Missing: {', '.join(missing)}.")
+                   for t in st["tools"] if not t["installed"] and not t.get("bundled")]
+        bundled = [t["name"] for t in st["tools"] if t.get("bundled")]
+        text = "All tools are installed." if not missing and not bundled else \
+            "Everything needed is there." if not missing else f"Missing: {', '.join(missing)}."
+        if bundled:                      # (not "installed": the app's own copy does it — UnRAR is not on the system)
+            text += f" {', '.join(bundled)}: the app's own 7-Zip (nothing installed)."
+        self.system_label.setText(text)
 
     def refresh_info(self) -> None:
         self.bridge.call(self.bridge.core.system_status(), self._system, owner=self)

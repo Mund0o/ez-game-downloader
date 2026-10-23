@@ -49,25 +49,22 @@ def _cpu() -> dict:
 
 
 def _gpus() -> list[dict]:
+    """The graphics cards as the kernel sees them. (Not vulkaninfo: the profile is read at every start, and starting
+    every Vulkan driver made the whole desktop stutter while the app opened.)"""
     out = []
-    try:
-        from ezgd.platform.syscheck import gpus as sys_gpus
-        found, _ok = sys_gpus()
-        for g in found:
-            name = getattr(g, "name", "")
-            vendor = ("nvidia" if re.search(r"nvidia|geforce|rtx|gtx|quadro", name, re.I) else
-                      "amd" if re.search(r"amd|radeon|ati\b", name, re.I) else
-                      "intel" if re.search(r"intel|arc\b|iris|uhd", name, re.I) else "other")
-            out.append({"name": name[:80], "driver": getattr(g, "driver", "")[:60], "vendor": vendor})
-    except Exception:
-        pass
-    if not out:                                   # no vulkaninfo: the kernel's view
-        for d in Path("/sys/class/drm").glob("card[0-9]"):
-            v = _read(str(d / "device" / "vendor")).strip()
-            vendor = {"0x10de": "nvidia", "0x1002": "amd", "0x8086": "intel"}.get(v)
-            if vendor:
-                drv = Path(os.path.realpath(d / "device" / "driver")).name
-                out.append({"name": vendor.upper() + " GPU", "driver": drv, "vendor": vendor})
+    nv_version = re.search(r"Kernel Module.*?\s(\d+\.\d+(?:\.\d+)?)\s", _read("/proc/driver/nvidia/version"))
+    for d in sorted(Path("/sys/class/drm").glob("card[0-9]")):
+        v = _read(str(d / "device" / "vendor")).strip()
+        vendor = {"0x10de": "nvidia", "0x1002": "amd", "0x8086": "intel"}.get(v)
+        if not vendor:
+            continue
+        drv = Path(os.path.realpath(d / "device" / "driver")).name
+        slot = Path(os.path.realpath(d / "device")).name
+        model = re.search(r"^Model:\s*(.+)$", _read(f"/proc/driver/nvidia/gpus/{slot}/information"), re.M)
+        name = model.group(1).strip() if model else vendor.upper() + " GPU"
+        if vendor == "nvidia" and nv_version:
+            drv = f"{drv} {nv_version.group(1)}"
+        out.append({"name": name[:80], "driver": drv[:60], "vendor": vendor})
     return out
 
 

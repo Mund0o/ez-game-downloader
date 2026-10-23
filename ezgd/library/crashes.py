@@ -197,7 +197,10 @@ def capture(data: Path, entry, prefix_dir: Path, log_path: Path, code: int | Non
     if dumps:
         text += "\n" + tracer.dump_line(dumps[0][1])
     t = tracer.trace(text, exe, exit_code=code, seconds=played)
-    crashed = kind == "freeze" or bool(dumps) or (t.crash is not None and t.crash.certain) or is_crash_exit(code)
+    # (a game the kernel killed for memory exits with SIGKILL, like one the app stopped: the system log tells them
+    # apart — ezgd.library.syslog)
+    crashed = kind == "freeze" or bool(dumps) or (t.crash is not None and t.crash.certain) or is_crash_exit(code) \
+        or bool(t.serious())
     if not crashed:
         return None
     engine = engine_of(exe) if exe.name else None
@@ -236,13 +239,14 @@ def capture(data: Path, entry, prefix_dir: Path, log_path: Path, code: int | Non
                                              "kind": c.kind, "null": c.null, "describe": c.describe()},
            "dumps": copied, "dump_source": [str(p) for p, _d in dumps[:3]], "engine_log": eng_name,
            "phase": t.phase, "chain": chain, "replaced": [r.name for r in t.replaced],
-           "fingerprint": tracer.fingerprint(t, engine), "machine": machine or {}, "freeze": freeze}
+           "fingerprint": tracer.fingerprint(t, engine), "machine": machine or {}, "freeze": freeze,
+           "system": [e.describe() for e in t.serious()]}
     (out / "record.json").write_text(json.dumps(rec, indent=1, default=str), "utf-8")
     for old in sorted(folder(data, entry.id).iterdir(), reverse=True)[KEEP:]:
         shutil.rmtree(old, ignore_errors=True)
     rec["folder"] = str(out)
     log.info("%s: %s after %ss kept in %s — %s", entry.title, kind, played, out,
-             rec["crash"]["describe"] if rec["crash"] else (freeze or {}).get("verdict", ""))
+             rec["crash"]["describe"] if rec["crash"] else (rec["system"] or [(freeze or {}).get("verdict", "")])[0])
     return rec
 
 
@@ -251,9 +255,12 @@ def summary(rec: dict) -> str:
     mins = max(1, int(rec.get("played") or 0) // 60)
     if rec.get("kind") == "freeze":
         return f"froze after {mins} min — " + ((rec.get("freeze") or {}).get("verdict") or "")
+    system = rec.get("system") or []
+    if system and (rec.get("code") in NORMAL_EXITS or not rec.get("crash")):
+        return f"stopped after {mins} min: {system[0]}"          # (the kernel / driver's account is the deeper one)
     c = rec.get("crash")
     if c:
-        return f"crashed after {mins} min: {c['describe']}"
+        return f"crashed after {mins} min: {c['describe']}" + (f" ({system[0]})" if system else "")
     return f"crashed after {mins} min (exit code {rec.get('code')})"
 
 

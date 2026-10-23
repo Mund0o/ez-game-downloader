@@ -46,3 +46,19 @@ def test_a_launcher_from_an_installation_is_left_alone(tmp_path, monkeypatch):
     (apps / "ezgd.desktop").write_text(installed.replace("Exec=sh", "Exec=/gone/ezgd"))   # its program is gone
     assert appentry.register(b"PNG", "violet", ["/x/ezgd"])
     assert appentry.MANAGED in (apps / "ezgd.desktop").read_text()
+
+
+def test_a_portable_run_leaves_the_desktops_entries_alone(tmp_path, monkeypatch):
+    # (a --home scratch copy once rewrote both: the real app then started that copy, hidden in the tray)
+    from ezgd.library import steamrun
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    real = tmp_path / "cfg" / "autostart" / "ezgd.desktop"
+    real.parent.mkdir(parents=True)
+    real.write_text("[Desktop Entry]\nExec=/real/ezgd --minimized\n")
+    monkeypatch.setattr(steamrun, "HOME", str(tmp_path / "scratch"))
+    assert not appentry.register(b"PNG", "violet", [str(tmp_path / "ezgd")])
+    assert not (tmp_path / "data" / "applications" / "ezgd.desktop").exists()
+    autostart.apply(True)
+    autostart.apply(False)
+    assert real.read_text() == "[Desktop Entry]\nExec=/real/ezgd --minimized\n"

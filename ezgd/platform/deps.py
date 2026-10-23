@@ -38,6 +38,7 @@ class ToolStatus:
     packages: list[str]
     note: str | None
     detail: str = ""              # what was found (program and where), or why it does not count
+    bundled: bool = False         # not installed — the copy that comes with the app does the job (7-Zip for RAR)
 
 
 def _which(*names: str) -> Callable[[], bool]:
@@ -45,9 +46,19 @@ def _which(*names: str) -> Callable[[], bool]:
 
 
 def _rar_tool() -> bool:
-    from ezgd.installation.archives import find_rar_tool
+    """A RAR extractor installed on the system. The app's own 7-Zip does not count — with it, the check showed a ✔
+    on a computer that had no UnRAR at all (it extracts, but nothing was installed); see ``_rar_bundled``."""
+    from ezgd.installation.archives import bundled_7zip, find_rar_tool
     tool = find_rar_tool()
-    return tool is not None and tool[0] != "bsdtar"      # bsdtar cannot open password-protected RAR archives
+    # (bsdtar cannot open password-protected RAR archives)
+    return tool is not None and tool[0] != "bsdtar" and tool[1] != bundled_7zip()
+
+
+def _rar_bundled() -> bool:
+    """RAR archives are extracted by the 7-Zip that comes with the app (nothing installed on the system)."""
+    from ezgd.installation.archives import bundled_7zip, find_rar_tool
+    tool = find_rar_tool()
+    return tool is not None and tool[1] == bundled_7zip()
 
 
 def _steam() -> bool:
@@ -128,9 +139,9 @@ def tool_detail(key: str) -> str:
         kind, path = tool
         if kind == "bsdtar":
             return f"Only bsdtar was found ({path}) — it cannot open password-protected RAR archives (OnlineFix)."
-        if path == bundled_7zip():                # (a ✔ next to "UnRAR" read as "unrar is installed" — it was not)
+        if path == bundled_7zip():                # (shown without a ✔: nothing is installed on the system)
             return ("UnRAR is not installed — the 7-Zip that comes with the app extracts RAR archives instead "
-                    "(password-protected ones too), so nothing more is needed.")
+                    "(password-protected ones too), so it is not needed.")
         return f"{'UnRAR' if kind == 'unrar' else '7-Zip'} at {path}"
     if key == "steam":
         from ezgd.platform.steam import find_steam_root
@@ -156,19 +167,21 @@ def status(family: str | None = None) -> list[ToolStatus]:
             detail = tool_detail(t.key)
         except Exception:
             detail = ""
+        try:
+            bundled = not ok and t.key == "rar" and _rar_bundled()
+        except Exception:
+            bundled = False
         out.append(ToolStatus(t.key, t.name, t.purpose, ok, t.importance,
-                              t.packages.get(family or "", []), t.note.get(family or ""), detail))
+                              t.packages.get(family or "", []), t.note.get(family or ""), detail, bundled))
     return out
 
 
 def windows_status() -> list[ToolStatus]:
-    ok = False
+    ok = bundled = False
     if IS_WINDOWS:
-        from ezgd.installation.archives import find_rar_tool
-        tool = find_rar_tool()
-        ok = tool is not None and tool[0] != "bsdtar"
+        ok, bundled = _rar_tool(), _rar_bundled()
     return [ToolStatus("rar", "7-Zip", "Extracts RAR archives — both sources ship games as RAR", ok, "required",
-                       ["7zip.7zip"], "Installed with winget.")]
+                       ["7zip.7zip"], "Installed with winget.", bundled=bundled)]
 
 
 def multilib_enabled(pacman_conf: str | None = None) -> bool:
@@ -246,6 +259,8 @@ def plan(include_optional: bool = True, only: list[str] | None = None) -> Instal
     for st in statuses:
         if st.installed or (only and st.key not in only):
             continue
+        if st.bundled and not only:
+            continue                         # the app's own copy does the job: installed only when ticked
         if st.importance == "optional" and not include_optional:
             continue
         if st.key == "steam" and (umu_planned or _proton_capable()):
@@ -278,7 +293,7 @@ def run_setup_cli(assume_yes: bool = False) -> int:
         return 0
     family = detect_family()
     for st in status(family):
-        mark = "✔" if st.installed else ("✘" if st.importance == "required" else "–")
+        mark = "✔" if st.installed else "○" if st.bundled else ("✘" if st.importance == "required" else "–")
         star = " (highly recommended)" if st.importance == "highly_recommended" and not st.installed else ""
         print(f"  {mark} {st.name:<15} {st.purpose}{star}")
         if st.key == "rar" and st.detail:

@@ -152,6 +152,8 @@ class Trace:
     game_errors: list[tuple[str, str]] = field(default_factory=list)   # (log file, line) from the game's own logs
     steam_fail: list[str] = field(default_factory=list)   # what Steam's API said when it refused
     setup: dict = field(default_factory=dict)                          # the app's snapshot of how it was started
+    system: list = field(default_factory=list)            # what the kernel / graphics driver logged (syslog.Event)
+    system_readable: bool = True                          # False: the system log could not be read for this run
 
     def loaded(self, name: str) -> bool:
         name = name.lower()
@@ -161,12 +163,25 @@ class Trace:
         name = name.lower()
         return any(ld.name == name and ld.kind == "native" for ld in self.loads)
 
+    def serious(self) -> list:
+        """What the system logged that ended or broke this run, the deepest cause first: killed for memory, then a
+        GPU fault (a game crash on a "device lost" usually follows one), then a crash Wine could not catch. A GPU
+        fault no process was named for counts only when the run failed; NVIDIA's Xid 45 is the clean-up after
+        another fault."""
+        failed = not self.ran or bool(self.errors) or self.crash is not None
+        out = [e for e in self.system if e.kind in ("oom", "oomd", "gpu", "segfault", "core")
+               and (e.ours or failed) and e.code != "nvidia:45"]
+        order = {"oom": 0, "oomd": 1, "gpu": 2, "segfault": 3, "core": 4}
+        return sorted(out, key=lambda e: order[e.kind])
+
     def first_problem(self) -> str:
         """The first thing that went wrong, in a few words (what the next step follows)."""
         if self.errors:
             return f"error message “{self.errors[0][:120]}”"
         if self.missing:
             return f"{self.missing[0][0]} not found"
+        if self.serious():
+            return self.serious()[0].describe()
         if self.crash is not None:
             return self.crash.describe()
         if self.replaced:
@@ -184,7 +199,8 @@ class Trace:
 
     def score(self) -> tuple:
         """How far the run got, comparable between runs: milestones, then not crashing, then time alive."""
-        return (len(self.phase), self.ran, self.crash is None and not self.errors, min(self.seconds or 0, 45) // 10)
+        return (len(self.phase), self.ran, self.crash is None and not self.errors and not self.serious(),
+                min(self.seconds or 0, 45) // 10)
 
 
 def _win_dir(path: str) -> str:
@@ -267,6 +283,8 @@ def trace(text: str, exe: Path, *, exit_code: int | None = None, seconds: int | 
     _game_logs(extra, t)
     t.steam_fail = list(dict.fromkeys(m.group(1).strip()[:200] for m in _STEAM_FAIL.finditer(text + "\n" + extra)))[:3]
     t.setup = _setup(text)
+    from ezgd.library import syslog
+    t.system, t.system_readable = syslog.from_text(text + "\n" + extra)
     t.errors = errorbox.messages(text)
     t.notices = [m for m in errorbox.messages(text, 10, notices=True) if errorbox.is_notice(m)]
     t.phase = history.phase(text + "\n" + extra).reached
@@ -623,6 +641,13 @@ def follow(t: Trace, entry=None, good: dict | None = None) -> tuple[list[str], l
     elif t.exit_code is not None:
         chain.append(f"It quit by itself with exit code {t.exit_code} after {t.seconds}s, without an error message "
                      "or a crash.")
+    # 1b. what the system logged: the kernel killed it, or the graphics driver faulted under it
+    for ev in t.serious()[:2]:
+        chain.append(_system_line(ev))
+    if not t.system_readable and quiet_end(t):
+        chain.append("The system log could not be read on this computer, so a kill for lack of memory or a graphics "
+                     "driver fault would not show here.")
+    out += _system_suspects(t)
     if t.phase:
         chain.append("How far it got: " + " → ".join(t.phase) + ".")
     else:
@@ -789,6 +814,88 @@ def follow(t: Trace, entry=None, good: dict | None = None) -> tuple[list[str], l
     return chain, out
 
 
+def quiet_end(t: Trace) -> bool:
+    """It ended without saying why — no error message, no crash Wine saw, not still running."""
+    return not t.ran and not t.errors and t.crash is None
+
+
+_GPU_LIBS = ("libnvidia", "libcuda", "libvulkan_", "libgallium", "radeonsi", "iris_dri", "libdrm", "libGLX_",
+             "libEGL_nvidia", "nvidia_drv")
+
+
+def _system_line(ev) -> str:
+    from ezgd.library import syslog
+    if ev.kind in ("oom", "oomd"):
+        mem = syslog.memory_facts()
+        have = f" of {mem['MemTotal'] / (1 << 30):.0f} GB" if mem.get("MemTotal") else ""
+        swap = "" if not mem else " This computer has no swap space." if not mem.get("SwapTotal") else \
+            f" Swap: {mem['SwapTotal'] / (1 << 30):.0f} GB."
+        used = f" — the game was using {ev.mem / (1 << 30):.1f} GB{have}" if ev.mem else ""
+        who = "The kernel" if ev.kind == "oom" else "systemd-oomd"
+        return f"{who} killed it because the computer ran out of memory{used}.{swap}"
+    if ev.kind == "gpu":
+        whose = syslog.XID.get(int(ev.code.split(":")[1]), ("", ""))[1] if ev.code.startswith("nvidia:") else ""
+        line = f"The graphics driver reported a GPU fault during the run ({ev.code}: {ev.detail})"
+        if whose == "hardware":
+            line += " — that points at the hardware (power, the PCIe slot, the card's memory), not at the game"
+        elif whose == "game":
+            line += " — the GPU failed on the game's own commands (how the game's graphics are translated, or a " \
+                    "driver bug they trigger)"
+        return line + "."
+    where = f" in {ev.lib}" if ev.lib else ""
+    line = f"It crashed outside Wine's control: {ev.proc} — {ev.detail}{where}"
+    if ev.lib.startswith(_GPU_LIBS):
+        line += " (inside the graphics driver)"
+    return line + "."
+
+
+def _system_suspects(t: Trace) -> list[Suspect]:
+    """What the kernel's or the driver's account points at. A kill for memory has no launch setting that fixes it —
+    it is said plainly (information); a GPU fault on the game's work has settings worth testing, each predicted to
+    make the fault disappear."""
+    from ezgd.library import syslog
+    from ezgd.library.fixgen import GeneratedFix
+    out: list[Suspect] = []
+    events = t.serious()
+    if any(e.kind in ("oom", "oomd") for e in events):
+        mem = syslog.memory_facts()
+        steps = ["close other programs while playing (a browser can hold several GB)",
+                 "lower the game's texture quality"]
+        if mem and not mem.get("SwapTotal"):
+            steps.insert(0, "add swap space or zram — this computer has none, so the kernel had nothing to fall "
+                            "back on")
+        out.append(Suspect("system:memory", "The computer ran out of memory",
+                           "Linux stopped the game to keep the computer running. To avoid it: " + "; ".join(steps)
+                           + ".", 0.9))
+    gpu = [e for e in events if e.kind == "gpu"]
+    if gpu:
+        e = gpu[0]
+        hardware = e.code.startswith("nvidia:") and \
+            syslog.XID.get(int(e.code.split(":")[1]), ("", ""))[1] == "hardware"
+        if hardware:
+            out.append(Suspect("system:gpu-hardware", "Check the graphics card's power and connection",
+                               f"The driver's report ({e.code}: {e.detail}) is a hardware fault: the power cable, the "
+                               "power supply under load, or the card's seating in its slot.", 0.8))
+        else:
+            expect = {"no_system": "gpu"}
+            if e.code.startswith("nvidia:") and (t.loaded("nvapi64.dll") or t.loaded("nvngx_dlss.dll")):
+                out.append(Suspect("system:no-nvapi", "Turn NVAPI off (DLSS / Reflex)",
+                                   "The GPU faulted on an NVIDIA card while the game used NVAPI (DLSS / Reflex); "
+                                   "without it the game takes its plain rendering path.", 0.5,
+                                   GeneratedFix("sys:no-nvapi", "Turn NVAPI off (DLSS / Reflex)",
+                                                f"The graphics driver reported {e.code} while NVAPI was in use.",
+                                                options=["no_nvapi"]), expect))
+            shipping = any(n.endswith("-shipping.exe") for n in {ld.name for ld in t.loads})
+            if t.loaded("d3d12.dll") and shipping:
+                out.append(Suspect("system:dx11", "Start it with DirectX 11 (-dx11)",
+                                   "The GPU faulted under the game's DirectX 12 renderer; Unreal games can draw with "
+                                   "DirectX 11 instead (translated by DXVK, a different path).", 0.55,
+                                   GeneratedFix("sys:dx11", "Start it with DirectX 11 (-dx11)",
+                                                f"The graphics driver reported {e.code} under DirectX 12.",
+                                                args="-dx11"), expect))
+    return out
+
+
 def _addon(ld: Load, t: Trace) -> bool:
     """A DLL in the game's folder that is not the game's or its engine's (a mod, an injected overlay, a fix)."""
     name = ld.name
@@ -823,6 +930,10 @@ def verdict(before: Trace, after: Trace, expect: dict) -> tuple[str, str]:
         still = {k.lower() for _t, k, _a in after.keys_missing}
         if after.keys_traced:
             (missed if any(k.lower() in still for k in expect["no_key"]) else met).append("the registry key is found now")
+    if "no_system" in expect:
+        kind = expect["no_system"]
+        (missed if any(e.kind == kind for e in after.serious()) else met).append(
+            {"gpu": "no GPU fault any more", "oom": "not killed for memory any more"}.get(kind, f"no {kind} any more"))
     if "crash_moved" in expect and before.crash is not None:
         moved = after.crash is None or after.crash.module.lower() != expect["crash_moved"]
         (met if moved else missed).append(f"no crash in {expect['crash_moved']} any more")
@@ -868,6 +979,9 @@ def fingerprint(t: Trace, engine: str | None = None) -> dict:
     sig["box"] = errorbox.explain(t.errors[0])[0] if t.errors else ""
     sig["missing"] = sorted({d for d, _n in t.missing})
     sig["keys"] = sorted({k.lower() for _t, k, _a in t.keys_missing})[:5]
+    sys_ = sorted({e.kind if e.kind != "gpu" else e.code for e in t.serious()})
+    if sys_:
+        sig["system"] = sys_
     return sig
 
 
@@ -875,6 +989,8 @@ def _sig_id(sig: dict) -> str:
     import hashlib
     import json
     core = {k: sig.get(k) for k in ("code", "module", "null", "build", "replaced", "box", "missing")}
+    if sig.get("system"):                      # (only when present: the ids of failures kept before stay the same)
+        core["system"] = sig["system"]
     return hashlib.sha1(json.dumps(core, sort_keys=True).encode()).hexdigest()[:12]
 
 
@@ -893,6 +1009,9 @@ def _similar(a: dict, b: dict) -> tuple[float, str]:
     if a.get("module") and a.get("module") != "<game>" and a.get("module") == b.get("module") and \
             a.get("code") == b.get("code") and a.get("engine") == b.get("engine"):
         return 0.7, f"a crash in {a['module']} in a game with the same engine"
+    gpu = [x for x in a.get("system") or [] if ":" in x]
+    if gpu and gpu == [x for x in b.get("system") or [] if ":" in x] and a.get("engine") == b.get("engine"):
+        return 0.6, f"the same GPU fault ({', '.join(gpu)}) in a game with the same engine"
     return 0.0, ""
 
 
@@ -977,7 +1096,7 @@ _WORD = re.compile(r"^[a-z0-9_]{1,40}$")
 _DLL = re.compile(r"^[A-Za-z0-9_.\-]{1,64}$")
 _DLL_MODES = {"", "n", "b", "n,b", "b,n", "d"}
 _COMPAT_SET = {"use_runtime", "protonfixes", "report_app_id"}
-_SIG_KEYS = {"engine", "code", "module", "null", "build", "replaced", "loaders", "box", "missing", "keys"}
+_SIG_KEYS = {"engine", "code", "module", "null", "build", "replaced", "loaders", "box", "missing", "keys", "system"}
 
 
 def _txt(v, n: int = 160) -> str:

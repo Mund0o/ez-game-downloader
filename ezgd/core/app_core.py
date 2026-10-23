@@ -6,6 +6,7 @@ All methods run on the core asyncio loop (see :mod:`ezgd.ui.bridge`).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -217,6 +218,7 @@ class AppCore:
         self.library.on_game_exit = self._game_exited
         self._freezes: dict[int, dict] = {}            # games that seem / were said to be frozen: their threads
         self._cpu_hist: dict[int, list] = {}           # running games' processor time (the freeze watch)
+        self._net_ports: dict[int, set] = {}           # the ports running games listen on (ezgd.library.netprobe)
         self.post.recover()
         self.downloads = DownloadManager(self.download_repo, self.settings, self.http_engine, self.torrents,
                                          self.emit, client=self.client, on_completed=self._after_download,
@@ -763,7 +765,8 @@ class AppCore:
         proton_ok = await asyncio.to_thread(deps._proton_capable) if deps.IS_LINUX else True
         return {"family": deps.detect_family() if deps.IS_LINUX else "windows",
                 "tools": [s.__dict__ for s in statuses], "can_run_windows_games": proton_ok,
-                "missing_required": [s.name for s in statuses if s.importance == "required" and not s.installed]}
+                "missing_required": [s.name for s in statuses
+                                     if s.importance == "required" and not s.installed and not s.bundled]}
 
     async def system_install_plan(self, only: list[str] | None = None) -> dict:
         """What installing would do; ``only``: just these tools (keys from system_status) — the ones ticked in the
@@ -1355,7 +1358,9 @@ class AppCore:
             self._trial_cancel = threading.Event()
         found: list = [] if repairs is None else repairs
         # stop at the first setup that works: the rest would only make you wait
-        results = await self._run_candidates(entry_id, cands, stop_on_success=True, repairs=found, symptom=symptom)
+        with self._watching(symptom):
+            results = await self._run_candidates(entry_id, cands, stop_on_success=True, repairs=found,
+                                                 symptom=symptom)
         if found and repairs is None:              # the UI offers them (they change the real prefix: not tested)
             self.emit("trial_repairs", {"id": entry_id, "findings": found})
         return results
@@ -1390,7 +1395,8 @@ class AppCore:
         cand = {"label": "Current setup", "overrides": {}}
         self.emit("trial", {"id": entry_id, "index": 1, "total": 1, "label": "Test run with detailed logging",
                             "status": "running"})
-        r = await asyncio.to_thread(self.library.run_trial, entry_id, cand, 1, self._trial_cancel)
+        with self._watching(symptom):
+            r = await asyncio.to_thread(self.library.run_trial, entry_id, cand, 1, self._trial_cancel)
         self.emit("trial", {"id": entry_id, "index": 1, "total": 1, "label": "Test run with detailed logging",
                             "status": "done", "result": r})
         ev = self.library.trial_evidence.get(entry_id, {}).get(1)
@@ -1670,6 +1676,24 @@ class AppCore:
                           background: bool = False) -> dict:
         """One button: check, repair what has strong evidence, test setups, and give one answer.
         ``background``: the new-game check runs it (a press of the button stops that check first)."""
+        with self._watching(symptom):
+            return await self._fix_my_game(entry_id, symptom, test, background)
+
+    @contextlib.contextmanager
+    def _watching(self, symptom: str):
+        """No sound / controller / runs badly: every test run meanwhile watches for that problem (ezgd.library
+        .probes) — a run that keeps going while the problem is still there is no success. (Nested: the outer wins.)"""
+        from ezgd.library import probes
+        outer = self.library.trial_symptom
+        if not outer:
+            self.library.trial_symptom = symptom if symptom in probes.PROBED else ""
+        try:
+            yield
+        finally:
+            self.library.trial_symptom = outer
+
+    async def _fix_my_game(self, entry_id: int, symptom: str, test: bool, background: bool) -> dict:
+        from ezgd.library import probes
         if getattr(self, "_investigating", False) and not background:
             self._trial_cancel.set()                    # a new-game check is running: it steps aside
             while getattr(self, "_investigating", False):
@@ -1703,9 +1727,12 @@ class AppCore:
             return await self._fix_late_crash(entry_id, late, symptom, step, before)
         top = max((f["confidence"] for f in d["findings"] if f.get("fix")), default=0.0)
         seen_ev = None                                 # the investigation's test run (its evidence is kept)
-        if test and top < 0.6 and d.get("suggest_diagnostic_run", True):
-            # weak evidence: look first (what "Investigate" did) — one start with Wine's detailed logging
-            step("Investigating", "running", "starting the game once with detailed logging (about a minute)")
+        probed = symptom in probes.PROBED
+        if test and (top < 0.6 or probed) and d.get("suggest_diagnostic_run", True):
+            # weak evidence: look first (what "Investigate" did) — one start with Wine's detailed logging. For a
+            # problem of a running game (sound, controller, speed) always: that run shows the problem itself
+            step("Investigating", "running", "starting the game once with detailed logging (about a minute)"
+                 + (" — watching for the problem you reported" if probed else ""))
             if getattr(self, "_trial_cancel", None) is None or self._trial_cancel.is_set():
                 self._trial_cancel = threading.Event()
             r = await asyncio.to_thread(self.library.run_trial, entry_id, {"label": "Current setup", "overrides": {}},
@@ -1715,6 +1742,10 @@ class AppCore:
                 d = await self.diagnose_game(entry_id, symptom, evidence=ev)
                 seen_ev = ev
             step("Investigating", "done", r["detail"] + (f" — {d['summary']}" if ev and r["outcome"] != "ran" else ""))
+            if probed:
+                stop = await self._symptom_answer(entry_id, symptom, r)
+                if stop is not None:
+                    return {"applied": [], "before": before, "findings": d["findings"][:5], **stop}
         applied: list[str] = []
         step("Repairing", "running")
         await self._auto_repair(entry_id, d["findings"], applied, step, "Repairing")
@@ -1748,6 +1779,8 @@ class AppCore:
                     await self.apply_trial(entry_id, kept_ov, gen_id, problems)
                 kept = "; ".join(acted) or "; ".join(a.split(" — ")[0] for a in applied) or "the repaired setup"
                 verdict.update(status="fixed", kept=kept, trials=rounds + [again])
+                if probed:                            # (the probe judged it: not only "it did not crash")
+                    verdict["checked"] = again["detail"]
                 step("Testing", "done", f"✓ the game kept running after: {kept} (checked twice)", at=1.0)
                 return verdict
             step("Testing", "running", f"✗ the second check failed ({again['detail']})")
@@ -2214,6 +2247,8 @@ class AppCore:
                 v, why = tracer.verdict(cur, after, sx.expect)
                 if r["outcome"] == "ran" and not r.get("stuck"):
                     v, why = "fixed", r["detail"]
+                elif r["outcome"] == "symptom" and v == "fixed":
+                    v, why = "no-change", r["detail"]      # it runs, but the reported problem is still there
                 ok = v in ("fixed", "progress", "confirmed")
                 say(name, f"{'✓' if ok else '✗'} {sx.title}: {why}")
                 if not ok:
@@ -2251,6 +2286,49 @@ class AppCore:
             say(name, "the trail ends here: " + cur.first_problem(), "done")
             break
         return finish("partial" if kept else "cold")
+
+    async def _symptom_answer(self, entry_id: int, symptom: str, r: dict) -> dict | None:
+        """After the first watched test run: an answer that needs no game fix — the problem did not show, it could
+        not be checked, or it is the sound setup rather than the game. None: test fixes as usual."""
+        seen = r.get("probe") or {}
+        cause = seen.get("cause", "")
+        if r["outcome"] == "ran":                  # the watched problem did not show in a test run
+            if symptom == "slow":
+                measured = await asyncio.to_thread(self.library.measure_next_session, entry_id)
+                return {"status": "seen", "kept": None, "trials": [r],
+                        "reason": f"In a test run it ran smoothly ({r['detail'].split(' — ')[-1]}) — but a test only "
+                                  "sees the menu. " + ("Your next session is measured (frame times, no overlay): "
+                                                       "play a while, then open Diagnose to see where the time goes."
+                                                       if measured else "Install MangoHud to measure a real session.")}
+            what = {"no_sound": "If you still hear nothing in the game, check its own audio options (output device, "
+                                "volume).",
+                    "controller": "If it still does not react in the game: some games only take input while their "
+                                  "window is in front, or want an Xbox layout (Steam Input)."}.get(symptom, "")
+            return {"status": "seen", "kept": None, "trials": [r],
+                    "reason": f"In a test run {seen.get('detail') or 'the problem did not show'}. {what}".strip()}
+        if r["outcome"] != "symptom":
+            return None                            # it crashed / did not start: that is followed first
+        if seen.get("ok") is None and seen:
+            return {"status": "seen", "kept": None, "trials": [r], "reason": seen.get("detail", "")}
+        if cause == "firewall":
+            return {"status": "seen", "kept": None, "trials": [r],
+                    "reason": f"{seen['detail'][0].upper()}{seen['detail'][1:]}. That is this computer's firewall, not "
+                              "the game. To let the game through, allow its port (needs administrator rights): "
+                              f"{seen.get('command', '')}. Many games pick a new port each time — Steam's relay, on by "
+                              "default, does not need one."}
+        if cause == "steam-off":
+            return {"status": "seen", "kept": None, "trials": [r],
+                    "reason": "OnlineFix plays online through Steam, and Steam was not running. Start Steam and sign "
+                              "in (any account), then start the game."}
+        if cause in ("muted-output", "muted-stream", "other-output"):
+            return {"status": "seen", "kept": None, "trials": [r],
+                    "reason": f"{seen['detail'][0].upper()}{seen['detail'][1:]} — that is your sound setup, not the "
+                              "game, so no game setting would change it. Change it in the volume mixer (your system's "
+                              "sound settings, or pavucontrol)."}
+        if symptom == "slow" and "could not be measured" in r.get("detail", ""):
+            return {"status": "seen", "kept": None, "trials": [r], "reason": r["detail"].removeprefix("kept running, ")
+                    .capitalize()}
+        return None
 
     async def _trim(self, entry_id: int, parts: list, kept: dict, trial, say, name: str) -> dict:
         """A fix of several changes: each is left out once — if the game still runs without it, it was not needed
@@ -2524,7 +2602,7 @@ class AppCore:
             # these change the prefix (where the saves are): zip the saves first
             await asyncio.to_thread(self.library.backup_saves, entry_id, "before-fix", True)
         msg = await self._apply_fix(entry_id, kind, value)
-        if kind not in ("restore_saves", "system", "open_url"):
+        if kind not in ("restore_saves", "system", "open_url", "measure"):
             what = self.FIX_LABELS.get(kind, "the fix")
             if kind == "winetricks":
                 what = f"installing {value}"
@@ -2667,6 +2745,28 @@ class AppCore:
             return
         freeze = self._freezes.pop(entry_id, None)
         kind = "freeze" if freeze and code in crashes.NORMAL_EXITS else "crash"
+        try:                       # the kernel / graphics driver's view of the session, into its log (before reading it)
+            events, sys_text = await asyncio.to_thread(self.library._system_log, entry_id, time.time() - played - 30)
+            if events or (sys_text and code not in (0, None)):
+                with open(self.paths.logs / f"game-{entry_id}.log", "a", encoding="utf-8") as fh:
+                    fh.write(sys_text)
+        except Exception:
+            log.exception("reading the system log after playing failed")
+        if self.library.measuring(entry_id):        # a measured session ("runs badly"): its log answers the request
+            await asyncio.to_thread(self.library.play_measurement, entry_id)
+        ports = self._net_ports.pop(entry_id, set())
+        if ports:                                  # did the firewall turn away anyone trying to reach the game?
+            try:
+                from ezgd.library import netprobe
+                found, _readable = await asyncio.to_thread(netprobe.read_blocks, time.time() - played - 30,
+                                                           time.time(), ports)
+                if found:
+                    fw = await asyncio.to_thread(netprobe.firewall)
+                    with open(self.paths.logs / f"game-{entry_id}.log", "a", encoding="utf-8") as fh:
+                        fh.write(netprobe.marker({"kind": "session", "firewall": fw, "blocks": found[:5],
+                                                  "ports": sorted(f"{p}/{proto}" for proto, p in ports)[:20]}))
+            except Exception:
+                log.exception("checking the firewall after playing failed")
         try:
             prof = await asyncio.to_thread(machine.profile)
             rec = await asyncio.to_thread(crashes.capture, self.paths.data, e, self.library.prefix_dir(entry_id),
@@ -2699,16 +2799,23 @@ class AppCore:
     async def _watch_freezes(self) -> None:
         """A running game whose Windows processes used no processor time at all for a minute is probably frozen:
         what its threads were doing is kept now, while it hangs (once it is stopped there is nothing to read)."""
-        from ezgd.library import crashes
+        from ezgd.library import crashes, netprobe
         now = time.monotonic()
         running = set(self.library.running_ids())
         for eid in list(self._cpu_hist):
             if eid not in running:
                 self._cpu_hist.pop(eid, None)
         for eid in running:
-            if eid in self.library._suspended or (self.library.session_seconds(eid) or 0) < 120:
+            if eid in self.library._suspended:
                 continue
             pids = await asyncio.to_thread(self.library.game_processes, eid)
+            try:                                   # where friends would reach it: compared with the firewall's log
+                ports = await asyncio.to_thread(lambda: netprobe.listening(netprobe.sockets(set(pids))))
+                self._net_ports.setdefault(eid, set()).update(ports)
+            except Exception:
+                log.debug("reading the game's sockets failed", exc_info=True)
+            if (self.library.session_seconds(eid) or 0) < 120:
+                continue
             ticks = await asyncio.to_thread(_exe_ticks, pids)
             if ticks is None:
                 continue
@@ -2918,15 +3025,23 @@ class AppCore:
     async def _layer_suspects(self, entry_id: int, cur) -> list:
         from ezgd.library import dxlayers, tracer
         c = cur.crash
-        if c is None or not c.module or dxlayers.kind_for_module(c.module) is None:
+        gpu = next((e for e in cur.serious() if e.kind == "gpu"), None)
+        if c is not None and c.module and dxlayers.kind_for_module(c.module) is not None:
+            module, why, expect = c.module, f"The crash is inside {c.module}, part of {{label}}; another version of it " \
+                                            "often starts a game the bundled one crashes in.", {}
+        elif gpu is not None and (cur.loaded("d3d12.dll") or cur.loaded("d3d11.dll")):
+            # the driver faulted on the game's GPU work: that work is what DXVK / VKD3D-Proton made of its DirectX
+            module = "d3d12.dll" if cur.loaded("d3d12.dll") else "d3d11.dll"
+            why = f"The graphics driver reported a GPU fault ({gpu.code}) on the game's work, which {{label}} " \
+                  "translates from DirectX; another version translates it differently."
+            expect = {"no_system": "gpu"}
+        else:
             return []
-        label = dxlayers.KINDS[dxlayers.kind_for_module(c.module)]["label"]
+        label = dxlayers.KINDS[dxlayers.kind_for_module(module)]["label"]
         out = []
-        for name, version in await self.layer_variants(entry_id, c.module):
-            out.append(tracer.Suspect(f"layer:{name}", f"Use {label} {version}",
-                                      f"The crash is inside {c.module}, part of {label}; another version of it "
-                                      "often starts a game the bundled one crashes in.", 0.55,
-                                      overrides={"proton_version": name}))
+        for name, version in await self.layer_variants(entry_id, module):
+            out.append(tracer.Suspect(f"layer:{name}", f"Use {label} {version}", why.format(label=label), 0.55,
+                                      expect=expect, overrides={"proton_version": name}))
         return out
 
     async def report_freeze(self, entry_id: int) -> str:
@@ -3017,6 +3132,10 @@ class AppCore:
         from ezgd.installation import integrity
         e = self.library.get(entry_id)
         log.info("applying fix %s for %s", kind, e.title)
+        if kind == "measure":                     # "runs badly": the next play session's frame times are logged
+            if not await asyncio.to_thread(self.library.measure_next_session, entry_id):
+                raise SourceError("Measuring needs MangoHud — install it in Settings → System check.")
+            return "Your next session is measured (frame times, no overlay) — play a while, then open Diagnose."
         if kind == "repair_files":
             rep = await self.integrity_report(entry_id)
             if rep is None or not rep.issues:

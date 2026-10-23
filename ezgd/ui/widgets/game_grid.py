@@ -18,6 +18,22 @@ CARD_WIDTHS = {"compact": 196, "comfortable": 234, "large": 284}
 GroupRole = Qt.UserRole + 1
 
 
+def _top_rounded(r: QRectF, radius: float) -> QPainterPath:
+    """Rounded top corners, square bottom edge — one outline drawn with arcs. (It used to be a rounded rectangle
+    united with a rectangle over its lower half; in the app that union sometimes came back as the lower half alone,
+    and every cover lost its top half.)"""
+    d = radius * 2
+    path = QPainterPath()
+    path.moveTo(r.left(), r.bottom())
+    path.lineTo(r.left(), r.top() + radius)
+    path.arcTo(QRectF(r.left(), r.top(), d, d), 180, -90)
+    path.lineTo(r.right() - radius, r.top())
+    path.arcTo(QRectF(r.right() - d, r.top(), d, d), 90, -90)
+    path.lineTo(r.right(), r.bottom())
+    path.closeSubpath()
+    return path
+
+
 class GameListModel(QAbstractListModel):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -76,12 +92,7 @@ class GameCardDelegate(QStyledItemDelegate):
         q = QPainter(out)
         q.setRenderHint(QPainter.Antialiasing)
         q.setRenderHint(QPainter.SmoothPixmapTransform)
-        # rounded top corners, square bottom edge (union — not odd-even — of the two shapes)
-        rounded = QPainterPath()
-        rounded.addRoundedRect(QRectF(0.5 * dpr, 0.5 * dpr, pw - dpr, ph), 11.5 * dpr, 11.5 * dpr)
-        bottom = QPainterPath()
-        bottom.addRect(QRectF(0.5 * dpr, ph / 2, pw - dpr, ph / 2))
-        q.setClipPath(rounded.united(bottom))
+        q.setClipPath(_top_rounded(QRectF(0.5 * dpr, 0.5 * dpr, pw - dpr, ph), 11.5 * dpr))
         scaled = img.scaled(QSize(pw, ph), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
         q.drawImage(0, 0, scaled, (scaled.width() - pw) // 2, (scaled.height() - ph) // 2, pw, ph)
         shade = QLinearGradient(0, ph * 0.65, 0, ph)
@@ -161,13 +172,8 @@ class GameCardDelegate(QStyledItemDelegate):
         if pm is not None:
             p.drawPixmap(QPointF(0, 0), pm)
         else:
-            # rounded top corners, square bottom edge (union — not odd-even — of the two shapes)
-            rounded = QPainterPath()
-            rounded.addRoundedRect(cover.adjusted(0.5, 0.5, -0.5, 0), 11.5, 11.5)
-            bottom = QPainterPath()
-            bottom.addRect(cover.adjusted(0.5, cover_h / 2, -0.5, 0))
             p.save()
-            p.setClipPath(rounded.united(bottom))
+            p.setClipPath(_top_rounded(cover.adjusted(0.5, 0.5, -0.5, 0), 11.5))
             grad = QLinearGradient(cover.topLeft(), cover.bottomRight())
             grad.setColorAt(0, QColor(pal.accent).darker(260))
             grad.setColorAt(1, QColor(pal.bg3))

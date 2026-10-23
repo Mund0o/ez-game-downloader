@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 from ezgd.core.fsutil import is_within, safe_dirname
 from ezgd.database.repositories import GameRepository, LibraryRepository
-from ezgd.library import advisor, crashes, errorbox, fixes, fixgen, picture, repack, saves, screenread, steamrun
+from ezgd.library import advisor, crashes, errorbox, fixes, fixgen, picture, probes, repack, saves, screenread, steamrun
 from ezgd.library.executables import Candidate, find_executables, rank
 from ezgd.library.models import CompatConfig, LaunchMethod, LibraryEntry, LibraryStatus
 from ezgd.platform import IS_LINUX
@@ -391,6 +391,9 @@ _OF_INI_CACHE: dict[str, tuple[float, list]] = {}      # game folder → (when, 
 
 class LibraryManager:
     on_game_exit = None          # (entry_id, exit code, seconds) after every game run — the fix follow-up
+    # the problem the user reported ("no_sound", "controller", "slow"), while the assistant tests for it: each test
+    # run then watches for that problem (ezgd.library.probes) instead of only "did it keep running"
+    trial_symptom = ""
 
     @property
     def trial_evidence(self) -> dict[int, dict[int, dict]]:
@@ -798,11 +801,64 @@ class LibraryManager:
         """Every game starts with MangoHud loaded (when it is installed) but hidden unless switched on, reading its
         own config file: switching MangoHud on or off then shows / hides it over the running game at once (MangoHud
         reloads a config file that changes). Vulkan games — Proton's DirectX too."""
-        if os.name == "nt" or not getattr(self.settings.settings, "mangohud_live", True) or \
-                not shutil.which("mangohud"):
+        if os.name == "nt" or not shutil.which("mangohud"):
+            return {}
+        if self.measuring(e.id):                   # "runs badly": this session's frame times are logged
+            try:
+                conf = probes.logging_conf(self.paths.data / "measure" / f"game-{e.id}.conf", self.measure_dir(e.id),
+                                           20, 900, self._user_mangohud_conf(),
+                                           visible="mangohud" in e.compat_config.fixes)
+                return {"MANGOHUD": "1", "MANGOHUD_CONFIGFILE": str(conf)}
+            except OSError as exc:
+                log.info("measuring %s could not be set up: %s", e.title, exc)
+        if not getattr(self.settings.settings, "mangohud_live", True):
             return {}
         conf = self._write_mangohud_conf(e.id, "mangohud" in e.compat_config.fixes)
         return {"MANGOHUD": "1", "MANGOHUD_CONFIGFILE": str(conf)} if conf else {}
+
+    # ------------------------------------------------------------ "runs badly": measuring a real session
+    def measure_dir(self, entry_id: int) -> Path:
+        return self.paths.data / "measure" / f"game-{entry_id}"
+
+    def measure_next_session(self, entry_id: int, on: bool = True) -> bool:
+        """Log the frame times of this game's next play session (a test run only sees its menu). One session:
+        cleared once a log of it exists (``play_measurement``). False when MangoHud is not installed."""
+        flag = self.paths.data / "measure" / f"next-{entry_id}"
+        if not on:
+            flag.unlink(missing_ok=True)
+            return False
+        if not shutil.which("mangohud"):
+            return False
+        flag.parent.mkdir(parents=True, exist_ok=True)
+        flag.write_text(str(time.time()))
+        return True
+
+    def measuring(self, entry_id: int) -> bool:
+        return (self.paths.data / "measure" / f"next-{entry_id}").exists()
+
+    def play_measurement(self, entry_id: int) -> dict | None:
+        """The newest measured play session (ezgd.library.probes.read_log + when), clearing the request it answered."""
+        found = probes.newest_log(self.measure_dir(entry_id))
+        if found is None:
+            return None
+        perf = probes.read_log(found)
+        if perf is None:
+            return None
+        flag = self.paths.data / "measure" / f"next-{entry_id}"
+        try:
+            if flag.exists() and found.stat().st_mtime > float(flag.read_text() or 0):
+                flag.unlink()                      # (that session was measured)
+            perf["at"] = found.stat().st_mtime
+        except (OSError, ValueError):
+            pass
+        return perf
+
+    def _user_mangohud_conf(self) -> str:
+        p = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "MangoHud" / "MangoHud.conf"
+        try:
+            return p.read_text("utf-8", "replace")
+        except OSError:
+            return ""
 
     def _write_mangohud_conf(self, entry_id: int, visible: bool) -> Path | None:
         """The game's MangoHud config: the user's own MangoHud.conf, shown or hidden (``no_display``). Written in
@@ -1572,7 +1628,8 @@ class LibraryManager:
                         methods=[m.to_dict() for m in (game.download_methods or [])] if game else [],
                         install_dest=Path(install_dest) if install_dest else None, community=community,
                         steam_ref=self.steam_reference(e, game), evidence=evidence,
-                        play_crashes=crashes.records(self.paths.data, e.id)[:5]).to_dict()
+                        play_crashes=crashes.records(self.paths.data, e.id)[:5],
+                        measured=self.play_measurement(e.id)).to_dict()
 
     # --------------------------------------------------------------- trials
     TRIAL_SECONDS = 45
@@ -1775,11 +1832,23 @@ class LibraryManager:
             plan = self.launch_plan(entry_id, {**cand["overrides"], "prefix_dir": str(prefix)})
             plan.env = {**plan.env, "WINEDEBUG": self.DIAGNOSTIC_WINEDEBUG + (self.DEEP_WINEDEBUG if deep else "")}
             limit = seconds or self.TRIAL_SECONDS
+            symptom = self.trial_symptom if self.trial_symptom in probes.PROBED else ""
+            measure_dir = None
+            if symptom == "slow" and IS_LINUX and shutil.which("mangohud") and limit >= 25:
+                # frame times of the run (MangoHud's log), to compare with the current setup's
+                measure_dir = self.paths.data / "measure" / f"trial-{entry_id}-{n}"
+                shutil.rmtree(measure_dir, ignore_errors=True)
+                conf = probes.logging_conf(measure_dir.with_suffix(".conf"), measure_dir, 8, max(5, limit - 16))
+                plan.env = {**plan.env, "MANGOHUD": "1", "MANGOHUD_CONFIGFILE": str(conf)}
             run_log = self.paths.logs / f"trial-{entry_id}-deep.log" if deep else log_path
             use_hidden = bool(hidden if hidden is not None else self.settings.settings.hidden_tests) and IS_LINUX \
                 and hidden_mod.available()
             pics: list = []
             last_img = None
+            wall_start = time.time()                   # the window the system log is read for (ezgd.library.syslog)
+            run_pids: set[int] = set()
+            probe = probes.Probe(symptom, hidden=use_hidden) if symptom in ("no_sound", "controller", "online") \
+                else None
             for attempt in (1, 2):
                 if deep:
                     run_log.write_text("")
@@ -1798,6 +1867,7 @@ class LibraryManager:
                         hs.stop()
                     raise
                 code = None
+                run_pids.add(proc.pid)
                 box = _BoxWatch(run_log, offset)
                 if early and limit <= 30:              # a quick check: a look every few seconds
                     looks = [t for t in (6, 11, 16, 21) if t < limit - 1] + [limit - 2]
@@ -1814,11 +1884,15 @@ class LibraryManager:
                         break
                     if box.seen():                         # the game stopped on an error pop-up: read, close, done
                         break
-                    if hs is not None and time.monotonic() - checked >= 1.0:
-                        checked = time.monotonic()         # the test's windows kept away, its sound muted
+                    if time.monotonic() - checked >= (1.0 if hs is not None else 2.0):
+                        checked = time.monotonic()
                         ours = self._trial_pids(proc, prefix)
-                        wins = hs.check(ours)
-                        hs.mute(ours)
+                        run_pids |= ours                   # (the kernel names the processes it kills by pid)
+                        if probe is not None:              # the reported problem, watched while it runs
+                            probe.sample(ours)
+                        if hs is not None:                 # the test's windows kept away, its sound muted
+                            wins = hs.check(ours)
+                            hs.mute(ours)
                     if looks and time.monotonic() - started >= looks[0]:
                         at = int(time.monotonic() - started)
                         looks.pop(0)                       # errors Wine does not know: read the game's screen
@@ -1870,7 +1944,22 @@ class LibraryManager:
                     fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} trial {n}: {cand['label']} · diagnostic run"
                              " · looking closer (condensed)\n" + text)
                 run_log.unlink(missing_ok=True)
-            reason = _trial_reason(text)
+            seen = probe.result(text) if probe is not None else None
+            perf = None
+            if measure_dir is not None:
+                found = probes.newest_log(measure_dir, wall_start)
+                perf = probes.read_log(found) if found else None
+            for line in ([probes.marker(seen)] if seen else []) + ([probes.perf_marker(perf)] if perf else []):
+                text += "\n" + line.rstrip("\n")
+                with open(log_path, "a", encoding="utf-8") as fh:
+                    fh.write(line)
+            sys_events, sys_text = self._system_log(entry_id, wall_start, run_pids,
+                                                    cand["overrides"].get("executable"))
+            if sys_text:                               # the kernel / graphics driver's view, as markers
+                text += "\n" + sys_text
+                with open(log_path, "a", encoding="utf-8") as fh:
+                    fh.write(sys_text)
+            reason = _trial_reason(text) or next((ev.describe() for ev in sys_events if ev.ours), "")
             frames = _drew_frames(text)
             # how far it got: Wine's log plus the engine's own log (written inside the test prefix, or in the
             # game folder during this test)
@@ -1906,6 +1995,8 @@ class LibraryManager:
             for old_n in sorted(ev)[:-8]:              # loader errors are early, crashes late: head + tail kept
                 del ev[old_n]
             result["frames"] = frames
+            if sys_events:
+                result["system"] = [ev.describe() for ev in sys_events]
             if cancel is not None and cancel.is_set() and still:
                 result.update(outcome="cancelled", seconds=secs, detail="stopped by you")
             elif still:
@@ -1926,6 +2017,8 @@ class LibraryManager:
             else:
                 result.update(outcome="exited", seconds=secs, detail=f"exited with code {code} after {secs}s"
                               + (f" (got to: {progress[-1]})" if progress else ""))
+            if symptom:
+                self._judge_symptom(entry_id, result, cand, symptom, seen, perf)
             with open(log_path, "a", encoding="utf-8") as fh:
                 fh.write(f"=== trial result: {result['outcome']} — {result['detail']}\n")
         except (LibraryError, launcher.LaunchError) as exc:
@@ -2368,6 +2461,65 @@ class LibraryManager:
                 except (OSError, ValueError, IndexError):
                     continue
         return found
+
+    perf_baseline: dict = {}             # entry id → the current setup's measured frame times (runs badly)
+
+    def _judge_symptom(self, entry_id: int, result: dict, cand: dict, symptom: str, seen: dict | None,
+                       perf: dict | None) -> None:
+        """A run that kept going is a success only when the reported problem is gone: what the probe saw becomes the
+        verdict ("symptom": it ran, the problem is still there; it could not be checked is said too)."""
+        if seen is not None:
+            result["probe"] = seen
+        if perf is not None:
+            result["perf"] = perf
+        if result.get("outcome") != "ran":
+            return
+        if symptom in ("no_sound", "controller", "online"):
+            if seen is None or seen.get("ok") is True:
+                if seen:
+                    result["detail"] += f" — {seen['detail']}"
+                return
+            what = "but " if seen.get("ok") is False else "but this could not be checked: "
+            result.update(outcome="symptom", detail=f"kept running, {what}{seen['detail']}")
+            return
+        # runs badly: measured against the current setup's run
+        if perf is None:
+            result.update(outcome="symptom", detail="kept running, but its frame times could not be measured "
+                                                    "(MangoHud is needed, and a run long enough to log)")
+            return
+        if not cand["overrides"]:
+            self.perf_baseline = {**self.perf_baseline, entry_id: perf}
+            found = probes.causes(perf)
+            if found and found[0][0] == "fine":
+                result["detail"] += f" — {found[0][1]}"
+            else:
+                result.update(outcome="symptom", detail="kept running; measured: " + "; ".join(w for _k, w in found)
+                              if found else f"kept running at {perf['fps']:.0f} FPS (1 % low {perf['low1']:.0f})")
+            return
+        base = self.perf_baseline.get(entry_id)
+        if base is None:
+            result["detail"] += f" — {perf['fps']:.0f} FPS, 1 % low {perf['low1']:.0f} (nothing to compare with)"
+            return
+        better, how = probes.smoother(perf, base)
+        if better:
+            result["detail"] += f" — smoother: {how}"
+        else:
+            result.update(outcome="symptom", detail=f"kept running, but not smoother: {how}")
+
+    def _system_log(self, entry_id: int, since: float, pids: set[int] | None = None,
+                    executable: str | None = None) -> tuple[list, str]:
+        """What the kernel and the graphics driver logged about a run since ``since`` (ezgd.library.syslog):
+        (events, the marker lines for its log — "" when there is nothing to say)."""
+        from ezgd.library import syslog
+        if not IS_LINUX:
+            return [], ""
+        try:
+            exe = Path(executable or self.get(entry_id).executable or "")
+            events, readable = syslog.read(since, time.time(), syslog.run_names(exe) if exe.name else set(), pids)
+        except Exception:
+            log.exception("reading the system log failed")
+            return [], ""
+        return events, syslog.markers(events, readable)
 
     def _trace_calls_in(self, entry_id: int, prefix: Path, proton_name: str | None = None) -> None:
         """A closer look: in the test copy only, Wine is told which calls to trace (RELAY_CALLS)."""

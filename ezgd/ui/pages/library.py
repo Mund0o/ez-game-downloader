@@ -437,13 +437,15 @@ class LibraryPage(QWidget):
         self._fixes_btn.setEnabled(bool(e.executable))
         play_row.addWidget(self._fixes_btn)
         installing = (e.setup or {}).get("state") in ("pending", "installing")
-        self._fixes_btn.setVisible(not installing)          # nothing to fix before the game is installed
+        if installing:                    # nothing to fix before the game is installed (hide only: shown, a button
+            self._fixes_btn.hide()        # not yet in the window opens as a little window of its own)
         diag = button("  Diagnose", "bug", tooltip="Debugging assistant: finds out why the game does not run and "
                                                     "recommends the fix that matches the evidence",
                       on_click=lambda: self._diagnose(e))
         diag.setMinimumHeight(44)
         diag.setEnabled(bool(e.executable))
-        diag.setVisible(not installing)
+        if installing:
+            diag.hide()
         play_row.addWidget(diag)
         if e.executable:
             self.bridge.call(self.bridge.core.library_call("fixes_for", e.id),
