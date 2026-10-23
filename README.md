@@ -596,7 +596,8 @@ it and closes the game at once instead of waiting.
   quit yourself — instead of being blamed for the problem.
 * **System health**: `vm.max_map_count` (big games crash at loading below 1048576 — the exact command to raise
   it is offered, since it needs administrator rights), the open-file limit, free space on the game/prefix drive,
-  prefixes or games on NTFS/exFAT/FAT drives, the GPU(s) and driver (`vulkaninfo`).
+  prefixes or games on NTFS/exFAT/FAT drives, the GPU(s) and driver (read from the kernel's lists — no GPU tool is
+  started: one `vulkaninfo` at every app start made the whole desktop stutter on NVIDIA).
 * **ProtonDB** rating (with a Steam App ID): a *Borked* game is said to be unlikely to have a fix.
 
 **Try fixes for me** tests candidate setups for real — the current one, the fixes the findings recommend, the
@@ -607,7 +608,8 @@ kept running, crashed (with the reason) or exited. *Use this setup* saves a setu
 running” means it did not crash — check it looked right. Trials can be stopped any time.
 
 **The assistant builds its own fixes** (`ezgd/library/fixgen.py`) from the evidence and the symptom you pick
-under *What happens?* (doesn't start · crashes after a while · black screen · no sound · runs badly): forcing the
+under *What happens?* (doesn't start · crashes after a while · black screen · no sound · runs badly · controller
+doesn't work · can't play online): forcing the
 discrete GPU on hybrid-graphics PCs (`DXVK_FILTER_DEVICE_NAME`, `VKD3D_FILTER_DEVICE_NAME`, PRIME offload),
 ignoring an injected DLL in the game folder that crashed (ReShade `dxgi.dll`, mod loaders → Wine's own DLL via
 `WINEDLLOVERRIDES`, nothing deleted), turning NVAPI off when it errors, engine renderer switches (Unity
@@ -704,6 +706,27 @@ what happened* (Library ⋯ menu, and the quick menu) does the same on request. 
 crash: each idea is checked with a hidden start (the game must still start as well as before), the first is applied
 **on trial**, and your next sessions judge it — played well past the old crash time: kept (and remembered); the same
 crash: undone and the next idea set; quit early: not judged yet.
+
+**What the system saw, and the problem itself** (`ezgd/library/syslog.py`, `probes.py`, `netprobe.py`). Some failures
+never reach the game's log, so the assistant also reads:
+
+* **The system journal** for each test run and play session: a game the kernel (or systemd-oomd) killed because
+  memory ran out, a GPU fault under it (NVIDIA *Xid*, amdgpu ring timeouts, i915 hangs), a crash Wine could not catch,
+  a core dump. A game killed for memory used to look like a normal quit (the same SIGKILL as stopping it); now it is
+  kept as a crash, with what to do (swap / zram when there is none, fewer programs open). A GPU fault on the game's
+  work is followed with tests that must make the fault disappear (DirectX 11, another DXVK / VKD3D-Proton, NVAPI off);
+  a hardware fault (*the GPU has fallen off the bus*) is said as such. Where the journal cannot be read, Diagnose says
+  so and offers the command that grants access — never "nothing found".
+* **The problem you reported, while the test runs.** *No sound*: did the game open an audio stream in PipeWire, did it
+  play, into which output (muted, or not your default — that is the sound setup, and no game fix is tested for it)?
+  *Controller*: which of the connected controllers the game opened — none, or the same one twice (its raw HID and its
+  event device, or the pad and Steam Input's virtual one). *Runs badly*: MangoHud's frame times (1 % lows, hitches,
+  stutter that fades = shaders being built, CPU, GPU, swap); a fix is kept only when it is measurably smoother than
+  the current setup, and the next real play session can be measured (the overlay stays invisible). A test that keeps
+  running with the problem still there is no longer called *fixed*.
+* **Online play** (*Can't play online*): the ports the game listens on while you play, and the firewall's blocks of
+  exactly those ports during the session (UFW / netfilter log lines; the rule that lets it through is offered as a
+  command, never applied), Wine's TLS errors, and Steam not running for an OnlineFix release.
 
 **New games get a quick check before their first start** (about 30 seconds): after a game is installed — as soon as
 no game is running (a game you start pauses it) — common problems are looked for without starting it (the game's own
