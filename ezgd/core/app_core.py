@@ -273,8 +273,8 @@ class AppCore:
             log.exception("could not resume suspended games")
         from ezgd.platform import awake
         awake.shared().release_all()
-        if self.library.input_layout.games:          # a forced game layout must not outlive the app (the desktop
-            try:                                      # controller would stay a gamepad)
+        if self.library.input_layout.active:         # a forced layout — a game's, or the quick menu's desktop one —
+            try:                                      # must not outlive the app
                 self.library.input_layout.hand_back()
             except Exception:
                 log.exception("could not hand the controller layout back to Steam")

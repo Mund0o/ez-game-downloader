@@ -260,8 +260,8 @@ class QuickMenu(QWidget):
         return pm
 
     def _input_hold(self, on: bool) -> None:
-        """While the menu is open Steam's controller layout is left alone; closed, the game gets its layout back
-        (Steam drops it when its Steam button is pressed — see steaminput)."""
+        """While the menu is open Steam's desktop layout is asked for (its keys drive the menu); closed, the game
+        gets its layout back — or Steam chooses again for a game whose layout is Steam's (see steaminput)."""
         if self.game is None and on:
             return
         b = self.couch.bridge

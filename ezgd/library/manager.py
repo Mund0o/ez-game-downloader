@@ -1016,8 +1016,12 @@ class LibraryManager:
         threading.Thread(target=check, daemon=True, name=f"steam-input-{e.id}").start()
 
     def input_hold(self, on: bool) -> None:
-        """The quick menu is over a game (``True``) or gone: Steam's controller layout is left alone meanwhile (the
-        menu is driven by its desktop layout's keys), and the game layout is asked for again when it closes."""
+        """The quick menu is over a game (``True``) or gone: Steam's desktop layout (whose keys drive the menu) is
+        asked for while it is open; closing it asks for the game's layout again, or hands it back to Steam for a
+        game whose layout the app leaves to Steam."""
+        if on and not (IS_LINUX and steaminput.enabled() and self.settings.settings.steam_input_layout
+                       and steam.is_steam_running()):
+            return                         # (off: the menu is driven by the controller without Steam's layout)
         self.input_layout.hold(on)
 
     BOX_CLOSE_AFTER = 2.0          # seconds an error pop-up of a diagnostic run stays before the game is closed
@@ -1068,15 +1072,31 @@ class LibraryManager:
     def running_dir(self) -> Path:
         return self.paths.data / "running"
 
+    def _steam_input_layout(self, entry_id: int) -> None:
+        """A game Steam started for play mode gets the game controller layout, as one started here would: Steam
+        knows only this app's shortcut, not the game (games that sign in to Steam are left to Steam, as always)."""
+        try:
+            e = self.repo.get(entry_id)
+            if e is not None:
+                self._game_input_layout(e, self.paths.logs / f"game-{entry_id}.log")
+        except Exception:
+            log.exception("could not switch Steam's controller layout for the game Steam started")
+
     def _reap_steam(self) -> list[int]:
         """Games started through Steam: notice when they start and stop (play mode records the playtime)."""
         now = steamrun.sessions(self.running_dir)
         for eid, info in now.items():
             if eid not in self._steam_seen:
                 self._steam_seen[eid] = info
+                self._steam_input_layout(eid)
                 self.emit("game_state", {"id": eid, "running": True, "steam": True})
         ended = [eid for eid in self._steam_seen if eid not in now]
         for eid in ended:
+            try:
+                if self.input_layout.end(eid):
+                    log.info("game %s (through Steam) ended: Steam chooses the controller layout again", eid)
+            except Exception:
+                log.exception("could not hand the controller layout back to Steam")
             self._suspended.pop(eid, None)
             self._frozen_seconds.pop(eid, None)
             self._forget_suspension(eid)

@@ -6,6 +6,7 @@ import time
 
 import pytest
 
+from ezgd.library import steamrun
 from ezgd.platform import steam, steaminput
 
 from test_release_fixes import core  # noqa: F401 — the shared AppCore fixture
@@ -25,7 +26,7 @@ def fake_steam(tmp_path, answer: int | None = 480):
         if answer is not None:
             with open(log, "a") as fh:
                 fh.write(f"[2026-10-21 10:00:00] Queueing activation for controller: 0 app: "
-                         f"{answer if appid else 413080}\n")
+                         f"{appid or 413080}\n")
     return root, sent, opener
 
 
@@ -45,12 +46,15 @@ def test_switches_are_read_from_steams_log(tmp_path):
 
 def test_the_game_layout_comes_back_after_the_steam_button(tmp_path, monkeypatch):
     """Steam drops a forced layout when its Steam button is pressed: the chord layout, then the desktop one — the
-    virtual pad goes and the game has no controller (a friend's Dark Souls III). The game layout is asked for again,
-    but not while the quick menu is open (it runs on the desktop layout's keys)."""
+    virtual pad goes and the game has no controller (a friend's Dark Souls III). The desktop layout is asked for
+    while the quick menu is open (its keys drive the menu — Steam does not always fall back to them by itself), and
+    the game layout again as soon as it closes."""
     root, sent, opener = fake_steam(tmp_path)
     monkeypatch.setattr(steaminput.Forced, "WATCH_SECONDS", 0.05)
-    monkeypatch.setattr(steaminput.Forced, "RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(steaminput.Forced, "RETRY_SECONDS", 0.1)
     log = root / "logs" / "controller.txt"
+    desktop = "steam://forceinputappid/413080"
+    game_layout = "steam://forceinputappid/480"
 
     def steam_switches(*apps):
         with open(log, "a") as fh:
@@ -58,26 +62,30 @@ def test_the_game_layout_comes_back_after_the_steam_button(tmp_path, monkeypatch
                 fh.write(f"[2026-10-23 03:19:49] Queueing activation for controller: 0 app: {a}\n")
     f = steaminput.Forced(tmp_path / "marker", opener, root=lambda: root)
     f.start(1)
-    assert sent == ["steam://forceinputappid/480"]
+    assert sent == [game_layout]
     time.sleep(0.2)
     f.hold(True)                                       # the quick menu opened with the Steam button
+    assert sent == [game_layout, desktop]              # the menu's keys come from the desktop layout
     steam_switches(443510, 413080)
     time.sleep(0.3)
-    assert sent == ["steam://forceinputappid/480"]     # the menu runs on the desktop layout meanwhile
+    assert sent == [game_layout, desktop]              # nothing forced while it is open
     f.hold(False)                                      # closed: the game layout again (and Steam takes it)
     deadline = time.monotonic() + 3
-    while len(sent) < 2 and time.monotonic() < deadline:
+    while sent[-1] != game_layout and time.monotonic() < deadline:
         time.sleep(0.02)
-    assert sent[1:] == ["steam://forceinputappid/480"]
-    time.sleep(0.2)
+    assert sent[-1] == game_layout
+    time.sleep(0.3)
+    assert sent[-1] == game_layout and sent.count(desktop) == 1
+    n = len(sent)
     steam_switches(443510, 413080)                     # a tap without the menu: back by itself
-    while len(sent) < 3 and time.monotonic() < deadline + 3:
+    while len(sent) == n and time.monotonic() < deadline + 3:
         time.sleep(0.02)
-    assert sent[2:] == ["steam://forceinputappid/480"]
+    assert sent[-1] == game_layout and sent.count(desktop) == 1
     time.sleep(0.2)
+    n = len(sent)
     steam_switches(4000)                               # a game Steam started itself: its layout is left alone
     time.sleep(0.3)
-    assert len(sent) == 3
+    assert len(sent) == n
     assert f.end(1) and sent[-1] == "steam://forceinputappid/0"
 
 
@@ -135,6 +143,57 @@ async def test_a_game_that_never_talks_to_steam_gets_a_game_layout(steam_here, t
             break
         time.sleep(0.25)
     assert "ezgd:steam-input Steam switched the controller to the game layout" in log_path.read_text()
+    ended(core, e.id)
+    assert sent[-1] == "steam://forceinputappid/0"
+
+
+async def test_a_game_started_through_steam_gets_the_game_layout(steam_here, tmp_path, monkeypatch):
+    """Steam starts only this app's shortcut (play mode), not the game: its layout for the shortcut is not the
+    game's, and the quick menu needs the desktop one — so play-mode games are forced like direct ones."""
+    core, sent = steam_here
+    e = game(core, tmp_path)
+    monkeypatch.setattr(steamrun, "sessions", lambda _d: {e.id: {"started": time.time()}})
+    core.library.reap()
+    assert sent == ["steam://forceinputappid/480"]
+    core.library.input_hold(True)
+    assert sent[-1] == "steam://forceinputappid/413080"
+    core.library.input_hold(False)
+    assert sent[-1] == "steam://forceinputappid/480"
+    monkeypatch.setattr(steamrun, "sessions", lambda _d: {})
+    core.library.reap()
+    assert sent[-1] == "steam://forceinputappid/0"
+
+
+async def test_a_game_steam_started_that_talks_to_steam_is_left_to_steam(steam_here, tmp_path, monkeypatch):
+    """OnlineFix games sign in to Steam themselves: Steam knows the game and its layout, so play mode does not
+    override it. The quick menu still needs the desktop layout, and hands the choice back afterwards."""
+    core, sent = steam_here
+    e = game(core, tmp_path, "OnlineFix game")
+    monkeypatch.setattr(core.library, "talks_to_steam_itself", lambda _e: True)
+    monkeypatch.setattr(steamrun, "sessions", lambda _d: {e.id: {"started": time.time()}})
+    core.library.reap()
+    assert sent == []
+    core.library.input_hold(True)
+    assert sent[-1] == "steam://forceinputappid/413080"
+    core.library.input_hold(False)
+    assert sent[-1] == "steam://forceinputappid/0"
+    monkeypatch.setattr(steamrun, "sessions", lambda _d: {})
+    core.library.reap()
+
+
+async def test_the_quick_menu_over_a_game_left_to_steam_hands_the_layout_back(steam_here, tmp_path, monkeypatch):
+    core, sent = steam_here
+    e = game(core, tmp_path, "OnlineFix game")
+    monkeypatch.setattr(core.library, "talks_to_steam_itself", lambda _e: True)
+    marker = core.paths.data / "steam-input-forced"
+    core.library.launch(e.id, confirmed=True)
+    assert sent == []                                  # the game layout is Steam's to choose
+    core.library.input_hold(True)
+    assert sent[-1] == "steam://forceinputappid/413080" and marker.is_file()
+    assert core.library.input_layout.active            # (the app must hand this back if it quits now)
+    core.library.input_hold(False)
+    assert sent[-1] == "steam://forceinputappid/0"     # not 480: Steam chooses again
+    assert not marker.exists() and not core.library.input_layout.active
     ended(core, e.id)
     assert sent[-1] == "steam://forceinputappid/0"
 

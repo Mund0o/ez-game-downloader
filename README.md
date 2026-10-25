@@ -380,15 +380,20 @@ the one OnlineFix games already get (Steam's gamepad template unless changed in 
 layout) — and `steam://forceinputappid/0` when the last such game ends, so Steam chooses again. Whether Steam took it
 is read back from Steam's `logs/controller.txt` ("Queueing activation for controller: 0 app: 480") and written to the
 game's log (`ezgd:steam-input …`). A layout still forced when the app quits — or left by a crash — is handed back
-(at the next start). Off: *Settings → Library & launching*; games with *Without Steam Input* are left alone
-(`ezgd/platform/steaminput.py`).
+(at the next start). Off: *Settings → Library & launching*; games with *Without Steam Input* get no game layout
+(the quick menu still asks for the desktop one while it is open, then hands it back; `ezgd/platform/steaminput.py`).
 
 Steam does not keep that layout through its own **Steam button**: pressing it switches to the button's chord layout
 and, on release, back to the *desktop* layout — Steam's virtual pad disappears and the game has no controller until it
 ends (a friend's Dark Souls III after opening the quick menu; Steam's `controller.txt`: 480 → 443510 → 413080). While
 such a game runs the app watches `controller.txt` and asks for the game layout again when Steam fell back to the
-desktop or Big Picture layout — except while the quick menu is open (it is driven by the desktop layout's keys); it
-comes back as soon as the menu closes.
+desktop or Big Picture layout. The quick menu is driven by the desktop layout's keys, so opening it asks Steam for
+that layout itself (`steam://forceinputappid/413080`) — after the Steam button Steam does not always fall back to it
+— and closing it asks for the game layout again, patiently: closing the menu, not only a tap, may have dropped it.
+For a game whose layout the app leaves to Steam (OnlineFix games, *Without Steam Input*), closing the menu hands the
+choice back (`/0`). Games started through Steam for its overlay are the same: Steam knows only this app's shortcut,
+not the game, so play mode gets the game layout forced as well — choosing Steam's overlay instead of the app's does
+not leave the controller on the shortcut's layout.
 
 **The screen stays on.** A controller is not activity to the desktop: KDE and GNOME dim and lock after their idle time
 while you play with one (Steam only prevents it for games it starts). While one of the app's games runs — not while it
@@ -1069,6 +1074,8 @@ that PC can check:
   act as a gamepad (no mouse pointer moving) and the screen should not dim. The game's log shows whether Steam took the
   game layout: `ezgd:steam-input Steam switched the controller to the game layout` — "no controller switched" means
   Steam Input never switched (look in Steam's `logs/controller.txt`); "did not take" names what Steam used instead.
+  Then open the quick menu with a hold of the Steam button and close it: the controller must work in the game again.
+  Repeat with *Our overlay* off (Settings → Library & launching, Steam's overlay) for both the quick menu and the game.
   Checked on the developer's PC without a controller: Steam accepts the link (`ExecuteSteamURL` in console_log.txt).
 
 (The developer's PC had *Steam overlay in games* switched off, so in-game invite buttons could not work; it is on now.)
