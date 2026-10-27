@@ -1029,6 +1029,10 @@ class _Couch:
         items = [d for d in items if d.get("status") != "cancelled"]
         items.sort(key=lambda d: (order.get(d.get("status"), 9), -(d.get("updated_at") or 0)))
         self.downloads = items[:40]
+        opening = getattr(self, "_dl_open", None)
+        if opening is not None and opening["data"] is None:
+            opening["data"] = time.perf_counter() - opening["at"]
+            opening["all"] = len(items)
         self.index[T_DOWNLOADS] = max(0, min(self.index[T_DOWNLOADS], len(self._download_rows()) - 1))
         self.update()
 
@@ -1987,6 +1991,7 @@ class _Couch:
         self.top_index = tab
         self.zone = "main"
         if tab == T_DOWNLOADS:
+            self._dl_open = {"at": time.perf_counter(), "data": None}     # logged once drawn with its list
             self.bridge.call(self.bridge.core.downloads_snapshot(), self._downloads, owner=self)
         page = self.pages.get(tab)
         if page is not None:
@@ -3533,6 +3538,14 @@ class _Couch:
         finally:
             p.end()
             self.images.frame_dpr = 0.0
+            opening = getattr(self, "_dl_open", None)
+            if opening is not None and opening["data"] is not None and self.tab == T_DOWNLOADS:
+                self._dl_open = None
+                now = time.perf_counter()
+                log.info("couch Downloads tab opened: %d download(s) (%d listed, %d in-app browser, %d installing) — "
+                         "list in %d ms, drawn in %d ms (this frame %.1f ms)", opening["all"], len(self.downloads),
+                         len(self.browser_downloads), len(self.extraction), opening["data"] * 1000,
+                         (now - opening["at"]) * 1000, (now - t0) * 1000)
             self._meter_frame((time.perf_counter() - t0) * 1000, rect.width() * rect.height() < self.width() *
                               self.height() * 0.9)
 

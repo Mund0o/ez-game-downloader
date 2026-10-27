@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QSize, Qt, QTimer
+import logging
+import time
+
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (QButtonGroup, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QListWidget,
                                QListWidgetItem, QMenu, QMessageBox, QProgressBar, QPushButton, QSplitter,
@@ -13,6 +16,8 @@ from ezgd.ui import theme
 from ezgd.ui.dialogs.misc import open_folder, open_url
 from ezgd.ui.icons import icon
 from ezgd.ui.widgets.common import EmptyState, FlowLayout, button, chip, label, set_chip, source_chip, spin_box, tool
+
+log = logging.getLogger(__name__)
 
 STATUS_TEXT = {"queued": "Queued", "metadata": "Fetching metadata", "checking": "Checking", "downloading":
                "Downloading", "paused": "Paused", "verifying": "Verifying", "completed": "Download complete",
@@ -445,9 +450,30 @@ class DownloadsPage(QWidget):
 
     def showEvent(self, e) -> None:                          # noqa: N802
         super().showEvent(e)
+        self._opened_at = time.perf_counter()                 # logged after its first paint (see eventFilter)
+        for w in (self.list.viewport(), self.empty):
+            w.removeEventFilter(self)
+            w.installEventFilter(self)
         # rows added while the page was hidden (the desktop window is hidden in couch mode) were measured before
         # they were styled: they came back squashed, title and labels cut off — measured again once shown
         QTimer.singleShot(0, self, self._remeasure)
+
+    def eventFilter(self, obj, e) -> bool:                    # noqa: N802
+        if e.type() == QEvent.Paint and getattr(self, "_opened_at", None) is not None:
+            t, self._opened_at = self._opened_at, None
+            QTimer.singleShot(0, self, lambda t=t: self._log_opened(t))    # (after this paint is done)
+        return False
+
+    def _log_opened(self, t: float) -> None:
+        """One line per visit to the page — its size and how long it took to show (a friend's "it lags")."""
+        counts: dict[str, int] = {}
+        for _item, row in self.rows.values():
+            st = row.snap.get("status", "?")
+            counts[st] = counts.get(st, 0) + 1
+        shown = sum(1 for item, _ in self.rows.values() if not item.isHidden())
+        log.info("Downloads page opened: %d download(s) (%s; %d shown, filter %s), %d in-app browser — drawn in %d ms",
+                 len(self.rows), ", ".join(f"{n} {k}" for k, n in sorted(counts.items())) or "none", shown,
+                 self.filter_key, len(self.browser_rows), (time.perf_counter() - t) * 1000)
 
     def _remeasure(self) -> None:
         changed = False
