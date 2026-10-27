@@ -581,6 +581,7 @@ class BrowserDownloadDialog(QDialog):
         self._hang_shown = False
         self.manager = manager(actions)
         self.started: list[BrowserDownload] = []
+        self.opened_over = None                      # the modal window it was opened from (see show_clickable)
         self.setWindowTitle(f"{host_label} — {game.title}")
         self.resize(1100, 820)
         lay = QVBoxLayout(self)
@@ -1017,7 +1018,21 @@ class BrowserDownloadDialog(QDialog):
 
     def hideEvent(self, ev) -> None:
         super().hideEvent(ev)
+        if not ev.spontaneous():                     # hidden by the app, not minimised
+            self._back_to_page()
         self.went_away.emit()
+
+    def _back_to_page(self) -> None:
+        """KWin gives the focus to the window a dialog belongs to when it goes — the main window, raised above the
+        game page the browser was opened from; the main window, blocked by that page now hidden behind it, took no
+        clicks and refused its ✕ (the app had to be killed after a download, 0.6.5). The page is activated instead.
+        (Making the browser the page's own transient window does that too, but it is fixed when the browser's
+        native window is made — and opening the browser recreates the main window's, which made Qt close the page.)"""
+        import shiboken6
+        page = self.opened_over
+        self.opened_over = None
+        if page is not None and shiboken6.isValid(page) and page.isVisible():
+            QTimer.singleShot(0, page, lambda: (page.raise_(), page.activateWindow()))
 
     def couch_mode(self, zoom: float) -> None:
         """Opened from couch mode: no desktop toolbar (the controller does all of it), pages zoomed for the TV."""
@@ -1099,14 +1114,18 @@ def shutdown() -> None:
     _INTERCEPTOR = None
 
 
-def keep_clickable(dlg: QDialog) -> None:
+def show_clickable(dlg: "BrowserDownloadDialog") -> None:
     """Opened from a modal dialog (the game page runs with exec()), a window that is not its child is blocked by Qt:
     clicks and its ✕ are dropped while the page goes on drawing — the browser looked half frozen (since 0.2.0; it
     is owned by the main window so that closing the game page does not stop its download). It becomes the modal
-    window on top instead: the game page waits behind it and works again once the browser hides or closes."""
+    window on top instead: the game page waits behind it and works again once the browser hides or closes — and
+    is handed the focus then (see BrowserDownloadDialog._back_to_page)."""
     from PySide6.QtWidgets import QApplication
-    if QApplication.activeModalWidget() is not None:
+    modal = QApplication.activeModalWidget()
+    if modal is not None:
         dlg.setWindowModality(Qt.ApplicationModal)
+        dlg.opened_over = modal
+    dlg.show()
 
 
 def open_browser_download(actions, game, url: str, host_label: str, parent):
@@ -1118,6 +1137,5 @@ def open_browser_download(actions, game, url: str, host_label: str, parent):
     # owned by the main window, not the game page: closing the game page must not stop the download
     dlg = BrowserDownloadDialog(actions, game, url, host_label, actions.parent() or parent)
     dlg.setAttribute(Qt.WA_DeleteOnClose, False)     # disposed explicitly once its downloads are done
-    keep_clickable(dlg)
-    dlg.show()
+    show_clickable(dlg)
     return dlg

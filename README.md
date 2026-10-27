@@ -46,7 +46,7 @@ Built with Python 3.12, PySide6 (Qt 6), SQLite, httpx, Beautiful Soup and libtor
 | **Extraction** | zip, 7z (incl. password), rar (via UnRAR/7-Zip), tar.*, gz/bz2/xz; staging folder, traversal/symlink protection, disk-space check, corruption detection, cancellation, nested archives reported but never auto-extracted. |
 | **Library** | Steam-style: every downloaded/imported game with cover, big **Play/Stop**, running state, playtime, launches, setup checklist, Properties dialog; downloaded → extracted → installed as separate states; ranked executable candidates (uses the game page's “run X.exe” hint); confirmation before first launch; duplicate warnings; safe removal; add as non-Steam game. |
 | **Proton (Linux)** | Runs Windows games the way Steam does — your Proton build inside the Steam Linux Runtime it requires, one prefix per game; protonfixes keyed by the real Steam App ID (auto-detected); Steam's Proton toggles; DLL-override detection; winecfg/winetricks/reset prefix; Steam launch-option syntax (`VAR=1 gamemoderun %command% -arg`). |
-| **Couch mode** | Full-screen, controller-friendly library in the style of SteamOS (F11 or the sidebar button), opening with a 2-second intro (any button skips it): Steam artwork, a shelf of your games, Library grid, Downloads; any Linux game controller, keyboard or mouse. Quiet sounds as you move around and press into things, and a mouse click for the in-app browser's pointer (Settings → App → Sounds, with their own volume; the intro has its own volume too). The big ✕ leaves it — and first closes, completely, a game started from it. |
+| **Couch mode** | Full-screen, controller-friendly library in the style of SteamOS (F11 or the sidebar button), opening with a 2-second intro (any button skips it): Steam artwork, a shelf of your games, Library grid, Downloads; any Linux game controller, keyboard or mouse. Quiet, warm sounds as you move around and press into things (a soft low "bop", two mellow rising notes — no shrill tones since 0.6.6), and a muffled tap for the in-app browser's pointer (Settings → App → Sounds, with their own volume; the intro has its own volume too). The big ✕ leaves it — and first closes, completely, a game started from it. |
 | **Wishlist** | Its own tab: add any game through Steam's store search (even unreleased ones) or with ♡ on a game page; the app keeps looking for it on every source and notifies you when one has it. |
 | **Game updates** | Knows which version is installed (from the archive name) and checks the game's page every few hours; *Update* downloads the new release over the installed game — saves, settings, fixes and the Proton prefix stay. Optional: updates download and install by themselves. |
 | **Save backups** | Saves in each game's Proton prefix are zipped after every session and before updates, uninstalls and prefix rebuilds (caches/logs left out); restore with undo; backups survive a reinstall — and, with a synced folder (Syncthing, Nextcloud, Drive), move between your PCs. |
@@ -292,7 +292,8 @@ Every browser-only link (Buzzheavier, VikingFile, Gofile, FileKeeper, FileDitch,
 part**: do the “I'm not a robot” check if one appears and click the site's own download button. Opened from a
 game's page (a dialog that waits for you), the browser is the window on top and takes every click and its ✕ — before
 0.6.5 Qt blocked it behind that page: clicks and ✕ did nothing while the page kept drawing ("half frozen"). The
-window then closes by itself; the transfer continues in the background under **Downloads → In-app browser downloads**
+window then closes by itself and the game's page has the focus again (0.6.5 left KWin activating the main window,
+raised above the page that was blocking it: nothing took a click and the app had to be killed); the transfer continues in the background under **Downloads → In-app browser downloads**
 (progress, speed, time left, pause / resume / cancel) and, when it finishes, is **added to your Library
 automatically** (SHA-256 checked when the site publishes one, extracted with the password, launch files
 detected). The file is saved in the game's own folder, like every download, and **deleted once the game is
@@ -1093,6 +1094,10 @@ that PC can check:
   invite from the quick menu (*Invite* now says when the game gave Steam nothing to invite to), the other presses
   *Join <name>*. An invite without a lobby no longer offers Join (it started Spacewar); whether Join lands in the
   session is then up to the game, exactly as with Steam's own Join button.
+
+* **Download in app from a game's page (0.6.6)** — after the site's download starts and the browser closes, the game's
+  page is in front and takes clicks (on KDE Wayland 0.6.5 left the main window in front, frozen; checked here on
+  KWin 6.8.1, where KWin's window stack now shows the page on top and active).
 
 * **Shift+Tab** over a game without Steam's overlay (KDE Plasma) opens the quick menu and closes it again; Shift+Tab
   keeps working normally in other windows.

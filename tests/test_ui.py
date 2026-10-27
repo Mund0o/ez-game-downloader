@@ -456,7 +456,8 @@ def _click_element(qtbot, dlg, element_id: str) -> None:
 def test_the_browser_opened_from_the_game_page_takes_clicks(ui, qtbot, server):
     """The game page runs modally (exec): the browser it opens belongs to the main window (so closing the page does
     not stop a download) and was blocked by Qt — no clicks, its ✕ ignored, the page still drawing: "half frozen".
-    It must be usable while the game page is open, and the page usable again once the browser goes."""
+    It must be usable while the game page is open, and the page usable again once the browser goes — and given the
+    focus: KWin activated the main window instead, raised above the page and blocked by it (0.6.5)."""
     from PySide6.QtCore import QEvent, QObject, QTimer
     from PySide6.QtWidgets import QDialog
     from ezgd.ui.dialogs import browser
@@ -477,6 +478,8 @@ def test_the_browser_opened_from_the_game_page_takes_clicks(ui, qtbot, server):
     page = QDialog(win)
     page.setObjectName("page")
     page.installEventFilter(watch)
+    activated = []
+    page.activateWindow = lambda: activated.append(True)
     got = {}
 
     def from_the_page():
@@ -491,6 +494,46 @@ def test_the_browser_opened_from_the_game_page_takes_clicks(ui, qtbot, server):
     assert ("page", QEvent.WindowBlocked) in got["open"]                 # the page waits behind the browser
     assert ("browser", QEvent.WindowBlocked) not in got["open"]          # the browser takes clicks and its ✕
     assert events[-1] == ("page", QEvent.WindowUnblocked)               # closed: the page works again
+    assert activated                                                     # ... and has the focus
+
+
+def test_the_game_page_has_the_focus_when_the_browser_hides_after_a_download(ui, qtbot, server):
+    """The browser hides itself once the download starts. KWin then activated the window it belongs to — the main
+    window, raised above the game page and blocked by it: no clicks, its ✕ refused, the app had to be killed. The
+    game page it was opened from is activated instead."""
+    import io
+    import zipfile
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QDialog
+    from ezgd.ui.dialogs import browser
+    if not browser.AVAILABLE:
+        pytest.skip("Qt WebEngine not installed")
+    win, core, _ = ui
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("Game/Game.exe", b"MZ" + b"\0" * 100)
+    server.add("/file/Focus.zip", data=buf.getvalue(), content_type="application/zip", chunk_delay=0.05,
+               headers={"Content-Disposition": 'attachment; filename="Focus.zip"'})
+    server.add("/d/focus", data=b'<html><body><a id="dl" href="/file/Focus.zip">Download</a></body></html>',
+               content_type="text/html")
+    g = Game("steamrip", "81", "Focus Game", "https://steamrip.com/focus-game/")
+    core.games.save(g)
+    page = QDialog(win)
+    activated = []
+    page.activateWindow = lambda: activated.append(True)
+    got = {}
+
+    def from_the_page():
+        browser.open_browser_download(win.actions, g, server.url("/d/focus"), "TestHost", page)
+        dlg = got["dlg"] = next(w for w in win.findChildren(browser.BrowserDownloadDialog) if w.game.id == g.id)
+        dlg.view.loadFinished.connect(lambda *_: dlg.page.runJavaScript("document.getElementById('dl').click();"))
+        dlg.went_away.connect(lambda: QTimer.singleShot(200, page, lambda: (
+            got.setdefault("hid", bool(dlg.started)), got.setdefault("later", list(activated)), page.accept())))
+    QTimer.singleShot(100, from_the_page)
+    QTimer.singleShot(20000, page.reject)
+    page.exec()
+    assert got.get("hid"), "the browser never hid after the download started"
+    assert got["later"]                                                  # the page has the focus
 
 
 def test_in_app_browser_follows_clicks_into_other_sites(ui, qtbot, server):
