@@ -289,8 +289,10 @@ Linux desktop entry: copy `dist/EZGameDownloader` to e.g. `~/.local/opt/`, link
 
 Every browser-only link (Buzzheavier, VikingFile, Gofile, FileKeeper, FileDitch, cracked-games.org …) has a
 **Download in app** button. A small browser window (Qt WebEngine — a real Chromium) pops up **only for your
-part**: do the “I'm not a robot” check if one appears and click the site's own download button. The window then
-closes by itself; the transfer continues in the background under **Downloads → In-app browser downloads**
+part**: do the “I'm not a robot” check if one appears and click the site's own download button. Opened from a
+game's page (a dialog that waits for you), the browser is the window on top and takes every click and its ✕ — before
+0.6.5 Qt blocked it behind that page: clicks and ✕ did nothing while the page kept drawing ("half frozen"). The
+window then closes by itself; the transfer continues in the background under **Downloads → In-app browser downloads**
 (progress, speed, time left, pause / resume / cancel) and, when it finishes, is **added to your Library
 automatically** (SHA-256 checked when the site publishes one, extracted with the password, launch files
 detected). The file is saved in the game's own folder, like every download, and **deleted once the game is
@@ -341,7 +343,8 @@ On by default (switch in the browser window and in *Settings → Sources*):
 ### Steam overlay
 
 **Full overlay (default)** — *Settings → Library & launching → Full Steam overlay*: Steam only gives its complete
-overlay (Shift+Tab any time: friends, chat, browser, screenshots, FPS counter, Steam Input) to games it starts
+overlay (Shift+Tab any time: friends, chat, browser, screenshots, FPS counter, Steam Input — in those games
+Shift+Tab stays Steam's; in the app's games without it Shift+Tab opens the quick menu) to games it starts
 itself and knows. So every game gets a non-Steam shortcut in Steam that runs this app in play mode
 (`ezgd --play <id>`, which starts the game exactly like Play — same Proton, runtime, fixes, launch options —
 writes its log and records playtime), and Play asks Steam to start it. Steam reads its shortcut list only when it
@@ -637,7 +640,9 @@ large-address-aware for 32-bit games that run out of memory. Each shows its exac
 generated fix it is **remembered** (engine + problem → fix) and tried first for similar games, labelled with the
 game it worked for.
 
-**Fix my game** (top of the Diagnose window) is the one-button path: it checks everything, repairs on its
+**Fix my game** (top of the Diagnose window) is the one-button path (a change replaces the game's own setup only
+when a test shows it doing better — past start-up, drawing frames, further along; an unknown picture is not better
+than a black one: 0.6.3 swapped Wildlands' working GE-Proton for another Proton on such a result): it checks everything, repairs on its
 own only what has strong evidence and is reversible (damaged files, Steam-emulator setup, unapplied fix archives
 and folders, the release's launch script / the real exe, missing runtimes — installed and waited for, OnlineFix
 DLLs), then tests setups in throw-away prefixes, keeps the first that ran (preferring ones that drew frames) and
@@ -964,7 +969,7 @@ started. Not every Windows game works under Proton (anti-cheat, some launchers).
   to safe parts and lose code-loading variables (`LD_PRELOAD`, `*PATH*`, Vulkan ICDs/layers). Steam chat invites only
   offer *Join* when their connect string is a plain `+connect` / `+connect_lobby` / `-join` form (a friend's
   message cannot start a game with `+exec` or `-game`), friends' server addresses must be addresses, and only Steam's
-  join, chat and profile links are ever handed to Steam.
+  join, chat and profile links are ever handed to Steam (a Remote Play invite's session part only as plain tokens).
 * **The synced save folder** is not trusted (anyone with access to it, and sync tools carry symlinks): nothing is
   read or written through a link, writes go to a fresh random name first, sizes are capped, and each computer marks
   its own backups with a key only it has — only those are ever pruned, so fake "newer" backups cannot get real ones
@@ -1032,6 +1037,7 @@ See **TEST_REPORT.md** for the results of the last run.
 | Windows game won't start on Linux | Install Proton (Steam → Tools) or GE-Proton, choose it in the game's *Proton version*; some games simply do not work under Proton (anti-cheat, launchers). |
 | Database problems | Settings → Database → *Restore from backup…* (automatic backups are taken before migrations and at exit). |
 | Debugging | Settings → *Log level: Debug*, then *Open log folder*; *Recent errors…* lists the stored error summaries. |
+| Lag, a frozen window, the controller | Send `~/.local/state/EZGameDownloader/logs/ezgd.log` (Windows: `%LOCALAPPDATA%\EZGameDownloader\logs\ezgd.log`). Without changing any setting it records: every **UI stall** over a quarter of a second ("UI stall of … ms on the downloads page — stuck in: …", the page or couch tab and the line it was stuck in), every visit to the **Downloads** page / couch tab (how many downloads, how long until drawn), couch mode's frame times, every **controller layout** Steam chose while a game ran and why ("Steam switched the controller to the … layout"), Shift+Tab and quick-menu joins and invites. |
 
 ## Limitations and incomplete features
 
@@ -1077,17 +1083,26 @@ that PC can check:
   from a game). If full screen still will not stay, Settings → Window → *Custom size* at the screen's resolution
   filled the tester's screen every time in the logs.
 
-* **Joining a friend's invite from the quick menu** (both PCs on this release, Our overlay on). An invite to the
-  game being played no longer suspends it first — the suspended game was frozen while Steam handed it the lobby
-  (Slay the Spire 2 froze on *Join*). Only an invite to a different game suspends the one being played.
+* **The Steam Controller after the quick menu (0.6.4)** — in an OnlineFix game (Expedition 33, Risk of Rain 2), in Dark
+  Souls III and in Bloodborne, with *Our overlay* on and off: hold the Steam button, close the menu, play on. Steam's
+  rules behind it were measured on Steam itself (a forced layout survives focus changes, the Steam button and Big
+  Picture; `forceinputappid/0` switches nothing until the focus moves), but not with a Steam Controller — the log says
+  what Steam chose at every step.
 
-* **Bloodborne (SteamRIP, shadPS4) with the tester's Steam Controller.** Started from the app, the controller should
-  act as a gamepad (no mouse pointer moving) and the screen should not dim. The game's log shows whether Steam took the
-  game layout: `ezgd:steam-input Steam switched the controller to the game layout` — "no controller switched" means
-  Steam Input never switched (look in Steam's `logs/controller.txt`); "did not take" names what Steam used instead.
-  Then open the quick menu with a hold of the Steam button and close it: the controller must work in the game again.
-  Repeat with an OnlineFix game, and with *Our overlay* off (Settings → Library & launching, Steam's overlay). The
-  app's log now names every layout Steam chose ("Steam switched the controller to the … layout") — send it if not.
-  Checked on the developer's PC without a controller: Steam accepts the link (`ExecuteSteamURL` in console_log.txt).
+* **Joining from the quick menu (0.6.5)** — a friend opens a lobby in the game (hosts / creates a lobby), sends an
+  invite from the quick menu (*Invite* now says when the game gave Steam nothing to invite to), the other presses
+  *Join <name>*. An invite without a lobby no longer offers Join (it started Spacewar); whether Join lands in the
+  session is then up to the game, exactly as with Steam's own Join button.
+
+* **Shift+Tab** over a game without Steam's overlay (KDE Plasma) opens the quick menu and closes it again; Shift+Tab
+  keeps working normally in other windows.
+
+* **The Downloads section lag** a tester reported (not reproduced here: 10–23 ms with 120 downloads) — the log now has
+  a "Downloads page opened" / "couch Downloads tab opened" line per visit and a "UI stall" line naming the code if it
+  hangs.
+
+* **Ghost Recon Wildlands (EMPRESS)** is not fixed: with the performance-cores fix and GE-Proton it still quits with
+  code 255 at a random moment during loading (a clean run: 210 s of black, then 255). The cause inside EMP.dll is
+  still unknown.
 
 (The developer's PC had *Steam overlay in games* switched off, so in-game invite buttons could not work; it is on now.)
