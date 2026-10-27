@@ -403,7 +403,9 @@ class LibraryManager:
         return self._trial_evidence
 
     def __init__(self, repo: LibraryRepository, games: GameRepository, settings, paths: AppPaths,
-                 emit: Callable[[str, Any], None]):
+                 emit: Callable[[str, Any], None], recover: bool = True):
+        """``recover``: clean up after an app that did not end cleanly (frozen games, a forced controller layout) —
+        only the app itself; play mode runs next to it and must not thaw the games its quick menu froze."""
         self.repo = repo
         self.games = games
         self.settings = settings
@@ -417,7 +419,8 @@ class LibraryManager:
         self.closing = False                        # the app is shutting down: nothing new is started
         self._suspended: dict[int, dict] = {}        # frozen games: {"at": monotonic, "pids": [...]}
         self._frozen_seconds: dict[int, float] = {}  # time a running game spent frozen (not playtime)
-        self.thaw_leftovers()
+        if recover:
+            self.thaw_leftovers()
         try:                                     # this computer's mark on the save backups it makes (saves.py)
             from ezgd.platform import machine
             saves.set_owner(machine.profile().get("id") or "", paths.config / "backup-key")
@@ -425,7 +428,7 @@ class LibraryManager:
             log.exception("save backups: no owner key")
         self.input_layout = steaminput.Forced(paths.data / "steam-input-forced",
                                               root=lambda: self.steam_root())
-        if self.input_layout.left_over() and steaminput.enabled():   # forced by an app that did not end cleanly
+        if recover and self.input_layout.left_over() and steaminput.enabled():   # forced by an app that crashed
             log.info("handing Steam's controller layout back (left forced by the last session)")
             try:
                 self.input_layout.hand_back()
@@ -987,12 +990,14 @@ class LibraryManager:
     def _game_input_layout(self, e: LibraryEntry, log_path: Path) -> None:
         """A game started here that never talks to Steam keeps Steam's desktop layout on the controller (the stick
         moves the mouse, the game gets no gamepad): Steam is told to use a game layout until it ends. Whether
-        Steam switched is read back from its controller log and written to the game's log."""
-        if not (IS_LINUX and steaminput.enabled() and self.settings.settings.steam_input_layout):
+        Steam switched is read back from its controller log and written to the game's log. Games Steam knows (they
+        sign in to it) only have Steam's choices logged — see steaminput."""
+        if not (IS_LINUX and steaminput.enabled() and steam.is_steam_running()):
             return
-        if "no_steaminput" in e.compat_config.fixes or self.talks_to_steam_itself(e) or \
-                not steam.is_steam_running():
-            return                                # (OnlineFix games sign in to Steam: Steam switches by itself)
+        if not self.settings.settings.steam_input_layout or "no_steaminput" in e.compat_config.fixes or \
+                self.talks_to_steam_itself(e):
+            self.input_layout.watch(e.id)         # (OnlineFix games sign in to Steam: Steam switches by itself)
+            return
         root = self.steam_root()
         since = steaminput.log_size(root)
         try:
@@ -1015,14 +1020,15 @@ class LibraryManager:
                 pass
         threading.Thread(target=check, daemon=True, name=f"steam-input-{e.id}").start()
 
-    def input_hold(self, on: bool) -> None:
-        """The quick menu is over a game (``True``) or gone: Steam's desktop layout (whose keys drive the menu) is
-        asked for while it is open; closing it asks for the game's layout again, or hands it back to Steam for a
-        game whose layout the app leaves to Steam."""
-        if on and not (IS_LINUX and steaminput.enabled() and self.settings.settings.steam_input_layout
-                       and steam.is_steam_running()):
-            return                         # (off: the menu is driven by the controller without Steam's layout)
-        self.input_layout.hold(on)
+    def _input_layout_ended(self, entry_id: int, how: str = "") -> None:
+        """A game ended: a forced layout goes back to Steam with the last one — via the desktop layout when no game
+        of the app is left (Steam keeps a forced layout until an X11 focus change otherwise)."""
+        try:
+            others = [i for i in self.running_ids() if i != entry_id]
+            if self.input_layout.end(entry_id, desktop=not others):
+                log.info("game %s%s ended: Steam chooses the controller layout again", entry_id, how)
+        except Exception:
+            log.exception("could not hand the controller layout back to Steam")
 
     BOX_CLOSE_AFTER = 2.0          # seconds an error pop-up of a diagnostic run stays before the game is closed
     SCREEN_LOOKS = (8, 24, 40)     # seconds into a test / diagnostic run when the game's screen is read
@@ -1073,14 +1079,11 @@ class LibraryManager:
         return self.paths.data / "running"
 
     def _steam_input_layout(self, entry_id: int) -> None:
-        """A game Steam started for play mode gets the game controller layout, as one started here would: Steam
-        knows only this app's shortcut, not the game (games that sign in to Steam are left to Steam, as always)."""
-        try:
-            e = self.repo.get(entry_id)
-            if e is not None:
-                self._game_input_layout(e, self.paths.logs / f"game-{entry_id}.log")
-        except Exception:
-            log.exception("could not switch Steam's controller layout for the game Steam started")
+        """A game Steam started for play mode: Steam knows it (its shortcut) and gives it the shortcut's layout —
+        Steam's gamepad template, or the one the player chose in Steam — by focus, its overlay included. Nothing is
+        forced; Steam's choices are logged while it runs."""
+        if IS_LINUX and steaminput.enabled() and self.steam_root() is not None:
+            self.input_layout.watch(entry_id)
 
     def _reap_steam(self) -> list[int]:
         """Games started through Steam: notice when they start and stop (play mode records the playtime)."""
@@ -1092,11 +1095,7 @@ class LibraryManager:
                 self.emit("game_state", {"id": eid, "running": True, "steam": True})
         ended = [eid for eid in self._steam_seen if eid not in now]
         for eid in ended:
-            try:
-                if self.input_layout.end(eid):
-                    log.info("game %s (through Steam) ended: Steam chooses the controller layout again", eid)
-            except Exception:
-                log.exception("could not hand the controller layout back to Steam")
+            self._input_layout_ended(eid, " (through Steam)")
             self._suspended.pop(eid, None)
             self._frozen_seconds.pop(eid, None)
             self._forget_suspension(eid)
@@ -1160,11 +1159,7 @@ class LibraryManager:
                                  name=f"post-exit-{entry_id}", daemon=True).start()
             self._suspended.pop(entry_id, None)
             self._forget_suspension(entry_id)
-            try:
-                if self.input_layout.end(entry_id):
-                    log.info("game %s ended: Steam chooses the controller layout again", entry_id)
-            except Exception:
-                log.exception("could not hand the controller layout back to Steam")
+            self._input_layout_ended(entry_id)
             played = int(time.monotonic() - started - self._frozen_seconds.pop(entry_id, 0.0))
             try:                                       # the debugging assistant reads this back
                 with open(log_path, "a", encoding="utf-8") as fh:

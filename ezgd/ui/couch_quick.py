@@ -223,7 +223,6 @@ class QuickMenu(QWidget):
         if screen is not None:
             self.setGeometry(screen.geometry())
         self.showFullScreen()
-        self._input_hold(True)
         self.raise_()
         self.activateWindow()
         self.wc.keep_above(True)
@@ -259,17 +258,11 @@ class QuickMenu(QWidget):
         pm.setDevicePixelRatio(dpr)                  # the screen's real pixels: drawn 1:1, no scaling per frame
         return pm
 
-    def _input_hold(self, on: bool) -> None:
-        """While the menu is open Steam's desktop layout is asked for (its keys drive the menu); closed, the game
-        gets its layout back — or Steam chooses again for a game whose layout is Steam's (see steaminput)."""
-        if self.game is None and on:
-            return
-        b = self.couch.bridge
-        b.call(b.core.library_call("input_hold", on), None, lambda _e: None, owner=self)
-
+    # Steam's controller layout is left alone while the menu is open (see steaminput): over a game whose layout the
+    # app forced, the controller stays the game's virtual pad and drives the menu as a pad; over a game Steam knows,
+    # Steam gives the focused menu its desktop layout (keys) and the game its own back when it has the focus again.
     def hideEvent(self, event) -> None:
         self._still = None
-        self._input_hold(False)
         super().hideEvent(event)
 
     def _first_steam_tip(self) -> bool:

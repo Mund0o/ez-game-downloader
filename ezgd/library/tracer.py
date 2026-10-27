@@ -43,6 +43,8 @@ _STEAM_FAIL = re.compile(r"(\[S_API FAIL\][^\n]*|SteamAPI_Init\(\) failed[^\n]*|
                          r"Steam must be running[^\n]*|SteamAPI_RestartAppIfNecessary[^\n]*|"
                          r"Failed to load original steamclient[^\n]*)", re.I)
 _GAMELOG = "ezgd-gamelog: "
+# a crash inside one of Wine's Linux-side calls (Proton-CachyOS 11 + Wildlands: winevulkan listing the extensions)
+_UNIX_FAULT = re.compile(r"err:(\w+):(\w+) Exception (0x[0-9a-f]+) in Unix call")
 _KEY_MARK = re.compile(r'^([0-9a-f]+):ezgd:missing-key L"([^"]*)"', re.M)
 _REG = re.compile(r'^([0-9a-f]+):trace:reg:NtOpenKeyEx (?:\(([^,]+),L"([^"]*)"|<- (\(nil\)|0x[0-9a-f]+))', re.M)
 _FILE_NOISE = re.compile(r"(\.(dll|exe|drv|mui|manifest|local|config|lnk|tmp|sys|ocx|ax|pdb|ttf|ttc|otf|fon|nls|cat|inf|"
@@ -65,6 +67,16 @@ _FATAL = {"c0000005": "an access violation", "c0000409": "a security check failu
 # after an exception, these mean nothing caught it: the crash handler / the process's last-chance filter ran
 _LAST_CHANCE = re.compile(r"(_XcptFilter|UnhandledExceptionFilter|RtlCaptureStackBackTrace|MiniDumpWriteDump|"
                           r"EnumProcessModules|Unhandled exception)")
+# a handler fixed the exception and the thread carried on: a vectored handler said EXCEPTION_CONTINUE_EXECUTION (-1)
+# or a frame handler ExceptionContinueExecution (0). Copy-protection emulators (EMPRESS's EMP.dll) do this thousands
+# of times a minute with access violations, illegal instructions and single steps — none of them is the crash.
+_RESUMED = re.compile(r":trace:seh:(?:call_vectored_handlers handler at [0-9A-Fa-f]+ returned ffffffff|"
+                      r"call_seh_handlers handler at [0-9A-Fa-f]+ returned 0)\s*$", re.M)
+_NEXT_EXC = re.compile(r":(?:warn:seh:dispatch_exception backtrace: --- Exception|trace:seh:dispatch_exception code=)")
+
+# the game's own DLLs Proton replaces on purpose with its built-in versions (AMD's GPU library: Proton's talks to
+# DXVK) — not an add-on that failed to load
+_PROTON_SWAPS = {"amd_ags_x64.dll", "atiadlxx.dll", "atidxx64.dll"}
 
 # add-on loaders a release puts next to the game: the proxy DLLs they use, the files that mark them, what they load
 LOADERS = [
@@ -154,6 +166,9 @@ class Trace:
     setup: dict = field(default_factory=dict)                          # the app's snapshot of how it was started
     system: list = field(default_factory=list)            # what the kernel / graphics driver logged (syslog.Event)
     system_readable: bool = True                          # False: the system log could not be read for this run
+    unix_faults: str = ""                                 # "vulkan: enum_host_instance_extension_properties …"
+    resumed: int = 0                                      # "fatal" exceptions a handler fixed (the game went on)
+    resumers: list[str] = field(default_factory=list)     # the modules whose handlers fixed them (EMP.dll …)
 
     def loaded(self, name: str) -> bool:
         name = name.lower()
@@ -203,6 +218,15 @@ class Trace:
                 min(self.seconds or 0, 45) // 10)
 
 
+_WESC = re.compile(r"\\(\\|[0-9a-fA-F]{4})")
+
+
+def _wine_str(s: str) -> str:
+    """A string as Wine's debug output prints it: a backslash doubled, anything outside ASCII as \\xxxx — so the
+    ’ in “Tom Clancy’s …” reads \\2019 and the path matched nothing on disk."""
+    return _WESC.sub(lambda m: "\\" if m.group(1) == "\\" else chr(int(m.group(1), 16)), s)
+
+
 def _win_dir(path: str) -> str:
     """'X:\\Games\\A\\b.dll' → '/games/a' (the drive letter dropped: Wine maps drives to different folders)."""
     p = path.replace("\\\\", "\\").replace("\\", "/")
@@ -242,7 +266,7 @@ def trace(text: str, exe: Path, *, exit_code: int | None = None, seconds: int | 
     dirs = game_binary_dirs(exe)
     exe_names = {exe.name.lower()} | {p.name.lower() for d in dirs[1:] for p in d.glob("*-Shipping.exe")}
     for m in _LOAD.finditer(text):
-        path = m.group(2).replace("\\\\", "\\")
+        path = _wine_str(m.group(2))
         ld = Load(m.group(1), path, path.split("\\")[-1].lower(), int(m.group(3), 16), m.group(4), m.start())
         t.loads.append(ld)
         if ld.kind == "native" and (ld.name in exe_names or (ld.name.endswith(".exe")
@@ -252,7 +276,7 @@ def trace(text: str, exe: Path, *, exit_code: int | None = None, seconds: int | 
     # the game's own DLLs Wine swapped for its built-in ones (a mod loader, OnlineFix's loader …)
     seen: set[str] = set()
     for ld in game:
-        if ld.kind != "builtin" or not ld.name.endswith(".dll") or ld.name in seen:
+        if ld.kind != "builtin" or not ld.name.endswith(".dll") or ld.name in seen or ld.name in _PROTON_SWAPS:
             continue
         folder = _in(_win_dir(ld.path), dirs)
         if folder is None:
@@ -275,7 +299,10 @@ def trace(text: str, exe: Path, *, exit_code: int | None = None, seconds: int | 
                 break
         t.replaced.append(r)
     t.crash = _crash(text, t)
-    t.missing = [(m.group(1).lower(), m.group(2).replace("\\\\", "\\").split("\\")[-1])
+    uf = _UNIX_FAULT.search(text)
+    if uf:
+        t.unix_faults = f"{uf.group(1)}: {uf.group(2)}, exception {uf.group(3)}"
+    t.missing = [(m.group(1).lower(), _wine_str(m.group(2)).split("\\")[-1])
                  for m in _MISSING.finditer(text)][:5]
     t.unimplemented = list(dict.fromkeys(m.group(1) for m in _UNIMPL.finditer(text)))[:5]
     _lookups(text, t, dirs)
@@ -335,6 +362,15 @@ def _crash(text: str, t: Trace) -> Crash | None:
             continue
         after = text[m.end():m.end() + 20000]
         own = "\n".join(ln for ln in after.splitlines()[:400] if ln.startswith(tid + ":"))
+        nxt = _NEXT_EXC.search(own)
+        seg = own[:nxt.start()] if nxt else own
+        if _RESUMED.search(seg):
+            t.resumed += 1                    # handled: the thread went on (until its next exception)
+            if len(t.resumers) < 3:
+                _note_resumer(seg, t)
+            continue
+        if seg.count("calling handler at") > seg.count("returned ") and not _LAST_CHANCE.search(seg):
+            continue                          # still in a handler when the log ends (stopped, or the middle cut)
         certain = bool(_LAST_CHANCE.search(own))
         c = Crash(tid, code, _FATAL[code], at=m.start(), certain=certain)
         info = re.search(r"info\[0\]=0*([0-9a-f]+)\s*\n[^\n]*info\[1\]=([0-9A-Fa-f]+)", after[:600])
@@ -349,6 +385,19 @@ def _crash(text: str, t: Trace) -> Crash | None:
     return best
 
 
+_HANDLER = re.compile(r"call_vectored_handlers calling handler at ([0-9A-Fa-f]+)")
+
+
+def _note_resumer(own: str, t: Trace) -> None:
+    """Which module's handler resumed it: the last vectored handler called before "returned ffffffff"."""
+    for m in reversed(list(_HANDLER.finditer(own))):
+        c = Crash("", "", "")
+        _locate(c, int(m.group(1), 16), "", t)
+        if c.module and c.module not in t.resumers:
+            t.resumers.append(c.module)
+        return
+
+
 def _game_thread(tid: str, text: str, t: Trace) -> bool:
     """A thread whose backtraces run through the game's own exe belongs to the game's process."""
     exe = Path(t.exe).name.lower()
@@ -359,7 +408,7 @@ def _game_thread(tid: str, text: str, t: Trace) -> bool:
 def _locate(c: Crash, addr: int, own: str, t: Trace) -> None:
     bt = _BACKTRACE.search(own)
     if bt:                                    # Wine names the module and offset itself
-        c.module = bt.group(2).replace("\\\\", "\\").split("\\")[-1]
+        c.module = _wine_str(bt.group(2)).split("\\")[-1]
         c.offset = int(bt.group(3), 16)
         ld = next((x for x in t.loads if x.name == c.module.lower()), None)
         c.kind = ld.kind if ld else ""
@@ -384,14 +433,14 @@ _PLUMBING = re.compile(r"^(api-ms-|ext-ms-|mmdevapi|win(epulse|ealsa|ex11|ewayla
 
 def _module_at_addr(t: Trace, tid: str, addr: int) -> tuple[str, int, str]:
     """(module name, offset, full path) of the code at ``addr`` in the process of thread ``tid``."""
-    mods = sorted(t.loads, key=lambda ld: ld.base)
-    best = None
-    for ld in mods:
-        if ld.base <= addr:
-            best = ld
-        else:
-            break
-    if best is None or addr - best.base > 0x20000000:
+    below = [ld for ld in t.loads if ld.base <= addr]
+    if not below:
+        return "", 0, ""
+    top = max(ld.base for ld in below)
+    # every process puts its exe at the same address (0x140000000): the one this thread's process loaded
+    same = [ld for ld in below if ld.base == top]
+    best = next((ld for ld in same if ld.tid == tid), same[0])
+    if addr - best.base > 0x20000000:
         return "", 0, ""
     return best.path.split("\\")[-1], addr - best.base, best.path
 
@@ -427,7 +476,7 @@ def _calls(text: str, t: Trace, dirs: list[Path]) -> None:
             t.exits.append({"module": mod, "offset": off, "func": func, "code": code, "self": own, "tid": tid,
                             "at": m.start()})
         else:
-            strings = [x.replace("\\\\", "\\") for x in _WSTR.findall(args)]
+            strings = [_wine_str(x) for x in _WSTR.findall(args)]
             target = next((x for x in strings if x and not x.lower() in ("open", "runas")), "")
             t.launches.append({"module": mod, "offset": off, "func": func, "target": target[:300], "tid": tid,
                                "at": m.start()})
@@ -765,6 +814,9 @@ def follow(t: Trace, entry=None, good: dict | None = None) -> tuple[list[str], l
             elif mod.startswith("onlinefix"):
                 line += (": OnlineFix does that when Steam is not running, or when the fix does not match this "
                          "version of the game")
+            elif mod == "winevulkan.dll" and t.unix_faults:
+                line += (f": a Vulkan call crashed on Wine's Linux side ({t.unix_faults}) and Wine ended the game — "
+                         "this Proton's Vulkan layer, not the game; another Proton build is the test")
             elif mod.startswith(("eossdk", "galaxy")):
                 line += ": the store's own SDK (Epic / GOG) refused to start"
             elif mod.lower() == Path(t.exe).name.lower() or mod.endswith("-shipping.exe"):
@@ -782,6 +834,24 @@ def follow(t: Trace, entry=None, good: dict | None = None) -> tuple[list[str], l
                                                                           else "starts")
                                + f" {name} and quits.", 0.85 if la.get("ok") is False else 0.8,
                                overrides={"executable": str(target)}))
+    # 7b. EMPRESS's Denuvo emulation gave up: EMP.dll ends the game itself (ExitProcess(-1), exit code 255) after
+    # failing the same fix-up again and again — on a CPU with performance and efficiency cores, at a random moment
+    if emp_quit(t):
+        chain.append("EMP.dll — EMPRESS's replacement for Denuvo — ended the game (exit code -1/255). Its emulation "
+                     f"handled {t.resumed} of the game's exceptions and then could not fix the same one any more"
+                     if t.resumed else "EMP.dll — EMPRESS's replacement for Denuvo — ended the game (exit code "
+                     "-1/255)")
+        from ezgd.platform.machine import performance_cpus
+        cpus = performance_cpus()
+        on = set(entry.compat_config.fixes) if entry is not None else set()
+        if cpus and "pcores" not in on:
+            chain.append(f"This CPU has performance and efficiency cores; EMPRESS's emulation breaks when Linux moves "
+                         f"the game between them, at a random moment of the start.")
+            g = GeneratedFix("trace:pcores", "Run it on the performance cores",
+                             f"EMP.dll ended the game; kept on the performance cores (CPUs {cpus}) its emulation "
+                             "does not give up.", fixes_on=["pcores"])
+            out.append(Suspect("empress:pcores", g.label, "EMPRESS's emulation gives up on this CPU's mix of "
+                               "cores.", 0.9, g, {"no_quit_by": "emp.dll"}))
     # 8. what it looked for, just before it died, and did not find
     failed = (t.crash is not None or t.errors or (t.exit_code not in (None, 0) and not t.ran))
     files, keys = missing_before_end(t, harmless=set((good or {}).get("missing") or []))
@@ -812,6 +882,16 @@ def follow(t: Trace, entry=None, good: dict | None = None) -> tuple[list[str], l
         chain.append("Registry lookups were not recorded in this run — a closer look records them.")
     out.sort(key=lambda s: -s.confidence)
     return chain, out
+
+
+def emp_quit(t: Trace) -> bool:
+    """EMPRESS's EMP.dll ended the run: seen calling ExitProcess (a closer look), or the run ended with -1 (255)
+    while EMP.dll was the one handling the game's exceptions."""
+    if t.ran:
+        return False
+    if any((x.get("module") or "").lower() == "emp.dll" for x in t.exits):
+        return True
+    return "EMP.dll" in t.resumers and t.exit_code in (255, -1, 0xFFFFFFFF) and t.crash is None and not t.errors
 
 
 def quiet_end(t: Trace) -> bool:
@@ -934,6 +1014,8 @@ def verdict(before: Trace, after: Trace, expect: dict) -> tuple[str, str]:
         kind = expect["no_system"]
         (missed if any(e.kind == kind for e in after.serious()) else met).append(
             {"gpu": "no GPU fault any more", "oom": "not killed for memory any more"}.get(kind, f"no {kind} any more"))
+    if "no_quit_by" in expect and expect["no_quit_by"] == "emp.dll":
+        (missed if emp_quit(after) else met).append("EMP.dll did not end it")
     if "crash_moved" in expect and before.crash is not None:
         moved = after.crash is None or after.crash.module.lower() != expect["crash_moved"]
         (met if moved else missed).append(f"no crash in {expect['crash_moved']} any more")

@@ -1,30 +1,36 @@
 """Steam Input for games the app starts itself: a game controller layout instead of Steam's desktop one.
 
 While Steam runs it owns the controllers it supports (always Valve's: Steam Controller, Steam Deck; PlayStation /
-Xbox / Switch pads when Steam Input is on for them). Steam switches a controller to a game's layout only when it
-knows a game is running: one it started, or one that signs in to Steam (OnlineFix games sign in as Spacewar, 480 —
-Steam's controller.txt then shows ``Queueing activation for controller: 0 app: 480``). A game the app starts
-directly that never talks to Steam — an emulator like shadPS4 (Bloodborne), most repacks — keeps the **desktop
-layout** (app 413080): the stick / trackpad moves the mouse, buttons send keys, and the game gets no proper gamepad.
-A friend's Bloodborne (2026-10): "controller problems … the mouse was moving with the controller".
+Xbox / Switch pads when Steam Input is on for them) and picks a layout for them by **window focus**: the focused X11
+window of a game Steam knows gets that game's layout, anything else — a Wayland window like the app's quick menu
+included — Steam's **desktop layout** (app 413080: the stick / trackpad moves the mouse, buttons send keys). Steam
+logs each choice in controller_ui.txt (``OnFocusWindowChanged to game window type: AppID 480`` / ``… to window type:
+k_nGameIDControllerConfigs_Desktop``) and each switch in controller.txt (``Queueing activation for controller: 0
+app: 480``). Games Steam knows: its own, the app's shortcuts it starts (play mode: Steam's gamepad template, "Last
+Resort Path … controller_*_gamepad_joystick.vdf"), and games that sign in to it (OnlineFix games as Spacewar, 480).
+A game the app starts directly that never talks to Steam — an emulator like shadPS4 (Bloodborne), most repacks —
+only ever gets the desktop layout, and no proper gamepad (a friend's Bloodborne, 2026-10: "the mouse was moving with
+the controller").
 
-Steam's own link ``steam://forceinputappid/<app>`` makes it use that app's layout until ``…/0`` hands the choice
-back to Steam. The app uses Spacewar's (480): the layout OnlineFix games already get, Steam's gamepad template unless
-the player changed it (Steam → Spacewar → Controller layout). Whether Steam took the switch is read back from
-controller.txt and logged, not assumed. A marker file remembers a forced layout, so one left by a crashed app is
-handed back at the next start (else the controller would stay a gamepad on the desktop).
+Steam's own link ``steam://forceinputappid/<app>`` makes Steam use that app's layout for *every* window, whatever has
+the focus, until ``…/0``. Measured on Steam (2026-10-27, with a controller, reading both logs):
 
-Steam does not keep a forced layout through its own Steam button: pressing it switches to the guide-chord layout
-(443510) and, on release, to the **desktop** one (413080) — not back to the forced app. Steam's virtual pad goes away
-with it and the game has no controller until it ends (a friend's Dark Souls III, 2026-10-23: "controller
-disconnected" 14 ms after the button, never back; controller.txt here: 480 → 443510 → 413080 within a second).
-While a forced game runs, :class:`Forced` watches controller.txt and asks for the game layout again when Steam fell
-back to its desktop or Big Picture layout. The app's quick menu is driven by the keys of Steam's desktop layout, so
-opening it (``hold(True)``) asks for that layout itself — Steam does not always fall back to it after its Steam button
-(a game Steam knows, one started through a shortcut, keeps the game layout) — and closing it asks for the game layout
-again, or hands the choice back (``/0``) for a game whose layout is Steam's. Games started through Steam (play mode)
-get the same game layout as the ones started here: Steam only sees the shortcut that runs play mode, not the game,
-and its layout for it is not the game's.
+* a forced layout is switched to at once, and kept through focus changes (X11 and Wayland windows), through Steam's
+  Steam button (its chord layout 443510 while held, then the forced one again) and through Big Picture opening and
+  closing;
+* ``…/0`` switches *nothing* by itself: the forced layout stays until the next X11 focus change makes Steam choose
+  again. So handing back is "force the desktop layout, then ``/0``" when no game of the app is left;
+* steam:// links reach Steam asynchronously (the ``steam`` command returns in ~10 ms), so a second link is sent only
+  once Steam logged the first.
+
+The app forces Spacewar's layout (480 — the one OnlineFix games already get, Steam's gamepad template unless the
+player changed it) only for direct starts Steam cannot know, and leaves everything else to Steam. The quick menu
+changes nothing: over a forced game the controller stays the game's virtual pad (the menu reads that pad too — taking
+it away made the pad disappear and come back as a new device, which a game may never pick up again); over a game
+Steam knows, Steam itself gives the menu its desktop layout and the game its layout back when it has the focus again.
+While a game runs, Steam's choices are written to the app's log (evidence for the next report), and a forced layout
+Steam lost (a Steam restart) is asked for again. A marker file remembers a forced layout, so one left by a crashed
+app is handed back at the next start.
 """
 
 from __future__ import annotations
@@ -44,6 +50,8 @@ DESKTOP = 413080                 # Steam's desktop configuration
 BIG_PICTURE = 413090             # Steam's Big Picture configuration
 CHORD = 443510                   # Steam's guide-chord configuration (while the Steam button is held)
 ACTIVATED = re.compile(r"Queueing activation for controller: (\d+) app: (-?\d+)")
+FOCUS = re.compile(r"OnFocusWindowChanged (.+?)\s*$")
+NAMES = {DESKTOP: "desktop", BIG_PICTURE: "Big Picture", CHORD: "Steam button", GAME_LAYOUT: "game (Spacewar)"}
 
 
 def enabled() -> bool:
@@ -54,9 +62,9 @@ def url(appid: int) -> str:
     return f"steam://forceinputappid/{int(appid)}"
 
 
-def log_size(root: Path | None) -> int:
+def log_size(root: Path | None, name: str = "controller.txt") -> int:
     try:
-        return (root / "logs" / "controller.txt").stat().st_size if root else 0
+        return (root / "logs" / name).stat().st_size if root else 0
     except OSError:
         return 0
 
@@ -66,21 +74,35 @@ def activations(root: Path | None, since: int) -> list[tuple[int, int]]:
     return read_activations(root, since)[0]
 
 
-def read_activations(root: Path | None, since: int) -> tuple[list[tuple[int, int]], int]:
-    """:func:`activations` and the byte the log was read up to (where to go on from next time)."""
-    if root is None:
-        return [], since
+def _read_new(path: Path, since: int) -> tuple[str, int]:
+    """Whole lines written to ``path`` after byte ``since``, and where to go on from next time."""
     try:
-        with open(root / "logs" / "controller.txt", "rb") as fh:
+        with open(path, "rb") as fh:
             fh.seek(since if since <= fh.seek(0, 2) else 0)        # (a new, shorter log: from its start)
             data = fh.read(512 * 1024)
             end = fh.tell()
     except OSError:
-        return [], since
+        return "", since
     cut = data.rfind(b"\n") + 1                     # a line Steam is still writing is read next time
-    if 0 < cut < len(data):
+    if cut < len(data):
         data, end = data[:cut], end - (len(data) - cut)
-    return [(int(c), int(a)) for c, a in ACTIVATED.findall(data.decode("utf-8", "replace"))], end
+    return data.decode("utf-8", "replace"), end
+
+
+def read_activations(root: Path | None, since: int) -> tuple[list[tuple[int, int]], int]:
+    """:func:`activations` and the byte the log was read up to (where to go on from next time)."""
+    if root is None:
+        return [], since
+    text, end = _read_new(root / "logs" / "controller.txt", since)
+    return [(int(c), int(a)) for c, a in ACTIVATED.findall(text)], end
+
+
+def read_focus(root: Path | None, since: int) -> tuple[list[str], int]:
+    """Steam's reasons for its layout choices (controller_ui.txt) since byte ``since``."""
+    if root is None:
+        return [], since
+    text, end = _read_new(root / "logs" / "controller_ui.txt", since)
+    return [m.group(1) for m in map(FOCUS.search, text.splitlines()) if m], end
 
 
 def took(root: Path | None, since: int, appid: int, wait: float = 6.0) -> bool | None:
@@ -96,36 +118,41 @@ def took(root: Path | None, since: int, appid: int, wait: float = 6.0) -> bool |
         time.sleep(0.5)
 
 
-class Forced:
-    """The layout the app forced, per game (and the desktop one while the quick menu is over a game); handed back
-    (``/0``) when the last game ends or the menu closes over a game whose layout is Steam's."""
+def name(appid: int) -> str:
+    return f"{appid} ({NAMES[appid]})" if appid in NAMES else str(appid)
 
-    WATCH_SECONDS = 1.0            # how often controller.txt is looked at while a forced game runs
+
+class Forced:
+    """The game layout the app forced, per game; handed back when the last game ends. Also watches (and logs) Steam's
+    layout choices while any game of the app runs."""
+
+    WATCH_SECONDS = 1.0            # how often Steam's logs are looked at while a game runs
     RETRY_SECONDS = 2.0            # between two requests for the game layout
     MAX_TRIES = 8                  # requests in a row that Steam did not answer with the game layout: give up
-    #                                (the menu resets this: the Steam button may drop the layout more than once)
+    ACK_SECONDS = 3.0              # how long Steam may take to switch to a forced layout (before the next link)
 
     def __init__(self, marker: Path, opener=None, root: Callable[[], Path | None] | None = None):
         self.marker = marker
-        self.games: set[int] = set()
+        self.games: set[int] = set()               # forced: games Steam cannot know
+        self.watched: set[int] = set()             # every running game of the app (Steam's choices are logged)
         if opener is None:
             from ezgd.platform.steam import open_steam_url
             opener = open_steam_url
         self._open = opener
-        self._root = root                  # Steam's folder (its controller log); None: no watching
-        self.held = False                  # the app's quick menu is over the game: Steam's desktop layout is forced
+        self._root = root                  # Steam's folder (its controller logs); None: no watching, no waiting
         self._wake = threading.Event()
         self._watcher: threading.Thread | None = None
         self._appid = GAME_LAYOUT
-        self._lock = threading.Lock()      # the quick menu (UI) and the watcher both talk to Steam
+        self._lock = threading.Lock()      # the core and the watcher both talk to Steam
         self._tries = 0
         self._next_try = 0.0
-        self._menu_only = False            # the menu is over a game whose layout is Steam's: hand /0 back, no 480
+        self._generation = 0               # bumped by every start: a hand-back under way must not undo it
+        self._from: tuple[int, int] | None = None    # where the next watcher starts reading Steam's two logs
 
     @property
     def active(self) -> bool:
-        """A game layout is forced, or the quick menu is holding Steam's desktop layout."""
-        return bool(self.games or self._menu_only)
+        """A game layout is forced."""
+        return bool(self.games)
 
     def _remember(self, appid: int) -> None:
         try:
@@ -141,50 +168,40 @@ class Forced:
             pass
 
     def start(self, entry_id: int, appid: int = GAME_LAYOUT) -> None:
+        """A game Steam cannot know started: its layout is forced (and kept) until it ends."""
         first = not self.games
-        self.games.add(entry_id)
+        self._mark()                       # (Steam's answer to the link below is logged too)
         with self._lock:
+            self._generation += 1
+            self.games.add(entry_id)
             if first:
                 self._remember(appid)
             self._appid = appid
             self._tries = 0
             self._next_try = 0.0
-            self._menu_only = False
-            if not self.held:                  # (a game started from the open quick menu stays on its layout)
-                self._ask(appid)
-        if self._root is not None and (self._watcher is None or not self._watcher.is_alive()):
+            self._ask(appid)
+        self.watch(entry_id)
+
+    def _running(self) -> bool:
+        return self._watcher is not None and self._watcher.is_alive()
+
+    def _mark(self) -> None:
+        """Where the watcher starts reading Steam's logs (set before the first link, so its answer is read)."""
+        if self._root is not None and not self._running():
+            root = self._root()
+            self._from = (log_size(root), log_size(root, "controller_ui.txt")) if root is not None else None
+
+    def watch(self, entry_id: int) -> None:
+        """A game of the app runs (forced or not): Steam's layout choices go to the log while it does."""
+        self.watched.add(entry_id)
+        if self._root is not None and not self._running():
+            if self._from is None:
+                self._mark()
             self._watcher = threading.Thread(target=self._watch, name="steam-input-watch", daemon=True)
             self._watcher.start()
 
-    def hold(self, on: bool) -> None:
-        """The quick menu opened (``True``) or closed over a game. Opened: Steam's desktop layout, whose keys drive
-        the menu (after its Steam button Steam does not always fall back to it — a game Steam knows gets its game
-        layout back). Closed over a forced game: the game layout at once, then watched for until Steam took it.
-        Closed over a game whose layout the app leaves to Steam: ``/0``, so Steam chooses again."""
-        if not on and not self.games and not self._menu_only:
-            return                         # (nothing was forced, and the menu was not over a game here)
-        with self._lock:
-            self.held = bool(on)
-            if on:
-                self._menu_only = not self.games
-                if self._menu_only:
-                    self._remember(DESKTOP)    # (a crash with the menu open must not leave the desktop layout)
-                self._tries = 0
-                self._next_try = 0.0
-                log.info("the quick menu is over the game — Steam's desktop controller layout, which drives it")
-                self._ask(DESKTOP)
-            elif self._menu_only:
-                self._menu_only = False
-                self._tries = 0
-                self._next_try = 0.0
-                log.info("the quick menu closed — handing the controller layout back to Steam")
-                self._ask(0)
-                self._forget()
-            else:
-                self._tries = 1
-                self._next_try = time.monotonic() + self.RETRY_SECONDS
-                log.info("the quick menu closed — asking for the game controller layout again")
-                self._ask(self._appid)
+    def unwatch(self, entry_id: int) -> None:
+        self.watched.discard(entry_id)
         self._wake.set()
 
     def _ask(self, appid: int) -> None:
@@ -197,47 +214,78 @@ class Forced:
         root = self._root() if self._root else None
         if root is None:
             return
-        pos = log_size(root)
-        last = self._appid
-        while self.games:
+        pos, fpos = self._from or (log_size(root), log_size(root, "controller_ui.txt"))
+        self._from = None
+        last, said = self._appid if self.games else None, None
+        while self.watched or self.games:
             self._wake.wait(self.WATCH_SECONDS)
             self._wake.clear()
+            why, fpos = read_focus(root, fpos)
             got, pos = read_activations(root, pos)
+            for reason in why:
+                log.info("Steam controller layout: %s", reason)
+            for _c, app in got:
+                if app != said:
+                    said = app
+                    log.info("Steam switched the controller to the %s layout", name(app))
             if got:
                 last = got[-1][1]
                 if last == self._appid:
                     self._tries = 0
-            if not self.games or self.held or last not in (DESKTOP, BIG_PICTURE):
-                continue                   # (the chord while the button is held; another game Steam started)
+            if not self.games or last not in (DESKTOP, BIG_PICTURE):
+                continue                   # (the chord while the button is held; a game Steam knows)
             now = time.monotonic()
             if self._tries >= self.MAX_TRIES or now < self._next_try:
                 continue
             self._tries += 1
             self._next_try = now + self.RETRY_SECONDS
-            log.info("Steam went back to its %s controller layout while a game runs (its Steam button) — asking "
-                     "for the game layout again", "desktop" if last == DESKTOP else "Big Picture")
+            log.info("Steam lost the forced game layout while a game runs (Steam restarted?) — asking again")
             with self._lock:
-                self._ask(self._appid)
+                if self.games:
+                    self._ask(self._appid)
 
-    def end(self, entry_id: int) -> bool:
-        """True when this was the last game: Steam chooses the layout again."""
+    def end(self, entry_id: int, desktop: bool = True) -> bool:
+        """The game ended. True when it was the last forced one: the layout is handed back (``desktop``: no game of
+        the app is left, so the desktop layout is switched to first — see :meth:`hand_back`)."""
+        self.unwatch(entry_id)
         if entry_id not in self.games:
             return False
         self.games.discard(entry_id)
         if self.games:
             return False
-        self.hand_back()
+        self.hand_back(desktop=desktop)
         return True
 
-    def hand_back(self) -> None:
+    def hand_back(self, desktop: bool = True, wait: bool = False) -> None:
+        """Steam chooses the layout again. ``…/0`` alone keeps the forced game layout until an X11 focus change (the
+        Steam Controller stayed a gamepad on the desktop), so with ``desktop`` the desktop layout is forced first and
+        released once Steam switched to it. ``wait``: done before returning (the app is quitting), else in the
+        background."""
         with self._lock:
-            self.games.clear()               # (the app is quitting, or the last game ended: nothing left to force)
-            self.held = False
-            self._menu_only = False
+            self.games.clear()
             self._tries = 0
             self._next_try = 0.0
-            self._ask(0)
-            self._forget()
+            generation = self._generation
+            if not desktop:
+                self._ask(0)
+                self._forget()
+                return
+            root = self._root() if self._root else None
+            since = log_size(root)
+            self._ask(DESKTOP)
+
+        def release() -> None:
+            if root is not None:
+                took(root, since, DESKTOP, wait=self.ACK_SECONDS)
+            with self._lock:
+                if self._generation != generation:
+                    return                 # a game started meanwhile: its layout stays forced
+                self._ask(0)
+                self._forget()
+        if wait:
+            release()
+        else:
+            threading.Thread(target=release, name="steam-input-hand-back", daemon=True).start()
 
     def left_over(self) -> bool:
         """A layout forced by an app that did not end cleanly (its marker is still there)."""

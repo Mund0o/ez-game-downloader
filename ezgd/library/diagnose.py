@@ -1651,6 +1651,27 @@ def r_overlay(c: Context) -> list[Finding]:
                     Fix("enable_fix", "no_steam_overlay", "Turn the Steam overlay off for this game"))]
 
 
+def r_empress(c: Context) -> list[Finding]:
+    """EMPRESS's Denuvo emulation (EMP.dll) on a CPU with performance and efficiency cores: Linux moves the game's
+    threads between both kinds and the emulation gives up at a random moment — it fails the same write again and
+    again, then one of its own threads calls ExitProcess(-1) (exit code 255): Ghost Recon Wildlands on an
+    i9-13900K quit after 5 s to 4 minutes on every Proton; kept on the P-cores it ran 10 minutes and drew its menu."""
+    from ezgd.platform.machine import performance_cpus
+    if not c.exe or not (c.exe.parent / "EMP.dll").is_file() or "pcores" in c.entry.compat_config.fixes:
+        return []
+    cpus = performance_cpus()
+    if not cpus:
+        return []
+    ev = _lines(c.wine, r"(Call KERNEL32\.ExitProcess\(f{8,}\) ret=13|exited with code 255)", 3)
+    return [Finding("empress-hybrid", "EMPRESS's Denuvo emulation and this CPU's mix of cores",
+                    "This release replaces Denuvo with EMPRESS's emulation (EMP.dll). On a CPU with performance and "
+                    "efficiency cores it gives up at a random moment — from a few seconds to minutes into the "
+                    "start — and ends the game itself (exit code 255). Running the game on the performance cores "
+                    f"only (CPUs {cpus}) avoids it. The first start is slow either way: the emulation needs about "
+                    "3–4 minutes before the game's window shows anything.", 0.9 if ev else 0.7, ev,
+                    Fix("enable_fix", "pcores", "Run it on the performance cores"))]
+
+
 def r_fonts(c: Context) -> list[Finding]:
     ev = _lines(c.everything, r"(font.*(not found|missing|could not (be )?(loaded|found))|"
                               r"(Arial|Tahoma|Times New Roman|Verdana|Segoe UI).*not found|"
@@ -2083,7 +2104,7 @@ def r_network(c: Context) -> list[Finding]:
 
 RULES = [r_error_box, r_screen_text, r_integrity, r_emulator, r_fix_archive, r_missing_dll, r_unimplemented, r_imports, r_dotnet, r_steam, r_steam_client, r_anticheat, r_vulkan, r_dx12, r_media,
          r_crash, r_minidump, r_prefix, r_quick_exit, r_native, r_system, r_protondb, r_old_prefix, r_advisor,
-         r_overlay, r_fonts, r_display, r_display_mode, r_disk, r_writable, r_onlinefix_missing, r_regression, r_exit_code, r_override_files,
+         r_overlay, r_empress, r_fonts, r_display, r_display_mode, r_disk, r_writable, r_onlinefix_missing, r_regression, r_exit_code, r_override_files,
          r_steam_reference, r_redist, r_engine_crash, r_mixed_prefix, r_heap, r_filesystem, r_play_crash, r_system_log, r_probe, r_performance, r_network]
 
 

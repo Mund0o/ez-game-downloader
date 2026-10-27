@@ -125,7 +125,8 @@ def play(paths, entry_id: int) -> int:
     db = Database(paths.database, backup_dir=paths.backups).open()
     try:
         settings = SettingsStore(db)
-        lib = LibraryManager(LibraryRepository(db), GameRepository(db), settings, paths, lambda *_a: None)
+        lib = LibraryManager(LibraryRepository(db), GameRepository(db), settings, paths, lambda *_a: None,
+                             recover=False)       # (the app is running: its frozen games and layout are its own)
         try:
             e = lib.get(entry_id)
         except LibraryError:

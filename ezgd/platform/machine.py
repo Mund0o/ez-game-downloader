@@ -48,6 +48,15 @@ def _cpu() -> dict:
             "cores": os.cpu_count() or 0, "flags": [f for f in wanted if f in have]}
 
 
+def performance_cpus(sys_root: Path = Path("/sys")) -> str | None:
+    """On a hybrid CPU (Intel 12th gen and later: performance + efficiency cores) the performance cores' CPU list
+    as the kernel writes it ("0-15"); None on a CPU with one kind of core. Linux moves threads between both kinds;
+    EMPRESS's Denuvo emulation then breaks at random moments (Ghost Recon Wildlands on an i9-13900K, 2026-10-23)."""
+    core = _read(str(sys_root / "devices" / "cpu_core" / "cpus")).strip()
+    atom = _read(str(sys_root / "devices" / "cpu_atom" / "cpus")).strip()
+    return core if core and atom and re.fullmatch(r"[0-9,\-]+", core) else None
+
+
 def _gpus() -> list[dict]:
     """The graphics cards as the kernel sees them. (Not vulkaninfo: the profile is read at every start, and starting
     every Vulkan driver made the whole desktop stutter while the app opened.)"""

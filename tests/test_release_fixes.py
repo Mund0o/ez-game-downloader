@@ -259,6 +259,28 @@ async def test_fix_my_game_finds_a_combination(core, tmp_path, monkeypatch):
     assert any(r.get("combined") for r in v["trials"])
 
 
+async def test_fix_my_game_keeps_a_working_setup_over_an_unknown_one(core, tmp_path, monkeypatch):
+    """Wildlands (EMPRESS: minutes of black at start): the game's own setup ran with a black picture, another Proton
+    ran with no picture looked at — not better by any evidence, so nothing is changed (0.6.3 switched it)."""
+    e, root = install(core, tmp_path, {}, log="\n=== 2026-10-10 10:00:00 Proton\nx\n=== exited with code 1 after 70s\n")
+    cands = [{"label": "Current setup", "overrides": {}},
+             {"label": "Use Proton-CachyOS Latest", "overrides": {"proton_version": "Proton-CachyOS Latest"}}]
+    monkeypatch.setattr(core.library, "trial_candidates", lambda *a, **k: cands)
+    monkeypatch.setattr(core.library, "protons", lambda refresh=False: [type("P", (), {"name": "Proton-CachyOS Latest"})()])
+    checks = []
+
+    def run_trial(entry_id, cand, n, cancel=None, **_kw):
+        checks.append(cand["label"])
+        other = bool(cand["overrides"])
+        return {"label": cand["label"], "overrides": cand["overrides"], "outcome": "ran", "seconds": 45,
+                "detail": "", "stuck": True, "frames": None if other else False}
+    monkeypatch.setattr(core.library, "run_trial", run_trial)
+    monkeypatch.setattr(core, "ge_proton_status", lambda: _async({"newer_available": False}))
+    v = await core.fix_my_game(e.id)
+    assert v["status"] == "not_fixed" and not core.library.get(e.id).proton_version
+    assert not any("second check" in c for c in checks)
+
+
 async def _async(v):
     return v
 

@@ -273,9 +273,10 @@ class AppCore:
             log.exception("could not resume suspended games")
         from ezgd.platform import awake
         awake.shared().release_all()
-        if self.library.input_layout.active:         # a forced layout — a game's, or the quick menu's desktop one —
-            try:                                      # must not outlive the app
-                self.library.input_layout.hand_back()
+        if self.library.input_layout.active:         # a forced game layout must not outlive the app (the desktop
+            try:                                      # controller would stay a gamepad); a game still running only
+                #                                       gets it released (it keeps it until the focus moves)
+                self.library.input_layout.hand_back(desktop=not self.library.running_ids(), wait=True)
             except Exception:
                 log.exception("could not hand the controller layout back to Steam")
         from ezgd.sources import parsing
@@ -751,8 +752,7 @@ class AppCore:
                    "remove_steam_shortcuts", "last_run_status", "start_steam", "stop_completely",
                    "backup_saves", "save_backups", "restore_save_backup", "delete_save_backup",
                    "suspend", "resume", "resume_all", "suspended_ids", "game_volume", "set_game_volume", "protons",
-                   "session_seconds", "game_processes", "has_steam_overlay", "auto_executable", "set_mangohud",
-                   "input_hold"}
+                   "session_seconds", "game_processes", "has_steam_overlay", "auto_executable", "set_mangohud"}
         if method not in allowed:
             raise ValueError(f"unknown library call {method}")
         fn = getattr(self.library, method)
@@ -1852,11 +1852,19 @@ class AppCore:
                     kind, value = diff["fix"]
                     msg = await self.apply_fix(entry_id, kind, value)
                     applied.append(f"{diff['title']} — {msg}")
+        # a change must do better than the game's own setup when that ran too — by evidence: an unknown picture is
+        # not better than a black one (Wildlands' EMPRESS start is minutes of black: 0.6.3 swapped its working GE for
+        # a Proton whose test showed nothing more)
+        def evidence(r: dict):
+            return (bool(r.get("stuck")), r.get("frames") is not True, -len(r.get("progress") or []))
+        current = next((r for r in good if not r["overrides"]), None)
         confirmed = None
-        for r in good[:3]:                       # a setup must pass twice before it is kept (one lucky run ≠ fixed)
-            if not r["overrides"]:
+        for r in good[:3] + ([current] if current is not None and current not in good[:3] else []):
+            if not r["overrides"]:               # (a setup must pass twice before it is kept: one lucky run ≠ fixed)
                 confirmed = r
                 break
+            if current is not None and not evidence(r) < evidence(current):
+                continue
             if self._trial_cancel.is_set():
                 break
             step("Testing", "running", f"checking “{r['label']}” once more")

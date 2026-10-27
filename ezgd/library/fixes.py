@@ -154,6 +154,17 @@ def catalog(ctx: GameContext) -> list[FixState]:
     if IS_LINUX:
         overlay_crash = "gameoverlayrenderer" in ctx.log and any(
             w in ctx.log for w in ("Segmentation fault", "SIGSEGV", "backtrace", "Unhandled exception"))
+        from ezgd.platform.machine import performance_cpus
+        pcores = performance_cpus()
+        if pcores and ctx.windows_game:
+            out.append(FixState(
+                "pcores", "Stability", f"Run on the performance cores only (CPUs {pcores})",
+                "This CPU has fast performance cores and slower efficiency cores, and Linux moves the game's threads "
+                "between them. Releases that emulate Denuvo (EMPRESS) give up at a random moment when that happens "
+                "and the game quits; keeping the game on the performance cores avoids it.", "pcores" in on,
+                "EMPRESS's EMP.dll is in the game's folder: its Denuvo emulation quits the game at random on this "
+                "CPU's mix of cores." if ctx.has("EMP.dll") else None, bool(shutil.which("taskset")),
+                None if shutil.which("taskset") else "taskset (util-linux) is not installed."))
         out.append(FixState(
             "no_steam_overlay", "Performance & overlays", "Turn off the Steam overlay for this game",
             "The Steam overlay (Shift+Tab) is loaded into games while Steam is running. A few games crash or "
@@ -186,7 +197,8 @@ def apply_selection(ctx: GameContext, enabled: set[str]) -> CompatConfig:
     for flag, attr in (("protonfixes", "protonfixes"), ("runtime", "use_runtime"), ("report_app_id", "report_app_id")):
         if flag in known:
             setattr(cfg, attr, flag in enabled)
-    plain = {"game_dlls", "godot_vulkan", "godot_opengl", "pulse_latency", "gamemode", "mangohud", "no_steam_overlay"}
+    plain = {"game_dlls", "godot_vulkan", "godot_opengl", "pulse_latency", "gamemode", "mangohud", "no_steam_overlay",
+             "pcores"}
     cfg.fixes = sorted(k for k in plain if k in enabled and k in known) + \
         [k for k in cfg.fixes if k not in known]                               # keep fixes not shown here
     if "game_dlls" in known and "game_dlls" not in enabled and ctx.exe:
@@ -230,6 +242,12 @@ def effects(ctx: GameContext) -> FixEffects:
     if cfg.fps_limit > 0:                          # DirectX through DXVK (9–11) and VKD3D-Proton (12)
         env["DXVK_FRAME_RATE"] = env["VKD3D_FRAME_RATE"] = str(cfg.fps_limit)
         notes.append(f"{cfg.fps_limit} FPS limit")
+    if "pcores" in on:                             # the whole game (Proton, wineserver, its threads) on the P-cores
+        from ezgd.platform.machine import performance_cpus
+        cpus, taskset = performance_cpus(), shutil.which("taskset")
+        if cpus and taskset:
+            wrappers += [taskset, "-c", cpus]
+            notes.append("performance cores")
     for key, tool in (("gamemode", "gamemoderun"), ("mangohud", "mangohud")):
         if key in on:
             path = shutil.which(tool)

@@ -371,29 +371,40 @@ too. Both can be switched off; *Fixes → Turn off the Steam overlay for this ga
 ### Controllers and the screen while playing
 
 **Controllers act as a gamepad, not as Steam's desktop mouse.** While Steam runs it drives the controllers it supports
-(always Valve's — Steam Controller, Steam Deck — and PlayStation / Xbox / Switch pads with Steam Input on) with its
-*desktop layout* (stick or trackpad = mouse, buttons = keys) until it knows a game is running. It knows the games it
-starts and the ones that sign in to it (OnlineFix games, as Spacewar 480) — never a game this app starts that does not
-talk to Steam: emulators (a friend's Bloodborne, shadPS4 from SteamRIP: "the mouse was moving with the controller"),
-most repacks. For those the app sends Steam `steam://forceinputappid/480` when the game starts — Spacewar's layout,
-the one OnlineFix games already get (Steam's gamepad template unless changed in Steam → Spacewar → Controller
-layout) — and `steam://forceinputappid/0` when the last such game ends, so Steam chooses again. Whether Steam took it
-is read back from Steam's `logs/controller.txt` ("Queueing activation for controller: 0 app: 480") and written to the
-game's log (`ezgd:steam-input …`). A layout still forced when the app quits — or left by a crash — is handed back
-(at the next start). Off: *Settings → Library & launching*; games with *Without Steam Input* get no game layout
-(the quick menu still asks for the desktop one while it is open, then hands it back; `ezgd/platform/steaminput.py`).
+(always Valve's — Steam Controller, Steam Deck — and PlayStation / Xbox / Switch pads with Steam Input on) and picks
+their layout by **window focus**: the focused window of a game Steam knows gets that game's layout; anything else —
+the desktop, this app's windows, its quick menu — gets Steam's *desktop layout* (stick or trackpad = mouse, buttons =
+keys; the virtual Xbox pad games read is gone). Steam knows its own games, the games it starts from this app's
+shortcuts (Steam's gamepad template, or the layout chosen for the shortcut in Steam) and the games that sign in to it
+(OnlineFix games, as Spacewar 480). It never knows a game this app starts that does not talk to Steam — emulators (a
+friend's Bloodborne, shadPS4 from SteamRIP: "the mouse was moving with the controller"), most repacks. For those the
+app sends Steam `steam://forceinputappid/480` when the game starts: Spacewar's layout, the one OnlineFix games already
+get (Steam's gamepad template unless changed in Steam → Spacewar → Controller layout). Whether Steam took it is read
+back from Steam's `logs/controller.txt` ("Queueing activation for controller: 0 app: 480") and written to the game's
+log (`ezgd:steam-input …`). Off: *Settings → Library & launching*; games with *Without Steam Input* get nothing
+forced (`ezgd/platform/steaminput.py`).
 
-Steam does not keep that layout through its own **Steam button**: pressing it switches to the button's chord layout
-and, on release, back to the *desktop* layout — Steam's virtual pad disappears and the game has no controller until it
-ends (a friend's Dark Souls III after opening the quick menu; Steam's `controller.txt`: 480 → 443510 → 413080). While
-such a game runs the app watches `controller.txt` and asks for the game layout again when Steam fell back to the
-desktop or Big Picture layout. The quick menu is driven by the desktop layout's keys, so opening it asks Steam for
-that layout itself (`steam://forceinputappid/413080`) — after the Steam button Steam does not always fall back to it
-— and closing it asks for the game layout again, patiently: closing the menu, not only a tap, may have dropped it.
-For a game whose layout the app leaves to Steam (OnlineFix games, *Without Steam Input*), closing the menu hands the
-choice back (`/0`). Games started through Steam for its overlay are the same: Steam knows only this app's shortcut,
-not the game, so play mode gets the game layout forced as well — choosing Steam's overlay instead of the app's does
-not leave the controller on the shortcut's layout.
+What Steam does with a forced layout was measured on Steam itself (2026-10-27, reading `controller.txt` and
+`controller_ui.txt`, which logs the reason for every choice: "OnFocusWindowChanged … URL Forcing … 480"):
+* it is used at once and **kept** through every focus change, through Steam's **Steam button** (its chord layout
+  while held, then the forced one again) and through Big Picture;
+* `steam://forceinputappid/0` switches **nothing** by itself — the forced layout stays until the next focus change of
+  an X11 window. So when the last game of the app ends, the app forces the desktop layout and releases it once Steam
+  switched (a game still running keeps its layout); a Steam Controller no longer stays a gamepad on the desktop;
+* steam:// links reach Steam asynchronously, so the second link waits until Steam logged the first.
+
+**The quick menu leaves Steam's layout alone.** Over a forced game the controller stays the game's virtual pad: the
+menu reads that pad, and the game keeps its controller (0.6.3 forced the desktop layout for the menu — the pad went
+away and came back as a new device, which a game may never pick up again: a friend's Dark Souls III). Over a game Steam
+knows (OnlineFix games, games started through Steam), Steam itself gives the focused menu its desktop layout — a Steam
+Controller then drives the menu with keys — and the game its own layout back the moment it has the focus again
+(0.6.3's `/0` after the menu was the bug that left those games without a controller). Games started through Steam
+(Steam's overlay chosen) get nothing forced either: Steam's layout for its shortcut is a gamepad and works with its
+overlay. While any game of the app runs, Steam's choices go to the app's log ("Steam switched the controller to the …
+layout", "Steam controller layout: …"), and a forced layout Steam lost (Steam restarted) is asked for again. A layout
+still forced when the app quits — or left by a crash — is handed back (at the next start); play mode (a game Steam
+starts) never does that, and never thaws the games the quick menu froze to switch games — it ran next to the app and
+did both.
 
 **The screen stays on.** A controller is not activity to the desktop: KDE and GNOME dim and lock after their idle time
 while you play with one (Steam only prevents it for games it starts). While one of the app's games runs — not while it
@@ -1045,7 +1056,7 @@ See **TEST_REPORT.md** for the results of the last run.
 
 ## Still to confirm
 
-The to-do list from a tester's log (KDE Plasma on Wayland, Steam Controller) is done; two things only someone at
+The to-do list from a tester's log (KDE Plasma on Wayland, Steam Controller) is done; what only someone at
 that PC can check:
 
 * **Risk of Rain 2 and Slay the Spire 2 with GE-Proton on the tester's PC** (GE-Proton11-7, OnlineFix). Switch them
@@ -1075,7 +1086,8 @@ that PC can check:
   game layout: `ezgd:steam-input Steam switched the controller to the game layout` — "no controller switched" means
   Steam Input never switched (look in Steam's `logs/controller.txt`); "did not take" names what Steam used instead.
   Then open the quick menu with a hold of the Steam button and close it: the controller must work in the game again.
-  Repeat with *Our overlay* off (Settings → Library & launching, Steam's overlay) for both the quick menu and the game.
+  Repeat with an OnlineFix game, and with *Our overlay* off (Settings → Library & launching, Steam's overlay). The
+  app's log now names every layout Steam chose ("Steam switched the controller to the … layout") — send it if not.
   Checked on the developer's PC without a controller: Steam accepts the link (`ExecuteSteamURL` in console_log.txt).
 
 (The developer's PC had *Steam overlay in games* switched off, so in-game invite buttons could not work; it is on now.)
