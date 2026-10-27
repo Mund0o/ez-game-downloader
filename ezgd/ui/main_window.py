@@ -67,6 +67,7 @@ class MainWindow(QMainWindow):
         self.couch = None
         self._couch_gpu_failed = False            # couch mode's GPU drawing failed this run: draw it with the CPU
         self._quick_pads = None                   # the guide button while a game runs and couch mode is closed
+        self._quick_key = None                    # Shift+Tab over one of our games (hotkey.py), while one runs
         self._bpm_timer = QTimer(self)            # … and Steam's Big Picture taking it (Steam Input)
         self._bpm_timer.setInterval(1500)
         self._bpm_timer.timeout.connect(self._bpm_tick)
@@ -587,6 +588,28 @@ class MainWindow(QMainWindow):
         super().resizeEvent(e)
         self.toasts.relayout()
 
+    def _watch_quick_key(self, playing: bool) -> None:
+        """Shift+Tab over one of our games opens the quick menu (keyboard and mouse) — the focus is only followed
+        while a game runs, and the key is only taken while that game has the focus (see hotkey.py)."""
+        if playing:
+            if self._quick_key is None:
+                from ezgd.ui.hotkey import QuickMenuKey
+                self._quick_key = QuickMenuKey(self._quick_key_wanted, self._quick_menu_by_key, self)
+                QApplication.instance().aboutToQuit.connect(self._quick_key.stop)
+            self._quick_key.start()
+        elif self._quick_key is not None:
+            self._quick_key.stop()
+
+    def _quick_key_wanted(self, pid: int, answer) -> None:
+        self.bridge.call(self.bridge.core.library_call("quick_menu_key", pid), answer, lambda _e: answer(False),
+                         owner=self)
+
+    def _quick_menu_by_key(self) -> None:
+        if self.couch is not None:
+            self.couch._home_held()                      # (couch mode, or the menu's own background one)
+        elif self.pages["library"].running:
+            self._quick_menu_from_desktop()
+
     def force_quit(self) -> None:
         self._quitting = True
         visible = self.isVisible()
@@ -654,6 +677,7 @@ class MainWindow(QMainWindow):
     def _watch_quick_button(self) -> None:
         """While one of our games runs and couch mode is closed: listen for the guide button (tap or hold) to show
         the quick menu over the game. Nothing listens otherwise."""
+        self._watch_quick_key(bool(self.pages["library"].running))
         want = bool(self.pages["library"].running) and self.couch is None
         if want and self._quick_pads is None:
             from ezgd.ui.gamepad import Gamepads

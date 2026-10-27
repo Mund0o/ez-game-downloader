@@ -53,6 +53,7 @@ class Friend:
     gameid: str = ""                   # its Steam game id (a number; non-Steam games have big ones)
     lobby: str = ""                    # a lobby they can be joined in
     server: str = ""                   # the game server they are on (ip:port)
+    connect: str = ""                  # how their game says to join them (rich presence "connect"), Steam client only
     avatar: str = ""                   # picture URL
     last_online: int = 0               # (offline) when they were last online, unix time
 
@@ -70,7 +71,7 @@ class Friend:
 
     @property
     def joinable(self) -> bool:
-        return bool(self.gameid and (self.lobby or self.server))
+        return bool(self.gameid and (self.lobby or self.server or self.connect))
 
     def as_dict(self) -> dict:
         d = asdict(self)
@@ -202,10 +203,16 @@ def from_client(c: dict) -> Friend:
     server = f"{ip >> 24 & 255}.{ip >> 16 & 255}.{ip >> 8 & 255}.{ip & 255}:{port}" if ip and port and gid != "0" \
         else ""
     lobby = str(c.get("lobby") or "")
+    if "valid_lobby" in c and not c.get("valid_lobby"):
+        lobby = ""                                # (Steam's own "Join Game" only uses a lobby it calls valid)
+    from ezgd.platform.steambridge import safe_connect
+    connect = str(c.get("connect") or "")
+    connect = connect if gid != "0" and safe_connect(connect) else ""
     return Friend(to_steamid64(c["accountid"]), str(c.get("name") or ""), STATES.get(int(c.get("state") or 0),
                                                                                      "online"),
                   game=str(c.get("game") or "") if gid != "0" else "", gameid=gid if gid != "0" else "",
-                  lobby=lobby if lobby != "0" else "", server=server, avatar=str(c.get("avatar") or ""),
+                  lobby=lobby if lobby != "0" else "", server=server, connect=connect,
+                  avatar=str(c.get("avatar") or ""),
                   last_online=int(c.get("last") or 0))
 
 
@@ -272,8 +279,15 @@ def join_url(f: dict) -> str | None:
     gid, lobby, server = str(f.get("gameid") or ""), str(f.get("lobby") or ""), str(f.get("server") or "")
     if not gid.isdigit():
         return None
-    if lobby.isdigit() and str(f.get("steamid") or "").isdigit():
-        return f"steam://joinlobby/{gid}/{lobby}/{f['steamid']}"
+    sid = str(f.get("steamid") or "")
+    if lobby.isdigit() and sid.isdigit():
+        return f"steam://joinlobby/{gid}/{lobby}/{sid}"
+    connect = str(f.get("connect") or "")
+    if connect and sid.isdigit() and int(gid) < 2 ** 32:      # (the game's own "connect": what Steam's Join Game uses)
+        from urllib.parse import quote
+        from ezgd.platform.steambridge import safe_connect
+        if safe_connect(connect):
+            return f"steam://rungame/{gid}/{sid}/" + quote(connect, safe="")
     if server and server != "0.0.0.0:0" and re.fullmatch(r"[A-Za-z0-9.\-\[\]:]{3,64}:\d{1,5}", server):
         return f"steam://connect/{server}?appid={gid}"      # (the friend's status is their data: only an address)
     return None

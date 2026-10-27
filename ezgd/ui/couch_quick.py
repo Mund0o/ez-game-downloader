@@ -29,6 +29,7 @@ log = logging.getLogger(__name__)
 
 TITLE = "EZ Games — Quick menu"
 VOLUME_STEP = 10
+SPACEWAR = "480"                 # the app OnlineFix games sign in to Steam as (their invites are all "480")
 
 
 ICONS = ("resume", "switch", "couch", "friends", "volume", "mangohud", "settings", "quit")
@@ -474,8 +475,8 @@ class QuickMenu(QWidget):
         now = time.time()
         for c in (self.chats or {}).get("chats") or []:
             inv = c.get("invite")
-            if not inv or not (c.get("unread") or now - (c.get("time") or 0) < 15 * 60):
-                continue
+            if not steambridge.joinable(inv) or not (c.get("unread") or now - (c.get("time") or 0) < 15 * 60):
+                continue                             # (an empty invite: Steam's own chat has no Join for it either)
             name = self._name_of(c["accountid"])
             from ezgd.platform.steamfriends import to_steamid64
             url = steambridge.join_url(inv, to_steamid64(c["accountid"]))
@@ -489,11 +490,18 @@ class QuickMenu(QWidget):
         on the invite). Only a different game suspends the one being played, like switching games."""
         b = self.couch.bridge
         g = self.game
+        if not url:
+            self._flash_note(f"Nothing to join — {name or 'your friend'}'s game gave Steam no lobby. Join from the game.")
+            return
+        playing = g is not None and g.id in self.couch.running and not self._suspended(g)
+        if str(appid) == SPACEWAR and not playing:
+            # OnlineFix games all join as Spacewar in Steam: with none of ours running, Steam would start Spacewar
+            self._flash_note("Start the game first (Steam knows it only as Spacewar), then join.")
+            return
 
         def go() -> None:
             b.call(b.core.steam_open(url), lambda _r: None,
                    lambda e: self.couch.actions.toasts.show("Could not join", str(e), "warning"), owner=self.couch)
-        playing = g is not None and g.id in self.couch.running and not self._suspended(g)
         mine = str(((self.chats or {}).get("self") or {}).get("appid") or "")
         other = bool(appid) and mine not in ("", "0") and str(appid) != mine
         log.info("our overlay: joining %s (%s)", name, "another game" if other else "the game being played"
@@ -549,6 +557,10 @@ class QuickMenu(QWidget):
                                                           f"{f.get('name', 'They')} invited you to play")
             rows.append(Row(f"msg-{k}", text, kind="msg", extra={"mine": m["mine"], "time": m["time"]}))
             if m.get("invite") and not m["mine"] and now - m["time"] < 6 * 3600:
+                if not steambridge.joinable(m["invite"]):
+                    rows.append(Row(f"nojoin-{k}", "Their game sent no lobby with it — join from inside the game",
+                                    kind="header", extra={"note": True}))
+                    continue
                 url = steambridge.join_url(m["invite"], to_steamid64(self._acct(f)))
                 rows.append(Row(f"join-{k}", "Join their game", "Steam joins you up", "primary",
                                 action=lambda u=url, n=f.get("name", ""), a=m["invite"]["appid"]:
@@ -691,7 +703,8 @@ class QuickMenu(QWidget):
                     label, note = "Message", (f"{c['unread']} new — " if c and c.get("unread") else "") + \
                         "Your chat with them, right here"
                 elif a == "invite":
-                    note = "One press — Steam sends it"
+                    note = "One press — Steam sends it" if me.get("invitable", True) else \
+                        "No lobby yet — host or open one in the game first"
                 out.append(Row(f"fa-{a}", label, note, "primary" if a == "chat" else "row",
                                action=lambda a=a: self.friend_action(a)))
             return out
@@ -716,9 +729,18 @@ class QuickMenu(QWidget):
                 url = steamfriends.join_url(f) if action == "join" else steamfriends.launch_url(f)
                 if url:
                     self._join(url, f.get("name", ""), str(f.get("gameid") or ""))
+                else:
+                    self._flash_note(f"Nothing to join right now — {f.get('name', 'they')} are not in a joinable game.")
             return
-        if action in ("join", "launch"):
+        mine = str(((self.friends or {}).get("self") or {}).get("gameid") or "")
+        same = action == "join" and (not mine or mine == str(f.get("gameid") or ""))
+        if action in ("join", "launch") and not same:
             self._then_suspend(lambda: self.close_menu(lambda: open_action(self.couch, action, f)))
+        elif same and self.game is not None and self.game.id in self.couch.running:
+            # their game is the one being played: Steam hands it the lobby, so it must keep running (0.5.7 fixed
+            # this for our overlay only — suspending froze Slay the Spire 2 on the invite)
+            g = self.game
+            self.close_menu(lambda: (self.couch.go_to_game(g), open_action(self.couch, action, f)))
         else:
             self.close_menu(lambda: open_action(self.couch, action, f))
 
@@ -1075,6 +1097,9 @@ class QuickMenu(QWidget):
                 self.couch.sounds.play("move")
             self.update()
             return
+        if e.key() == Qt.Key_Backtab and not e.isAutoRepeat():
+            self.command("home")                         # Shift+Tab opened it from the game: it closes it too
+            return
         name = steam or {
             Qt.Key_Up: "up", Qt.Key_Down: "down", Qt.Key_Left: "left", Qt.Key_Right: "right",
             Qt.Key_Return: "a", Qt.Key_Enter: "a", Qt.Key_Space: "a", Qt.Key_Escape: "b",
@@ -1116,7 +1141,8 @@ class QuickMenu(QWidget):
         if h is None:
             return
         kind, idx = h
-        if kind == "row" and idx != self.focus and self.view in ("main", "friends", "friend"):
+        if kind == "row" and idx != self.focus and self.view in ("main", "friends", "friend", "chat", "confirm",
+                                                                 "starting"):
             self.focus = idx
             self.couch.sounds.play("move")
             self.update()

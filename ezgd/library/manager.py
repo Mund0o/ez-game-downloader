@@ -1327,6 +1327,17 @@ class LibraryManager:
                 return True
         return False
 
+    def quick_menu_key(self, pid: int) -> bool:
+        """Does Shift+Tab open the quick menu in the window of process ``pid``? Only in a running, not suspended game
+        of the app without Steam's overlay — with it Shift+Tab is Steam's (as a tap of the Steam button is)."""
+        if pid <= 1:
+            return False
+        for eid in self.running_ids():
+            if eid in self._suspended or pid not in self.game_processes(eid):
+                continue
+            return not self.has_steam_overlay(eid)
+        return False
+
     # ------------------------------------------------- suspend / resume (quick menu)
     def game_processes(self, entry_id: int) -> list[int]:
         """Every process of this running game: the members of its process groups (the app's or play mode's) and

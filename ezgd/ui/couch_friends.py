@@ -278,6 +278,8 @@ class FriendsPage(Page):
                 b.call(b.core.steam_open(url), lambda _r: w.toasts.show("Steam is starting it", f.get("game") or "",
                                                                        "info"),
                        lambda e: w.toasts.show("Could not join", str(e), "warning"), owner=w)
+            else:
+                w.toasts.show("Nothing to join right now", f"{f.get('name', 'They')} are not in a joinable game.")
 
     def _chat(self, f: dict) -> None:
         """The last messages with a friend, and Write (the on-screen keyboard) — all through the Steam client."""
@@ -300,10 +302,10 @@ class FriendsPage(Page):
         def show(msgs: list) -> None:
             lines = [("You" if m["mine"] else name,
                       ("Invite to play" if m.get("invite") else m["text"])[:160]) for m in msgs[-7:]]
+            from ezgd.platform.steambridge import join_url, joinable
             invite = next((m for m in reversed(msgs) if m.get("invite") and not m["mine"]), None)
             buttons = [("Write", write, "primary")]
-            if invite is not None:
-                from ezgd.platform.steambridge import join_url
+            if invite is not None and joinable(invite["invite"]):      # (an empty invite: nothing Steam can join)
                 url = join_url(invite["invite"], f["steamid"])
                 buttons.append(("Join their game", lambda: (w.close_overlay(), b.call(
                     b.core.steam_open(url), lambda _r: None, lambda e: w.toasts.show("Could not join", str(e),

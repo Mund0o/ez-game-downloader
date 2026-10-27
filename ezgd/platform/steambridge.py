@@ -8,11 +8,15 @@ Protocol). Everything below calls what Steam's own friends list and chat window 
 
 * chats: ``g_FriendsUIApp.m_ChatStore.GetFriendChat(accountid)`` — ``m_rgChatMessages`` (unAccountID, rtTimestamp,
   strMessage), ``SendChatMessage(text)`` (the chat box's own send), unread count / acknowledging like opening it
-* invite to your game: ``m_FriendStore.InviteToLobby(friend, appid, lobby)`` when you are in a lobby, else
-  ``InviteToGame(friend, appid, connect)`` — the friends list's "Invite to Game"
-* invites you get: chat messages with ``[lobbyinvite appid lobbyid]`` / ``[gameinvite appid connect]``; joining opens
-  the same link Steam's "Accept" opens (``steam://joinlobby/…`` / ``steam://rungame/…``) inside Steam
-  (``SteamClient.URL.ExecuteSteamURL``)
+* invite to your game — the friends list's own order (Steam's sp.js, read 2026-10-27): ``InviteToLobby(friend, appid,
+  lobby)`` when the game published a lobby, else ``InviteToGame(friend, appid, connect)`` with the game's private
+  connect string (``SteamClient.WebChat.GetPrivateConnectString(appid)``) or its public one. With neither, Steam offers
+  no invite at all — and neither does the app: an empty ``[gameinvite appid="480"]`` cannot be joined by anyone
+  (a friend's four "Join" presses on one, 2026-10-24, could only start Spacewar)
+* invites you get: chat messages with ``[lobbyinvite appid lobbyid]`` / ``[gameinvite appid connectString lobbyID
+  remoteplay]``; joining opens the link Steam's own chat builds for them (``steam://joinlobby/…``,
+  ``steam://remoteplay/connect/…``, ``steam://rungame/…/<connect>``) inside Steam (``SteamClient.URL.ExecuteSteamURL``);
+  an invite with none of those has no Join in Steam's chat either
 
 Only 127.0.0.1 is ever contacted. The debugging interface is only switched on after the player agreed (Settings →
 Our overlay), and the marker is removed when the setting is switched off.
@@ -117,17 +121,26 @@ def clean_text(text: str) -> str:
 
 
 def parse_invite(text: str) -> dict | None:
-    """{kind, appid, lobby, connect} from an invite message, else None."""
+    """{kind, appid, lobby, connect, remoteplay} from an invite message, else None. Steam names them ``lobbyid``
+    (lobby invites) and ``connectString`` / ``lobbyID`` / ``remoteplay`` (game invites)."""
     m = _INVITE.search(text or "")
     if not m:
         return None
     attrs = {k.lower(): (a if a is not None and a != "" else b if b else c) for k, a, b, c in _ATTR.findall(m.group(2))}
     appid = str(attrs.get("appid") or "")
     lobby = str(attrs.get("lobbyid") or attrs.get("lobby") or "")
-    connect = str(attrs.get("connect") or "")
+    connect = str(attrs.get("connectstring") or attrs.get("connect") or "")
+    remoteplay = str(attrs.get("remoteplay") or "")
     if not appid.isdigit() or len(appid) > 10 or not safe_connect(connect):
         return None
-    return {"kind": m.group(1).lower(), "appid": appid, "lobby": lobby if lobby.isdigit() else "", "connect": connect}
+    return {"kind": m.group(1).lower(), "appid": appid, "lobby": lobby if lobby.isdigit() else "", "connect": connect,
+            "remoteplay": remoteplay if _REMOTEPLAY.match(remoteplay) else ""}
+
+
+def joinable(invite: dict | None) -> bool:
+    """Can Steam join this invite? Only with a lobby, a connect string or a Remote Play session — Steam's chat shows
+    no Join otherwise."""
+    return bool(invite and (invite.get("lobby") or invite.get("connect") or invite.get("remoteplay")))
 
 
 # Steam hands an invite's connect string to the game as its command line ("+connect 1.2.3.4:27015",
@@ -135,12 +148,14 @@ def parse_invite(text: str) -> dict | None:
 # no other switches (Source's "+exec cfg", "-insecure", a "-game" folder …) and no shell or path characters.
 _CONNECT_SWITCH = re.compile(r"^[+-](connect\w*|join\w*|lobby\w*|password|server|ip|port)$", re.I)
 _CONNECT_TOKEN = re.compile(r"^[A-Za-z0-9_.:\[\]-]{1,64}$")
+_REMOTEPLAY = re.compile(r"^[A-Za-z0-9_.=&%-]{1,200}$")
 
 
 # the Steam links the app ever hands to Steam (joining, chats, profiles, starting a game) — nothing else, whoever
 # built the text
 _ALLOWED_URL = re.compile(r"^steam://(joinlobby/\d+/\d+/\d+|rungame/\d+/\d+(/[A-Za-z0-9%._\-]*)?|"
                           r"connect/[A-Za-z0-9.\-\[\]:]+\?appid=\d+|rungameid/\d+|friends/message/\d+|"
+                          r"remoteplay/connect/\d+\?appid=\d+&[A-Za-z0-9_.=&%-]+|"
                           r"url/SteamIDPage/\d+)$")
 
 
@@ -164,35 +179,40 @@ def safe_connect(connect: str) -> bool:
 
 
 def join_url(invite: dict, inviter_steamid64: str) -> str:
-    """What Steam's own "Accept" opens for an invite."""
+    """What Steam's own chat opens for an invite ("": nothing to join — see joinable)."""
     from urllib.parse import quote
     if invite.get("lobby"):
         return f"steam://joinlobby/{invite['appid']}/{invite['lobby']}/{inviter_steamid64}"
-    url = f"steam://rungame/{invite['appid']}/{inviter_steamid64}"
+    if invite.get("remoteplay"):
+        return f"steam://remoteplay/connect/{inviter_steamid64}?appid={invite['appid']}&{invite['remoteplay']}"
     if invite.get("connect"):
-        url += "/" + quote(invite["connect"], safe="")
-    return url
+        return f"steam://rungame/{invite['appid']}/{inviter_steamid64}/" + quote(invite["connect"], safe="")
+    return ""
 
 
 # ------------------------------------------------------------------ JavaScript (run in Steam's SharedJSContext)
 _JS_READY = ("(()=>{const a=window.g_FriendsUIApp;return !!(a&&a.m_FriendStore&&a.m_ChatStore&&a.m_FriendStore.self"
              "&&a.m_CMInterface&&a.m_CMInterface.logged_on)})()")
 
-_JS_STATE = """(()=>{const a=g_FriendsUIApp,fs=a.m_FriendStore,me=fs.self.persona;
+_JS_STATE = """(async()=>{const a=g_FriendsUIApp,fs=a.m_FriendStore,me=fs.self.persona;
 const nm=id=>{try{const p=fs.GetPlayerIfCached&&fs.GetPlayerIfCached(id);return p?(p.display_name||''):''}catch(e){return ''}};
 const chats=(a.m_ChatStore.m_FriendChatStore.m_rgFriendChats||[]).map(c=>({accountid:c.m_unAccountIDFriend,name:nm(c.m_unAccountIDFriend),
  unread:c.unread_message_count||0,last:c.m_strLastMessage||'',last_from:c.m_accountIDLastMessage||0,
  time:c.m_rtLastMessageReceived||0}));
 let connect='';try{connect=me.connect_string||(me.m_mapRichPresence&&me.m_mapRichPresence.get&&me.m_mapRichPresence.get('connect'))||''}catch(e){}
-return {self:{accountid:fs.self.accountid,appid:me.m_unGamePlayedAppID||0,lobby:String(me.m_game_lobby_id||'0'),
- connect:String(connect||''),game:me.m_strGameExtraInfo||''},chats:chats}})()"""
+const app=me.m_unGamePlayedAppID||0;let priv='';
+try{if(app&&SteamClient.WebChat.GetPrivateConnectString)priv=await SteamClient.WebChat.GetPrivateConnectString(app)||''}catch(e){}
+const lobby=String(me.m_game_lobby_id||'0');
+return {self:{accountid:fs.self.accountid,appid:app,lobby:lobby,connect:String(connect||''),
+ invitable:!!(app&&(lobby!=='0'||priv||connect)),game:me.m_strGameExtraInfo||''},chats:chats}})()"""
 
 # every friend as Steam's own friends list has them: live status, game, lobby, picture — no Web API key needed
 _JS_FRIENDS = """(()=>{const fs=g_FriendsUIApp.m_FriendStore;
 const one=p=>{const r=p.persona;const g=k=>{try{return p[k]}catch(e){return undefined}};let av='';try{av=r.avatar_url_medium||''}catch(e){}
 return {accountid:p.accountid,name:g('display_name')||r.m_strPlayerName||'',state:r.m_ePersonaState||0,
  appid:r.m_unGamePlayedAppID||0,gameid:String(r.m_gameid||'0'),game:g('current_game_name')||r.m_strGameExtraInfo||'',
- lobby:String(r.m_game_lobby_id||'0'),ip:r.m_unGameServerIP||0,port:r.m_unGameServerPort||0,avatar:av,
+ lobby:String(r.m_game_lobby_id||'0'),valid_lobby:!!g('is_in_valid_lobby'),connect:String(g('connect_string')||''),
+ ip:r.m_unGameServerIP||0,port:r.m_unGameServerPort||0,avatar:av,
  last:r.m_rtLastSeenOnline||0}};
 const out=[];for(const id of fs.m_setFriendAccountIDs){const p=fs.m_mapPlayerCache.get(id);if(p&&p.is_friend!==false)out.push(one(p))}
 return {self:one(fs.self),friends:out}})()"""
@@ -208,11 +228,12 @@ return {self:a.m_FriendStore.self.accountid,messages:m}})(%s,%d,%s)"""
 _JS_SEND = """(async(acct,text)=>{const c=g_FriendsUIApp.m_ChatStore.GetFriendChat(acct,true);if(!c)return 'no-chat';
 const r=await c.SendChatMessage(text);return r===undefined||r===0?'ok':String(r)})(%s,%s)"""
 
-_JS_INVITE = """((acct)=>{const fs=g_FriendsUIApp.m_FriendStore,f=fs.GetFriend(acct);if(!f)return 'not-a-friend';
+_JS_INVITE = """(async(acct)=>{const fs=g_FriendsUIApp.m_FriendStore,f=fs.GetFriend(acct);if(!f)return 'not-a-friend';
 const me=fs.self.persona,app=me.m_unGamePlayedAppID;if(!app)return 'not-in-game';
 if(me.m_game_lobby_id&&String(me.m_game_lobby_id)!=='0'){fs.InviteToLobby(f,app,me.m_game_lobby_id);return 'lobby'}
-let cs='';try{cs=me.connect_string||(me.m_mapRichPresence&&me.m_mapRichPresence.get&&me.m_mapRichPresence.get('connect'))||''}catch(e){}
-if(cs){fs.InviteToGame(f,app,cs);return 'connect'}fs.InviteToGame(f,app,'');return 'game'})(%s)"""
+let cs='';try{if(SteamClient.WebChat.GetPrivateConnectString)cs=await SteamClient.WebChat.GetPrivateConnectString(app)||''}catch(e){}
+if(!cs){try{cs=me.connect_string||''}catch(e){}}
+if(cs){fs.InviteToGame(f,app,cs);return 'connect'}return 'nothing'})(%s)"""
 
 _JS_URL = "(()=>{SteamClient.URL.ExecuteSteamURL(%s);return 'ok'})()"
 
@@ -277,13 +298,16 @@ class Bridge:
             raise BridgeError(f"Steam did not send the message ({r}).")
 
     async def invite(self, accountid: int) -> str:
-        """lobby | connect | game: what was sent; raises when there is nothing to invite to."""
+        """lobby | connect: what was sent; raises when there is nothing to invite to (Steam would send nothing)."""
         r = await self.eval(_JS_INVITE % int(accountid))
         if r == "not-in-game":
             raise BridgeError("Steam does not show you in a game right now — start the game first.")
         if r == "not-a-friend":
             raise BridgeError("Only friends can be invited.")
-        if r not in ("lobby", "connect", "game"):
+        if r == "nothing":
+            raise BridgeError("The game has not told Steam how to join you yet (no lobby) — Steam's own friends list "
+                              "offers no invite either. Open a lobby or host in the game, or invite from its menu.")
+        if r not in ("lobby", "connect"):
             raise BridgeError(f"Steam did not send the invite ({r}).")
         return r
 

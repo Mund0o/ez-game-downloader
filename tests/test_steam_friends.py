@@ -145,6 +145,25 @@ def test_the_steam_clients_own_list_is_live_and_in_steams_order():
     assert d["self"] == {"playing": True, "game": "Spacewar", "gameid": "480"}
 
 
+def test_join_their_game_like_steams_own_join_game():
+    """Steam's friends list joins a friend with their lobby only when it is valid (is_in_valid_lobby), else with
+    their game's own connect string (rich presence) — read 2026-10-27 in Steam's sp.js. A friend with a stale lobby
+    and nothing else is not joinable."""
+    def friend(**kw):
+        base = {"accountid": 9, "name": "P", "state": 1, "appid": 730, "gameid": "730", "game": "Counter-Strike 2",
+                "lobby": "0", "ip": 0, "port": 0, "avatar": "", "last": 0}
+        return sf.from_client({**base, **kw}).as_dict()
+    sid = sf.to_steamid64(9)
+    cs = friend(connect="+connect 10.0.0.5:27015", valid_lobby=False)
+    assert cs["joinable"] and sf.join_url(cs) == f"steam://rungame/730/{sid}/%2Bconnect%2010.0.0.5%3A27015"
+    stale = friend(lobby="109775241", valid_lobby=False)
+    assert not stale["joinable"] and sf.join_url(stale) is None
+    valid = friend(lobby="109775241", valid_lobby=True, connect="+connect 1.2.3.4:1")
+    assert sf.join_url(valid) == f"steam://joinlobby/730/109775241/{sid}"
+    sneaky = friend(connect="+exec evil.cfg")
+    assert not sneaky["joinable"]                                   # (their text: only connect forms)
+
+
 async def test_core_reads_the_steam_client_with_our_overlay_on(core, monkeypatch):
     from ezgd.platform.steambridge import BridgeError
     calls = []

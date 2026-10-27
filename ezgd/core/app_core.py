@@ -752,7 +752,8 @@ class AppCore:
                    "remove_steam_shortcuts", "last_run_status", "start_steam", "stop_completely",
                    "backup_saves", "save_backups", "restore_save_backup", "delete_save_backup",
                    "suspend", "resume", "resume_all", "suspended_ids", "game_volume", "set_game_volume", "protons",
-                   "session_seconds", "game_processes", "has_steam_overlay", "auto_executable", "set_mangohud"}
+                   "session_seconds", "game_processes", "has_steam_overlay", "auto_executable", "set_mangohud",
+                   "quick_menu_key"}
         if method not in allowed:
             raise ValueError(f"unknown library call {method}")
         fn = getattr(self.library, method)

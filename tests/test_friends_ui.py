@@ -407,3 +407,78 @@ def test_switching_our_overlay_on_asks_once_in_two_lines(ui, qtbot, monkeypatch)
     assert box.isChecked()
     box.setChecked(False)
     qtbot.waitUntil(lambda: not core.settings.settings.own_overlay, timeout=3000)
+
+
+@linux_only
+def test_an_invite_steam_cannot_join_has_no_join(ui, qtbot, tmp_path, monkeypatch):
+    """A game invite with no lobby, connect string or Remote Play (OnlineFix games send `[gameinvite appid="480"]`
+    when the game published no lobby) has no Join in Steam's chat — its Join here started Spacewar, four presses in a
+    friend's log did nothing. No Join row then; the chat says to join from the game."""
+    win, core, _ = ui
+    _fake_steam(core, monkeypatch)
+    bob = sf.to_account_id(B)
+    empty = {"kind": "gameinvite", "appid": "480", "lobby": "", "connect": "", "remoteplay": ""}
+    calls = []
+
+    async def chats():
+        return {"self": {"accountid": 1, "appid": 480, "lobby": "0", "connect": "", "invitable": False, "game": ""},
+                "chats": [{"accountid": bob, "name": "Bob", "unread": 1, "time": 1, "last": "Invited you to play",
+                           "last_from": bob, "invite": empty}]}
+
+    async def history(acct, limit=40):
+        import time as _t
+        return [{"mine": False, "time": int(_t.time()), "text": "Invited you to play", "invite": empty}]
+
+    async def open_url(url):
+        calls.append(url)
+    for name, fn in (("steam_chats", chats), ("steam_chat_history", history), ("steam_open", open_url)):
+        monkeypatch.setattr(core, name, fn)
+    a = _running(win, core, tmp_path, qtbot, "Empty Invite Game")
+    couch = _open_couch(win, qtbot)
+    monkeypatch.setitem(couch.actions.settings, "own_overlay", True)
+    qtbot.waitUntil(lambda: a.id in couch.running, timeout=5000)
+    couch._home_held()
+    qtbot.waitUntil(lambda: couch.quick is not None and couch.quick._shown >= 1.0, timeout=5000)
+    q = couch.quick
+    qtbot.waitUntil(lambda: q.chats is not None, timeout=3000)
+    q._build()
+    assert not any(r.key.startswith("inv-") for r in q.rows)           # no "Join Bob"
+    q.open_friend(next(f for f in FRIENDS["friends"] if f["name"] == "Bob"))
+    invite_row = next(r for r in q.rows if r.key == "fa-invite")
+    assert "No lobby yet" in invite_row.note                          # nothing to invite to: said up front
+    q.open_chat(next(f for f in FRIENDS["friends"] if f["name"] == "Bob"))
+    qtbot.waitUntil(lambda: bool(q.chat_msgs), timeout=3000)
+    assert not any(r.key.startswith("join-") for r in q.rows)
+    assert any(r.key.startswith("nojoin-") and "join from inside the game" in r.label for r in q.rows)
+    q._join("", "Bob", "480")                                        # (never a link that starts Spacewar)
+    assert calls == [] and "Nothing to join" in q.flash
+    win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
+    couch.force_close()
+
+
+@linux_only
+def test_joining_a_friend_in_the_same_game_keeps_it_running(ui, qtbot, tmp_path, monkeypatch):
+    """Without our overlay too: Steam hands the running game the lobby, so joining a friend in the game being played
+    must not suspend it (0.5.7 fixed this for our overlay only; suspending froze Slay the Spire 2)."""
+    win, core, _ = ui
+    opened = _fake_steam(core, monkeypatch)
+    same = dict(FRIENDS, self={"playing": True, "game": "Deep Rock Galactic", "gameid": "548430"})
+    monkeypatch.setattr(core, "steam_friends", lambda force=False: _async(same))
+    a = _running(win, core, tmp_path, qtbot, "Same Game")
+    couch = _open_couch(win, qtbot)
+    qtbot.waitUntil(lambda: a.id in couch.running, timeout=5000)
+    couch._home_held()
+    qtbot.waitUntil(lambda: couch.quick is not None and couch.quick._shown >= 1.0, timeout=5000)
+    q = couch.quick
+    qtbot.waitUntil(lambda: q.friends is not None, timeout=3000)
+    q.open_friend(next(f for f in same["friends"] if f["name"] == "Alice"))
+    q.focus = next(k for k, r in enumerate(q.rows) if r.key == "fa-join")
+    q.command("a")
+    qtbot.waitUntil(lambda: opened == [("join", "Alice")], timeout=5000)
+    assert a.id not in couch.suspended and not core.library.is_suspended(a.id)
+    win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
+    couch.force_close()
+
+
+async def _async(v):
+    return v

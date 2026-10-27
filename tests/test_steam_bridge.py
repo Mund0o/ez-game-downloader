@@ -97,7 +97,8 @@ async def test_chats_history_send_invite_and_join_through_the_client(steam):
     st = await b.state()
     [c] = st["chats"]
     assert c["unread"] == 2 and c["name"] == "Buddy" and c["last"] == "Invited you to play"
-    assert c["invite"] == {"kind": "lobbyinvite", "appid": "480", "lobby": "109775241047227400", "connect": ""}
+    assert c["invite"] == {"kind": "lobbyinvite", "appid": "480", "lobby": "109775241047227400", "connect": "",
+                           "remoteplay": ""}
     msgs = await b.history(BUDDY, 30)
     assert [m["mine"] for m in msgs] == [False, True, False] and msgs[0]["text"] == "hey you"
     assert msgs[2]["invite"]["connect"] == "+connect 1.2.3.4"
@@ -124,6 +125,36 @@ def test_invite_links_are_steams_own_accept():
     inv = sb.parse_invite("[gameinvite appid=480 connect='+connect 1.2.3.4:27015'][/gameinvite]")
     assert sb.join_url(inv, "7656") == "steam://rungame/480/7656/%2Bconnect%201.2.3.4%3A27015"
     assert sb.parse_invite("just text") is None and sb.clean_text("[url=x]link[/url] :steamhappy:") == "link :steamhappy:"
+
+
+def test_invites_as_steam_writes_them_and_what_can_be_joined():
+    """The invites in a real Steam chat (2026-10): a lobby invite joins like Steam's own chat; a game invite without a
+    connect string, lobby or Remote Play session has no Join in Steam's chat — the app's used to start Spacewar (a
+    friend pressed it four times). Steam names a game invite's parts connectString / lobbyID / remoteplay."""
+    lobby = sb.parse_invite('[lobbyinvite  appid="480" lobbyid="109775241575688370"][/lobbyinvite]')
+    assert sb.joinable(lobby)
+    assert sb.join_url(lobby, "7656") == "steam://joinlobby/480/109775241575688370/7656"
+    empty = sb.parse_invite('[gameinvite  appid="480"][/gameinvite]')
+    assert empty is not None and not sb.joinable(empty) and sb.join_url(empty, "7656") == ""
+    cs = sb.parse_invite('[gameinvite appid="730" connectString="+connect 10.0.0.5:27015"][/gameinvite]')
+    assert sb.joinable(cs) and sb.join_url(cs, "7656") == "steam://rungame/730/7656/%2Bconnect%2010.0.0.5%3A27015"
+    lid = sb.parse_invite('[gameinvite appid="1903340" lobbyID="109775241692069606"][/gameinvite]')
+    assert sb.join_url(lid, "7656") == "steam://joinlobby/1903340/109775241692069606/7656"
+    rp = sb.parse_invite('[gameinvite appid="413150" remoteplay="token=abc123&tok2=x"][/gameinvite]')
+    url = sb.join_url(rp, "7656")
+    assert url == "steam://remoteplay/connect/7656?appid=413150&token=abc123&tok2=x" and sb.allowed_url(url)
+    bad = sb.parse_invite('[gameinvite appid="413150" remoteplay="a;rm -rf /"][/gameinvite]')
+    assert not sb.joinable(bad)                                     # (a friend's text: only plain tokens)
+
+
+async def test_no_empty_invites_like_steams_own_friends_list(steam):
+    """Steam's friends list offers Invite only with a lobby or a connect string (its private one first); with
+    neither the app used to send an empty invite nobody could join — it now says why instead."""
+    b = sb.Bridge(port=steam.port)
+    steam.answer = lambda expr: "nothing" if "GetPrivateConnectString" in expr else None
+    with pytest.raises(sb.BridgeError, match="no lobby"):
+        await b.invite(BUDDY)
+    await b.close()
 
 
 def test_the_marker_switches_debugging_on_and_off(tmp_path):
