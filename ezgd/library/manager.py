@@ -147,12 +147,27 @@ def merge_overrides(a: dict, b: dict) -> dict | None:
 def _drew_frames(text: str) -> bool | None:
     """Did the game start presenting frames? (DXVK / vkd3d-proton log their swap chain.) None = cannot tell."""
     import re as _re
-    if _re.search(r"(Presenter: Actual swap chain properties|DxvkPresenter|vkd3d.*[Ss]wapchain|"
+    if _re.search(r"(Presenter: Actual swap ?chain properties|DxvkPresenter|vkd3d.*[Ss]wapchain|"
                   r"Creating swap ?chain|swapchain.*created|D3D11SwapChain|DXGI: .*Swapchain)", text):
         return True
-    if _re.search(r"(DXVK: v\d|vkd3d-proton)", text):
-        return False                                # the layer started, but no swap chain was ever made
-    return None                                     # OpenGL / native Vulkan / WineD3D: no marker to read
+    if _re.search(r"DXVK: v\d", text) and not _re.search(r'Loaded L"[^"]*[\\/]d3d12(core)?\.dll"', text, _re.I):
+        return False                                # DXVK started, but no swap chain was ever made
+    return None         # OpenGL / native Vulkan / WineD3D / D3D12 (vkd3d-proton's swap chain logs nothing): unknown
+
+
+def _with_meter(fv: dict, shown: str, shown_why: str, frames: bool | None) -> tuple[str, str, bool | None]:
+    """The picture's verdict and "drew frames", corrected by the frame meter (probes.frame_verdict): frames counted
+    beat a black screenshot (Wildlands' hidden window was always captured black while it drew); frames that stopped
+    while it still ran are a freeze; no frames at all from a Vulkan game is a black screen."""
+    if fv["drawing"] is True:
+        if fv["stalled"] and shown in ("unknown", "black"):
+            return "frozen", fv["text"], True
+        if not fv["stalled"] and shown == "black":
+            return "unknown", "its window was captured black, but " + fv["text"], True
+        return shown, shown_why, True
+    if fv["drawing"] is False and frames is not True:
+        return shown, shown_why, False
+    return shown, shown_why, frames
 
 
 def _trial_reason(text: str) -> str:
@@ -394,6 +409,7 @@ class LibraryManager:
     # the problem the user reported ("no_sound", "controller", "slow"), while the assistant tests for it: each test
     # run then watches for that problem (ezgd.library.probes) instead of only "did it keep running"
     trial_symptom = ""
+    trial_watch = 0                # seconds every test may run (a game that quits at random later than a test)
 
     @property
     def trial_evidence(self) -> dict[int, dict[int, dict]]:
@@ -417,6 +433,7 @@ class LibraryManager:
         self._steam_seen: dict[int, dict] = {}       # games running through Steam (play mode), last seen
         self._launch_info: dict[int, dict] = {}      # Proton used / overlay loaded, per running game
         self.closing = False                        # the app is shutting down: nothing new is started
+        self._no_meter: set[int] = set()            # games MangoHud crashed in a test: their tests run without it
         self._suspended: dict[int, dict] = {}        # frozen games: {"at": monotonic, "pids": [...]}
         self._frozen_seconds: dict[int, float] = {}  # time a running game spent frozen (not playtime)
         if recover:
@@ -936,6 +953,9 @@ class LibraryManager:
     # (not warn+file: GE-Proton's "Disabling case insensitive search" warning has no line end — they pile up in
     # Wine's debug buffer until Wine aborts with "debugstr buffer overflow"; Expedition 33 died after 1 s with it)
     DIAGNOSTIC_WINEDEBUG = "err+all,warn+module,+loaddll,+seh,+msgbox,fixme-all"
+    # DXVK's own log, into the run's log only (Proton sets DXVK_LOG_LEVEL=none; "none" as the path: no file is
+    # written into the game's folder): its version, device and swap chain say how far the graphics got
+    GRAPHICS_LOG_ENV = {"DXVK_LOG_LEVEL": "info", "DXVK_LOG_PATH": "none"}
     # "look closer": every registry lookup and every file the game asks for (huge — its own log, condensed after;
     # which requested files did not exist is worked out from the test copy itself: trace+file, not warn+file)
     DEEP_WINEDEBUG = ",+reg,trace+file,+relay"
@@ -963,7 +983,7 @@ class LibraryManager:
         self._launch_info[entry_id] = {"proton": self._proton_name_for(e, plan),
                                        "overlay": "Steam overlay" in plan.description}
         if diagnostic:
-            plan.env = {**plan.env, "WINEDEBUG": self.DIAGNOSTIC_WINEDEBUG}
+            plan.env = {**plan.env, **self.GRAPHICS_LOG_ENV, "WINEDEBUG": self.DIAGNOSTIC_WINEDEBUG}
             plan.description += " · diagnostic run"
         log_path = self.paths.logs / f"game-{e.id}.log"
         with open(log_path, "a", encoding="utf-8") as fh:
@@ -1750,6 +1770,10 @@ class LibraryManager:
         if dst.exists():
             shutil.rmtree(dst, ignore_errors=True)
         how = "a copy of the game's prefix"
+        exe = self.get(entry_id).executable
+        if not exe or not launcher.is_windows_binary(Path(exe)):
+            dst.mkdir(parents=True)                    # a Linux game: no Wine, nothing to copy or prepare
+            return dst, "no prefix (a Linux game)"
         if src is None or not prefix_ready(src):
             # another kind of Proton: a prefix of its own, prepared once with the runtimes the game's real prefix
             # has (a fresh one lacked e.g. the Visual C++ runtime, and every test of another Proton failed on that
@@ -1824,6 +1848,18 @@ class LibraryManager:
         ``seconds``: how long it may run (a slow first start gets more); ``deep``: record registry lookups too;
         ``hidden``: off-screen and muted, its pictures judged (default: the setting, where the desktop allows it);
         ``early``: done as soon as its picture shows its menu (the quick check of a new game)."""
+        r = self._run_trial_once(entry_id, cand, n, cancel, seconds=seconds, deep=deep, hidden=hidden, early=early)
+        if r.get("meter_crash") and not (cancel is not None and cancel.is_set()):
+            # MangoHud itself crashed in the game: never blame the setup for that — the game is tested again without
+            # it, and so are its next tests
+            log.info("MangoHud crashed in a test of entry %s: tested again without it", entry_id)
+            self._no_meter.add(entry_id)
+            r = self._run_trial_once(entry_id, cand, n, cancel, seconds=seconds, deep=deep, hidden=hidden,
+                                     early=early)
+        return r
+
+    def _run_trial_once(self, entry_id: int, cand: dict, n: int, cancel: threading.Event | None, *,
+                        seconds: int | None, deep: bool, hidden: bool | None, early: bool) -> dict:
         if self.is_running(entry_id):
             raise LibraryError("Stop the game first.")
         prefix, how = self._trial_prefix(entry_id, n, cand["overrides"].get("proton_version"))
@@ -1856,8 +1892,11 @@ class LibraryManager:
             if deep:
                 self._trace_calls_in(entry_id, prefix, cand["overrides"].get("proton_version"))
             plan = self.launch_plan(entry_id, {**cand["overrides"], "prefix_dir": str(prefix)})
-            plan.env = {**plan.env, "WINEDEBUG": self.DIAGNOSTIC_WINEDEBUG + (self.DEEP_WINEDEBUG if deep else "")}
+            plan.env = {**plan.env, **self.GRAPHICS_LOG_ENV,
+                        "WINEDEBUG": self.DIAGNOSTIC_WINEDEBUG + (self.DEEP_WINEDEBUG if deep else "")}
             limit = seconds or self.TRIAL_SECONDS
+            if self.trial_watch and not early:         # it quits at random, later than a test: watched that long
+                limit = max(limit, self.trial_watch)   # (a test still ends as soon as the game fails)
             symptom = self.trial_symptom if self.trial_symptom in probes.PROBED else ""
             measure_dir = None
             if symptom == "slow" and IS_LINUX and shutil.which("mangohud") and limit >= 25:
@@ -1866,16 +1905,35 @@ class LibraryManager:
                 shutil.rmtree(measure_dir, ignore_errors=True)
                 conf = probes.logging_conf(measure_dir.with_suffix(".conf"), measure_dir, 8, max(5, limit - 16))
                 plan.env = {**plan.env, "MANGOHUD": "1", "MANGOHUD_CONFIGFILE": str(conf)}
+            # the frame meter (ezgd.library.probes): did it present frames, from when, did they stop? — screenshots
+            # can be black while a game draws. (When measuring speed, that log is the meter: it starts at 8 s and
+            # ends 8 s before the test does, so a stop at its end is no freeze.)
+            meter_dir, meter_end = measure_dir, 8 + max(5, limit - 16) + probes.FRAME_START
+            if meter_dir is None and IS_LINUX and entry_id not in self._no_meter and shutil.which("mangohud"):
+                meter_dir, meter_end = self.paths.data / "measure" / f"frames-{entry_id}-{n}", None
+                shutil.rmtree(meter_dir, ignore_errors=True)
+                conf = probes.frames_conf(meter_dir.with_suffix(".conf"), meter_dir, limit + 60)
+                plan.env = {**plan.env, "MANGOHUD": "1", "MANGOHUD_CONFIGFILE": str(conf)}
+            if entry_id in self._no_meter:            # MangoHud crashed in this game: its tests run without it at all
+                plan.env = {k: v for k, v in plan.env.items() if k not in ("MANGOHUD", "MANGOHUD_CONFIGFILE")}
+                meter_dir = measure_dir = None
+            had_mangohud = plan.env.get("MANGOHUD") == "1"
+            # (WineD3D draws with OpenGL: MangoHud's Vulkan layer sees none of its frames)
+            wined3d = plan.env.get("PROTON_USE_WINED3D") == "1" or "PROTON_USE_WINED3D=1" in (plan.shell_script or "")
             run_log = self.paths.logs / f"trial-{entry_id}-deep.log" if deep else log_path
             use_hidden = bool(hidden if hidden is not None else self.settings.settings.hidden_tests) and IS_LINUX \
                 and hidden_mod.available()
             pics: list = []
             last_img = None
+            saw_window = False                         # KWin saw the game's own window (hidden tests)
             wall_start = time.time()                   # the window the system log is read for (ezgd.library.syslog)
             run_pids: set[int] = set()
             probe = probes.Probe(symptom, hidden=use_hidden) if symptom in ("no_sound", "controller", "online") \
                 else None
             for attempt in (1, 2):
+                meter_start = time.time()              # (the frames of this attempt only)
+                if attempt == 2 and meter_dir is not None and meter_dir is not measure_dir:
+                    shutil.rmtree(meter_dir, ignore_errors=True)
                 if deep:
                     run_log.write_text("")
                 with open(run_log, "a", encoding="utf-8") as fh:
@@ -1919,6 +1977,7 @@ class LibraryManager:
                         if hs is not None:                 # the test's windows kept away, its sound muted
                             wins = hs.check(ours)
                             hs.mute(ours)
+                            saw_window = saw_window or any(w["class"].startswith("steam_app_") for w in wins)
                     if looks and time.monotonic() - started >= looks[0]:
                         at = int(time.monotonic() - started)
                         looks.pop(0)                       # errors Wine does not know: read the game's screen
@@ -1985,8 +2044,26 @@ class LibraryManager:
                 text += "\n" + sys_text
                 with open(log_path, "a", encoding="utf-8") as fh:
                     fh.write(sys_text)
+            meter = probes.read_frames(meter_dir, meter_start) if meter_dir is not None else None
+            if meter_dir is not None and meter_dir is not measure_dir:
+                shutil.rmtree(meter_dir, ignore_errors=True)
+            if meter is not None:
+                text += "\n" + probes.frames_marker(meter).rstrip("\n")
+                with open(log_path, "a", encoding="utf-8") as fh:
+                    fh.write(probes.frames_marker(meter))
+            if had_mangohud and not still and any(
+                    ev.kind in ("segfault", "core") and "mangohud" in (ev.lib + ev.detail).lower() for ev in sys_events):
+                result["meter_crash"] = True
             reason = _trial_reason(text) or next((ev.describe() for ev in sys_events if ev.ours), "")
             frames = _drew_frames(text)
+            vulkan = not wined3d and bool(re.search(
+                r'(DXVK: v\d|vkd3d-proton|Loaded L"[^"]*[\\/](d3d9|d3d11|d3d12|d3d12core|dxgi|vulkan-1|winevulkan)\.dll")',
+                text, re.I))
+            fv = probes.frame_verdict(meter, min(secs, meter_end) if meter_end else secs, still, vulkan)
+            shown, shown_why, frames = _with_meter(fv, shown, shown_why, frames)
+            result["picture"] = shown
+            if meter is not None:
+                result["meter"] = {**meter, "stalled": fv["stalled"]}
             # how far it got: Wine's log plus the engine's own log (written inside the test prefix, or in the
             # game folder during this test)
             from ezgd.library import diagnose as _dg
@@ -2005,6 +2082,10 @@ class LibraryManager:
                 pass
             if shown == "menu":                        # its picture showed a menu: it got into the game
                 eng += "\nezgd-picture: Main menu shown"
+            if saw_window:
+                eng += "\nezgd-window: game window opened"
+            if shown in ("menu", "moving") or perf is not None or (fv["drawing"] and not fv["stalled"]):
+                eng += "\nezgd-frames: drawing frames"
             progress = _hist.phase(text + "\n" + eng).reached
             if shown in ("menu", "moving"):
                 frames = True
@@ -2031,8 +2112,8 @@ class LibraryManager:
                 result.update(outcome="ran", seconds=secs, stuck=stuck,
                               detail=f"kept running for {secs}s without crashing"
                               + (f" — {shown_why}" if shown in ("menu", "black", "frozen") else
-                                 {True: ", drawing frames", False: ", but drew no frames (black screen?)",
-                                  None: ""}[frames])
+                                 {True: f" — {fv['text']}" if fv["text"] else ", drawing frames",
+                                  False: ", but drew no frames (black screen?)", None: ""}[frames])
                               + ("" if shown == "menu" else " — got to the game" if "game loaded" in progress else
                                  " — but it waits on a notice (press OK when you play)" if box.notice else
                                  " — but no sign it got past start-up" if stuck and progress else "")

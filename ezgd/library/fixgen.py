@@ -55,6 +55,8 @@ class GeneratedFix:
     compat_set: dict = field(default_factory=dict)       # CompatConfig fields (use_runtime, protonfixes)
     winetricks: list[str] = field(default_factory=list)  # installed into the test copy first (into the real prefix
                                                          # only once it has worked there)
+    proton_kind: str = ""            # "ge" / "cachyos" / "valve": a Proton of that kind (shareable — no names)
+    proton_version: str = ""         # … the one installed here that stands for it (resolved locally, never kept)
 
     def proton_vars(self) -> list[str]:
         """The PROTON_* variables this fix relies on (to skip it on a Proton build that does not read them)."""
@@ -94,6 +96,8 @@ class GeneratedFix:
             o["edits"] = self.edits
         if self.winetricks:
             o["winetricks"] = list(self.winetricks)
+        if self.proton_version:
+            o["proton_version"] = self.proton_version
         return o
 
     def to_dict(self) -> dict:
@@ -101,7 +105,7 @@ class GeneratedFix:
                 "raw_options": self.raw_options,
                 "dll_overrides": self.dll_overrides, "options": self.options, "edits": self.edits,
                 "learned_from": self.learned_from, "fixes_on": self.fixes_on, "fixes_off": self.fixes_off,
-                "compat_set": self.compat_set, "winetricks": self.winetricks}
+                "compat_set": self.compat_set, "winetricks": self.winetricks, "proton_kind": self.proton_kind}
 
 
 def with_env(options: str, env: dict[str, str]) -> str:

@@ -92,6 +92,20 @@ def test_nothing_that_names_the_player_or_the_game_is_sent():
     assert crowd.reports(solved, me, set(ids)) == ([], [])                # sent once
 
 
+def test_a_switch_of_proton_is_shared_as_its_kind_and_empty_fingerprints_not_at_all():
+    """GE-Proton (the most common fix) is shared as "a GE-Proton" — never a folder name; a record whose fingerprint
+    holds no evidence (a run that just kept going) matches nothing anywhere and is not sent."""
+    me = {"id": "abc123", "gpus": [{"vendor": "nvidia"}]}
+    ge = {"gen_id": "proton:ge", "label": "Use GE-Proton", "why": "It worked with GE-Proton.", "proton_kind": "ge"}
+    empty = {"engine": "", "replaced": [], "loaders": [], "box": "", "missing": [], "keys": []}
+    solved = [{"sig": dict(SIG, missing=["uiautomationcore.dll"]), "game": "G", "fixes": [ge],
+               "overrides": {"proton_version": "Proton-GE Latest"}, "machine": {"id": "abc123"}},
+              {"sig": empty, "game": "W", "fixes": [dict(ge, gen_id="proton:cachyos", proton_kind="cachyos")],
+               "machine": {"id": "abc123"}}]
+    recs, _ids = crowd.reports(solved, me, set())
+    assert [r["fix"]["proton_kind"] for r in recs] == ["ge"] and "Proton-GE Latest" not in json.dumps(recs)
+
+
 def test_only_what_the_server_signed_is_used():
     srv = FakeServer()
     srv.entries = [{"sig": {k: v for k, v in SIG.items() if k not in ("build", "keys")},

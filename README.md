@@ -671,7 +671,11 @@ What it draws on, strongest first:
   fingerprint — where it crashed (module, offset, the game build), which loader DLLs were replaced, the error
   message, missing DLLs or registry keys, the engine — with the fix. The same failure in any game is tried with that
   fix first ("the very same crash", "the game's own dwmapi.dll replaced by Wine's, as in Expedition 33"). Changes
-  that did not help a game are remembered too and not tested on it again.
+  that did not help a game are remembered too and not tested on it again. A switch of Proton — the most common fix
+  by far — is kept as *a Proton of that kind* (GE-Proton, Proton-CachyOS, Valve's), so another game, or another
+  computer, uses its own newest build of that kind (0.6.7; before, it only ever helped the same game). A run that
+  just kept going leaves no fingerprint and is not remembered (a "fix" saved on such a run was wrong), and *Did it
+  work? No* takes back what that Fix my game remembered.
 * **The last run that worked** (`investigations/good-<id>.json`): what that run loaded — the game's own DLLs, OnlineFix,
   UE4SS, Steam's DLLs — and which Proton build it used. A failing run is compared with it ("then it loaded its own
   winmm.dll, now Wine's"; "it worked with GE-Proton11-5") — and when "Proton-GE Latest" was updated in place, the build
@@ -697,6 +701,17 @@ What it draws on, strongest first:
   tested). Verified on Expedition 33: its launcher's `CreateProcessW` of the Unreal executable, the game still at its
   menu under the trace.
 * **Patience**: a test still starting up after 45 s (shader compiling) gets one 120 s run before it counts as stuck.
+* **Games that quit at random** (0.6.7): when the game's recent starts quit by themselves later than a test lasts —
+  Ghost Recon Wildlands quit anywhere from 5 s to 4 minutes in — every test of that Fix my game (and *Try fixes for
+  me*) watches it past the latest of those times (one and a half times it, at most 8 minutes), and still ends as
+  soon as the game fails. The current setup then usually fails in the test too, and that run is followed; a fix has
+  to survive the long watch twice. If the current setup survives both, the answer says the tests were lucky rather
+  than calling the launch setup fine.
+* **How far it got**, without the game's own log (0.6.7): the graphics API the game loaded (`d3d11`, `d3d12`,
+  `dxgi`, Vulkan), DXVK's own log (Proton switches it off; test runs switch it back on, into the run's log only —
+  no file in the game folder; and DXVK writes "swapchain", which the old pattern "swap chain" never matched), the
+  game's window appearing in KWin, and frames (its picture moving or showing a menu, or MangoHud counting frames).
+  Every report used to end at "Proton started".
 
 A fix that needed several changes is **trimmed**: each change is left out once, and kept only if the game fails without
 it. Every investigation is written to `reports/investigation-<game>-<time>.txt` (the Diagnose window's *Open the
@@ -715,6 +730,13 @@ KWin, journald, busctl and pactl are part of the desktop; elsewhere tests are sh
 looks), a menu (Tesseract reads the text — dim text is stretched to full contrast first: Expedition 33's grey
 "PRESS ANY BUTTON" on black is read) or an error the game drew itself. "Kept running 45 s" no longer passes a black
 screen or a frozen loading screen; a menu counts as having reached the game.
+
+**Frames counted, not only photographed** (0.6.7): every test run also logs its frames with an invisible MangoHud
+(already loaded into every game the app starts). A window that is photographed black while frames are being drawn
+(Ghost Recon Wildlands' always was) is no longer judged a black screen; frames that stop while the game keeps running
+are judged a freeze; a DirectX/Vulkan game that presented no frame at all drew nothing. MangoHud only sees Vulkan
+(DXVK, vkd3d-proton): for OpenGL / WineD3D games it says nothing. Should MangoHud itself crash a game in a test, the
+test is repeated without it and the setup is not blamed.
 
 **Crashes and freezes while playing** (`ezgd/library/crashes.py`): a test start lasts 45 seconds; a crash 20 minutes
 in only happens while someone plays. Every start records which DLLs were loaded from where (`+loaddll`, a few hundred
@@ -1108,6 +1130,7 @@ that PC can check:
 
 * **Ghost Recon Wildlands (EMPRESS)** is not fixed: with the performance-cores fix and GE-Proton it still quits with
   code 255 at a random moment during loading (a clean run: 210 s of black, then 255). The cause inside EMP.dll is
-  still unknown.
+  still unknown. 0.6.7 no longer presents the performance-cores fix as the cure (it is offered as something to try,
+  never switched on by itself), and Fix my game now watches such a game long enough to see it quit.
 
 (The developer's PC had *Steam overlay in games* switched off, so in-game invite buttons could not work; it is on now.)

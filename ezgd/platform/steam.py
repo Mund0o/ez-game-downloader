@@ -174,7 +174,9 @@ def find_proton_versions(steam_root: Path | None) -> list[ProtonInstall]:
             for d in common.iterdir():
                 if d.name.lower().startswith("proton") and (d / "proton").is_file():
                     found.setdefault(d.name, ProtonInstall(d.name, d))
-    custom_dirs = [Path.home() / ".steam" / "root" / "compatibilitytools.d"]
+    # a forced Steam (EZGD_STEAM_ROOT: tests) is the only one — the home folder's tools let tests start this
+    # computer's real GE-Proton (its cmd.exe, to prepare test prefixes, for minutes, and left behind)
+    custom_dirs = [] if os.environ.get("EZGD_STEAM_ROOT") else [Path.home() / ".steam" / "root" / "compatibilitytools.d"]
     if steam_root:
         custom_dirs.insert(0, steam_root / "compatibilitytools.d")
     for cd in custom_dirs:

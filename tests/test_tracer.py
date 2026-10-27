@@ -197,6 +197,62 @@ def test_solved_crashes_are_recognised_in_another_game(tmp_path):
     assert tracer.no_help(mem, t2, "Unreal Engine", "A Third Game") == set()
 
 
+def proton(tmp_path, name: str, version: str):
+    from ezgd.platform.steam import ProtonInstall
+    d = tmp_path / "compatibilitytools.d" / name
+    d.mkdir(parents=True)
+    (d / "proton").write_text(f'#!/usr/bin/env python3\nCURRENT_PREFIX_VERSION="{version}"\n')
+    return ProtonInstall(name, d)
+
+
+def test_a_switch_of_proton_is_remembered_for_other_games(tmp_path):
+    """GE-Proton fixed a game: other games with the same failure try "a GE-Proton" — the one installed here, by
+    whatever name — not the folder name it had in the first game (it may not exist, or be another computer's)."""
+    folder = game(tmp_path)
+    mem = tmp_path / "crash_memory.json"
+    ge, cachy = proton(tmp_path, "Proton-GE Latest", "GE-Proton11-7"), proton(tmp_path, "cachy", "CachyOS-11.0-100")
+    assert (tracer.proton_kind(ge), tracer.proton_kind(cachy)) == ("ge", "cachyos")
+    fix = tracer.proton_fix(ge)
+    assert fix["proton_kind"] == "ge" and fix["label"] == "Use GE-Proton"
+    t = tracer.trace(wine_log(folder, "Game.exe", own_dll=False), folder / "Game.exe", exit_code=5, seconds=10)
+    tracer.remember(mem, t, "Unreal Engine", "First Game", [fix], {"proton_version": "Proton-GE Latest"},
+                    ["Use Proton-GE Latest"])
+    other = game(tmp_path / "other")
+    t2 = tracer.trace(wine_log(other, "Game.exe", own_dll=False), other / "Game.exe", exit_code=5, seconds=9)
+    mine = proton(tmp_path / "here", "GE-Proton11-9", "GE-Proton11-9")
+    got = [s for s in tracer.recall(mem, t2, "Unreal Engine", "Another Game", protons=[cachy, mine], current=cachy)
+           if s.fix is not None and s.fix.proton_kind]
+    from ezgd.library.models import LibraryEntry, LibraryStatus
+    entry = LibraryEntry(title="Another Game", status=LibraryStatus.INSTALLED, id=2, executable=str(other / "Game.exe"))
+    assert got and got[0].changes(entry) == {"proton_version": "GE-Proton11-9"} and got[0].title == "Use GE-Proton11-9"
+    # nothing to test when the game already runs on that kind, or no Proton of that kind is installed
+    for protons, current in (([cachy, mine], mine), ([cachy], cachy)):
+        assert not any(s.fix is not None and s.fix.proton_kind for s in
+                       tracer.recall(mem, t2, "Unreal Engine", "Another Game", protons=protons, current=current))
+    # shared fixes keep the kind (and only known kinds)
+    assert tracer._clean_fix(fix)["proton_kind"] == "ge"
+    assert tracer._clean_fix({**fix, "proton_kind": "/home/x/evil"}) is None
+    assert "proton_kind" not in tracer._clean_fix({**fix, "proton_kind": ""})
+
+
+def test_a_run_without_evidence_is_not_remembered_and_a_no_takes_it_back(tmp_path):
+    """2026-10-25 a "fix" kept on a run that simply kept going (no crash, no error: an empty fingerprint) was wrong
+    (Wildlands → Proton-CachyOS) — such runs are not remembered; and "Did it work? No" forgets what the run kept."""
+    import time
+    folder = game(tmp_path)
+    mem = tmp_path / "crash_memory.json"
+    ran = tracer.trace(wine_log(folder, "Game.exe", own_dll=True, crash=False), folder / "Game.exe", ran=True,
+                       seconds=45)
+    tracer.remember(mem, ran, "", "Wildlands", [], {"proton_version": "cachy"}, ["Use cachy"])
+    assert not mem.exists() or tracer._load_memory(mem)["solved"] == []
+    t = tracer.trace(wine_log(folder, "Game.exe", own_dll=False), folder / "Game.exe", exit_code=5, seconds=10)
+    tracer.remember(mem, t, "", "Old", [], {"proton_version": "x"}, ["x"])
+    since = time.time()
+    tracer.remember(mem, t, "", "Wildlands", [], {"proton_version": "cachy"}, ["Use cachy"])
+    assert tracer.forget(mem, "Wildlands", since) == 1
+    assert [r["game"] for r in tracer._load_memory(mem)["solved"]] == ["Old"]
+
+
 def test_a_failing_run_is_compared_with_the_one_that_worked(tmp_path):
     folder = game(tmp_path)
     ok = tracer.trace(wine_log(folder, "Game.exe", own_dll=True, crash=False, menu=True), folder / "Game.exe",

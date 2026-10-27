@@ -467,3 +467,113 @@ def perf_from_text(text: str) -> dict | None:
         except ValueError:
             continue
     return found
+
+
+# ------------------------------------------------------------- the frame meter (every test run, ezgd.library.manager)
+# A test's screenshots can be black while the game draws (Ghost Recon Wildlands' hidden window always captured black)
+# — and that once decided Fix my game for the wrong Proton. MangoHud's log of the run says it directly: one row per
+# frame presented, written as it goes (a crash or a kill keeps the frames until then — checked with vkcube on
+# 2026-10-27: a SIGKILL at 4 s left 329 rows; ``elapsed`` is nanoseconds since the log started). It only sees Vulkan
+# presents — DXVK and vkd3d-proton count, OpenGL and WineD3D do not — so a missing log says nothing; a log with
+# (almost) no frames does.
+FRAME_START = 1                 # seconds after MangoHud loads that its log starts
+FRAMES_MARK = "ezgd:frames "
+STALL_SECONDS = 15              # no frame for this long while it still runs: it froze (or sits in a long load)
+_LOG_TIME = re.compile(r"_(\d{4}-\d\d-\d\d_\d\d-\d\d-\d\d)\.csv$")
+
+
+def frames_conf(conf: Path, folder: Path, duration: int) -> Path:
+    """An invisible MangoHud that logs every frame of a test run from its start."""
+    return logging_conf(conf, folder, FRAME_START, duration)
+
+
+def _frame_times(path: Path) -> list[float] | None:
+    """When each frame of a MangoHud log was presented (seconds since the log started), or None (not such a log)."""
+    try:
+        with open(path, newline="", encoding="utf-8", errors="replace") as fh:
+            rows = list(csv.reader(fh))
+    except OSError:
+        return None
+    head = next((i for i, r in enumerate(rows) if "frametime" in r), None)
+    if head is None:
+        return None
+    ft_i = rows[head].index("frametime")
+    el_i = rows[head].index("elapsed") if "elapsed" in rows[head] else None
+    out: list[float] = []
+    total = 0.0
+    for r in rows[head + 1:]:
+        try:
+            ft = float(r[ft_i])
+            total += ft / 1000
+            at = float(r[el_i]) / 1e9 if el_i is not None else total
+        except (ValueError, IndexError):
+            continue
+        if ft > 0:
+            out.append(at)
+    return out
+
+
+def read_frames(folder: Path, run_start: float) -> dict | None:
+    """The run's frames, from MangoHud's logs in ``folder`` (one per process that presented with Vulkan — the one with
+    the most frames is the game): {"frames", "first", "last", "gap", "process"}, the times in seconds since
+    ``run_start`` (wall clock). None: no log at all (MangoHud not loaded, or a game it cannot see)."""
+    try:
+        paths = [p for p in folder.glob("*.csv")
+                 if not p.name.endswith("_summary.csv") and p.stat().st_mtime >= run_start - 1]
+    except OSError:
+        return None
+    best = None
+    for p in paths:
+        times = _frame_times(p)
+        if times is None:
+            continue
+        m = _LOG_TIME.search(p.name)
+        try:
+            began = time.mktime(time.strptime(m.group(1), "%Y-%m-%d_%H-%M-%S")) if m else None
+        except ValueError:
+            began = None
+        offset = began - run_start if began is not None else float(FRAME_START)
+        gap = max((b - a for a, b in zip(times, times[1:])), default=0.0)
+        found = {"frames": len(times), "first": round(offset + times[0], 1) if times else None,
+                 "last": round(offset + times[-1], 1) if times else None, "gap": round(gap, 1),
+                 "process": m.string[:m.start()] if m else p.stem}
+        if best is None or found["frames"] > best["frames"]:
+            best = found
+    return best
+
+
+def frame_verdict(meter: dict | None, run_seconds: int, still: bool, vulkan: bool) -> dict:
+    """What the frame meter says about a run: {"drawing": True/False/None, "stalled": seconds without a frame at the
+    end while it still ran (0: none), "text"}. ``vulkan``: the game presents through Vulkan (DXVK, vkd3d-proton,
+    Vulkan itself) — only then do no frames mean it drew nothing."""
+    if meter is None:
+        return {"drawing": None, "stalled": 0, "text": ""}
+    if meter["frames"] < 10:
+        if not vulkan:
+            return {"drawing": None, "stalled": 0, "text": ""}
+        return {"drawing": False, "stalled": 0, "text": "it presented no frames (MangoHud counted "
+                                                         f"{meter['frames']})"}
+    stalled = max(0, int(run_seconds - meter["last"])) if still else 0
+    if stalled >= STALL_SECONDS:
+        return {"drawing": True, "stalled": stalled,
+                "text": f"it drew {meter['frames']} frames from {meter['first']:.0f} s, then none for the last "
+                        f"{stalled} s (frozen, or a long load)"}
+    if still:
+        return {"drawing": True, "stalled": 0,
+                "text": f"it drew {meter['frames']} frames (from {meter['first']:.0f} s on, MangoHud)"}
+    return {"drawing": True, "stalled": 0, "text": f"it drew frames from {meter['first']:.0f} s until "
+                                                   f"{meter['last']:.0f} s"}
+
+
+def frames_marker(meter: dict) -> str:
+    return FRAMES_MARK + json.dumps(meter, sort_keys=True) + "\n"
+
+
+def frames_from_text(text: str) -> dict | None:
+    found = None
+    for m in re.finditer(r"^" + re.escape(FRAMES_MARK) + r"(\{.*\})\s*$", text, re.M):
+        try:
+            found = json.loads(m.group(1))
+        except ValueError:
+            continue
+    return found

@@ -81,7 +81,7 @@ def test_emp_quitting_points_at_the_performance_cores(tmp_path, monkeypatch):
         chain, suspects = tracer.follow(t, entry)
         assert any("EMPRESS" in c for c in chain)
         top = suspects[0]
-        assert top.key == "empress:pcores" and top.confidence >= 0.9
+        assert top.key == "empress:pcores" and top.confidence < 0.85     # a test, never set by itself (unproven)
         assert top.changes(entry)["compat"]["fixes"] == ["pcores"]
     # the test with the fix: EMP.dll did not end it → kept
     ok = tracer.trace(run_log(folder, emp_exit=False), folder / "GRW.exe", ran=True, seconds=300)
@@ -114,13 +114,13 @@ def test_the_fix_pins_the_game_and_is_recommended_for_empress(tmp_path, monkeypa
     fx = fixes.effects(fixes.GameContext(e, folder / "GRW.exe", "", linux=True))
     assert fx.wrappers == ["/usr/bin/taskset", "-c", "0-15"] and "performance cores" in fx.notes
 
-    # the regular checks find it too (the new-game check switches it on by itself)
+    # the regular checks offer it too — not strongly enough for the new-game check to switch it on
     run = dg.LastRun(started="2026-10-23 14:33:08", text="=== exited with code 255 after 12s", exit_code=255,
                      seconds=12)
     c = dg.Context(LibraryEntry(title="G", status=LibraryStatus.INSTALLED, id=1, executable=str(folder / "GRW.exe"),
                                 install_path=str(folder.parent)),
                    folder / "GRW.exe", tmp_path / "pfx", run, None, "", "", False, [], "GE", True, True, {})
     f = dg.r_empress(c)
-    assert f and f[0].fix.kind == "enable_fix" and f[0].fix.value == "pcores" and f[0].confidence >= 0.9
+    assert f and f[0].fix.kind == "enable_fix" and f[0].fix.value == "pcores" and f[0].confidence < 0.85
     assert dg.r_empress(dg.Context(e, folder / "GRW.exe", tmp_path / "pfx", run, None, "", "", False, [], "GE", True,
                                    True, {})) == []                 # already on

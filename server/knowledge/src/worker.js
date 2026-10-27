@@ -127,10 +127,12 @@ function checkSig(s) {
   return Object.keys(out).length ? out : null;
 }
 
+const PROTON_KINDS = new Set(["ge", "cachyos", "valve"]);
+
 function checkFix(f) {
   if (!obj(f) || !str(f.gen_id, 80) || !/^[\w:.\-]{1,80}$/.test(f.gen_id)) return null;
   const known = new Set(["gen_id", "label", "why", "env", "args", "dll_overrides", "options", "fixes_on", "fixes_off",
-                         "compat_set", "winetricks"]);
+                         "compat_set", "winetricks", "proton_kind"]);
   if (Object.keys(f).some(k => !known.has(k))) return null;
   const env = f.env ?? {}, dlls = f.dll_overrides ?? {}, compat = f.compat_set ?? {};
   if (!obj(env) || !obj(dlls) || !obj(compat)) return null;
@@ -141,7 +143,10 @@ function checkFix(f) {
   if (!(typeof (f.args || "") === "string" && ARGS.test(f.args || ""))) return null;
   for (const k of ["options", "fixes_on", "fixes_off", "winetricks"]) if (!strs(f[k] || [], 8, 40, WORD)) return null;
   if (!str(f.label || "", 120) || !str(f.why || "", 400)) return null;
-  return { gen_id: f.gen_id, label: f.label || "", why: f.why || "", env, args: f.args || "", dll_overrides: dlls,
+  // a kind of Proton (each computer uses its own build of that kind) — never a folder name
+  if (f.proton_kind !== undefined && f.proton_kind !== "" && !PROTON_KINDS.has(f.proton_kind)) return null;
+  const kind = f.proton_kind ? { proton_kind: f.proton_kind } : {};
+  return { ...kind, gen_id: f.gen_id, label: f.label || "", why: f.why || "", env, args: f.args || "", dll_overrides: dlls,
            options: f.options || [], fixes_on: f.fixes_on || [], fixes_off: f.fixes_off || [], compat_set: compat,
            winetricks: f.winetricks || [] };
 }

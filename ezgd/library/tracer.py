@@ -835,7 +835,8 @@ def follow(t: Trace, entry=None, good: dict | None = None) -> tuple[list[str], l
                                + f" {name} and quits.", 0.85 if la.get("ok") is False else 0.8,
                                overrides={"executable": str(target)}))
     # 7b. EMPRESS's Denuvo emulation gave up: EMP.dll ends the game itself (ExitProcess(-1), exit code 255) after
-    # failing the same fix-up again and again — on a CPU with performance and efficiency cores, at a random moment
+    # failing the same fix-up again and again, at a random moment. Keeping it on the performance cores ran Wildlands
+    # 10 minutes once (2026-10-23), but a later run on them quit the same way (2026-10-27): worth a test, not a cure
     if emp_quit(t):
         chain.append("EMP.dll — EMPRESS's replacement for Denuvo — ended the game (exit code -1/255). Its emulation "
                      f"handled {t.resumed} of the game's exceptions and then could not fix the same one any more"
@@ -845,13 +846,13 @@ def follow(t: Trace, entry=None, good: dict | None = None) -> tuple[list[str], l
         cpus = performance_cpus()
         on = set(entry.compat_config.fixes) if entry is not None else set()
         if cpus and "pcores" not in on:
-            chain.append(f"This CPU has performance and efficiency cores; EMPRESS's emulation breaks when Linux moves "
-                         f"the game between them, at a random moment of the start.")
+            chain.append("This CPU has performance and efficiency cores; keeping the game on the performance cores "
+                         "helped once and not another time — worth testing, but not a known cure.")
             g = GeneratedFix("trace:pcores", "Run it on the performance cores",
                              f"EMP.dll ended the game; kept on the performance cores (CPUs {cpus}) its emulation "
                              "does not give up.", fixes_on=["pcores"])
-            out.append(Suspect("empress:pcores", g.label, "EMPRESS's emulation gives up on this CPU's mix of "
-                               "cores.", 0.9, g, {"no_quit_by": "emp.dll"}))
+            out.append(Suspect("empress:pcores", g.label, "EMPRESS's emulation may give up on this CPU's mix of "
+                               "cores (not proven).", 0.6, g, {"no_quit_by": "emp.dll"}))
     # 8. what it looked for, just before it died, and did not find
     failed = (t.crash is not None or t.errors or (t.exit_code not in (None, 0) and not t.ran))
     files, keys = missing_before_end(t, harmless=set((good or {}).get("missing") or []))
@@ -1124,14 +1125,22 @@ def _this_machine() -> dict:
         return {}
 
 
+def has_evidence(sig: dict) -> bool:
+    """Whether a fingerprint says anything about the failure (a run that just kept going leaves only the engine —
+    it matches nothing, and 2026-10-25 a "fix" saved on such a run was simply wrong: Wildlands → Proton-CachyOS)."""
+    return any(v for k, v in sig.items() if k != "engine")
+
+
 def remember(path: Path, t: Trace, engine: str | None, game: str, fixes: list[dict], overrides: dict,
              labels: list[str], machine: dict | None = None) -> None:
     """A failure that was solved: its fingerprint, what solved it (``fixes``: GeneratedFix dicts that rebuild
     the change for any game; ``overrides``: the exact change, reused only for the same game) and the computer it
     happened on (the same-looking failure can have another cause elsewhere)."""
     import time as _time
-    data = _load_memory(path)
     sig = fingerprint(t, engine)
+    if not has_evidence(sig):
+        return
+    data = _load_memory(path)
     data["solved"] = [r for r in data["solved"] if not (r.get("game") == game and _sig_id(r.get("sig", {})) ==
                                                         _sig_id(sig))]
     data["solved"].append({"sig": sig, "game": game, "fixes": fixes, "overrides": overrides, "labels": labels,
@@ -1143,6 +1152,40 @@ def remember(path: Path, t: Trace, engine: str | None, game: str, fixes: list[di
 _VENDOR_MODULES = {"nvidia": re.compile(r"^(nvapi|nvwgf|nvoglv|nvd3dum|nvcuda|nvngx|_nvngx)", re.I),
                    "amd": re.compile(r"^(amdxc|atidxx|atiu|amdvlk|amd_ags|aticfx)", re.I),
                    "intel": re.compile(r"^(igd|igxe|intel)", re.I)}
+
+
+def forget(path: Path, game: str, since: float) -> int:
+    """What was remembered as solved for ``game`` since ``since`` — taken back (the fix did not work after all:
+    "Did it work? No"). Returns how many records went."""
+    data = _load_memory(path)
+    keep = [r for r in data["solved"] if not (r.get("game") == game and (r.get("at") or 0) >= since)]
+    gone = len(data["solved"]) - len(keep)
+    if gone:
+        data["solved"] = keep
+        _save_memory(path, data)
+    return gone
+
+
+# a fix may name a kind of Proton (never a folder name: those differ on every computer); each computer uses its
+# own newest build of that kind
+PROTON_KINDS = {"ge": "GE-Proton", "cachyos": "Proton-CachyOS", "valve": "Valve's Proton"}
+
+
+def proton_kind(p) -> str:
+    """The kind of an installed Proton (steam.ProtonInstall), or "" for one that is none of PROTON_KINDS."""
+    from ezgd.platform import prefixguard
+    k = prefixguard.family(prefixguard.proton_prefix_version(getattr(p, "path", None))) or ""
+    return k if k in PROTON_KINDS else ""
+
+
+def proton_fix(p) -> dict | None:
+    """Switching to ``p`` as a fix any game (and any computer) can use: "a Proton of its kind"."""
+    from ezgd.library.fixgen import GeneratedFix
+    k = proton_kind(p)
+    if not k:
+        return None
+    return GeneratedFix(f"proton:{k}", f"Use {PROTON_KINDS[k]}", f"It worked with {PROTON_KINDS[k]}.",
+                        proton_kind=k).to_dict()
 
 
 def remember_no_help(path: Path, t: Trace, engine: str | None, game: str, keys: list[str]) -> None:
@@ -1218,9 +1261,15 @@ def _clean_fix(fx) -> dict | None:
             return None
     if any(k not in _COMPAT_SET or not isinstance(v, bool) for k, v in compat.items()):
         return None
-    return {"gen_id": gen_id, "label": _txt(fx.get("label"), 120), "why": _txt(fx.get("why"), 400), "env": env,
-            "args": args, "dll_overrides": dlls, "options": lists["options"], "fixes_on": lists["fixes_on"],
-            "fixes_off": lists["fixes_off"], "compat_set": compat, "winetricks": lists["winetricks"]}
+    kind = fx.get("proton_kind") or ""
+    if kind and kind not in PROTON_KINDS:
+        return None
+    out = {"gen_id": gen_id, "label": _txt(fx.get("label"), 120), "why": _txt(fx.get("why"), 400), "env": env,
+           "args": args, "dll_overrides": dlls, "options": lists["options"], "fixes_on": lists["fixes_on"],
+           "fixes_off": lists["fixes_off"], "compat_set": compat, "winetricks": lists["winetricks"]}
+    if kind:                                   # (only when set: servers before 0.6.7 refuse a fix with unknown keys)
+        out["proton_kind"] = kind
+    return out
 
 
 def _clean_machine(m) -> dict:
@@ -1284,10 +1333,12 @@ def shared_records(records: list) -> list[dict]:
 
 
 def recall(path: Path, t: Trace, engine: str | None, game: str, shared: list[dict] | None = None,
-           here: dict | None = None) -> list[Suspect]:
+           here: dict | None = None, protons: list | None = None, current=None) -> list[Suspect]:
     """Failures solved before that look like this one — on this computer, or (``shared``) on others through the
     synced folder: their fixes as suspects, strongest first; a match from a different kind of computer counts for
-    less, and one that hinges on another GPU vendor's driver not at all."""
+    less, and one that hinges on another GPU vendor's driver not at all. ``protons`` (installed) and ``current``
+    (the game's Proton) turn "a Proton of that kind" into one installed here — skipped when none is, or when the game
+    already uses that kind."""
     import time as _time
     from ezgd.library.fixgen import GeneratedFix
     from ezgd.platform import machine as machine_mod
@@ -1331,8 +1382,18 @@ def recall(path: Path, t: Trace, engine: str | None, game: str, shared: list[dic
             except TypeError:
                 continue
             if not (g.dll_overrides or g.env or g.args or g.options or g.fixes_on or g.fixes_off or g.winetricks
-                    or g.compat_set or g.raw_options):
+                    or g.compat_set or g.raw_options or g.proton_kind):
                 continue
+            g.proton_version = ""                      # (never a name from the record: another computer's folders)
+            if g.proton_kind:
+                if current is not None and proton_kind(current) == g.proton_kind:
+                    continue
+                p = next((x for x in protons or [] if proton_kind(x) == g.proton_kind), None)
+                if p is None:
+                    continue
+                g.proton_version = p.name
+                if g.label == f"Use {PROTON_KINDS[g.proton_kind]}":
+                    g.label = f"Use {p.name}"
             g.learned_from = rec.get("game", "")
             out.append(Suspect(f"memory:{g.gen_id}", g.label, text, conf, g))
     best: dict[str, Suspect] = {}

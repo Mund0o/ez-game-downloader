@@ -754,6 +754,23 @@ def test_frame_detection():
     assert _drew_frames("info:  DXVK: v3.0\ninfo:  Presenter: Actual swap chain properties:\n") is True
     assert _drew_frames("info:  DXVK: v3.0\ninfo:  Found device: NVIDIA\n") is False
     assert _drew_frames("nothing graphical here") is None
+    # what DXVK really prints (no space: "swap chain" never matched), and a D3D12 game's swap chain is vkd3d's
+    assert _drew_frames("info:  DXVK: v2.7.1\ninfo:  Presenter: Actual swapchain properties:\n") is True
+    d3d12 = '0134:trace:loaddll:build_module Loaded L"C:\\\\windows\\\\system32\\\\d3d12core.dll" at 1: builtin\n'
+    assert _drew_frames("info:  DXVK: v2.7.1\n" + d3d12) is None
+
+
+def test_how_far_a_run_got_without_engine_logs():
+    """Proton silences DXVK and many games log nothing: the graphics API the game loaded, the window KWin saw and the
+    frames its picture / MangoHud showed are milestones too (every Fix my game report used to end at "Proton
+    started")."""
+    from ezgd.library import history
+    run = ("Proton: /games/G.exe\n"
+           '0134:trace:loaddll:build_module Loaded L"C:\\\\windows\\\\system32\\\\DXGI.DLL" at 1: builtin\n')
+    assert history.phase(run).reached == ["Proton started", "graphics started"]
+    assert history.phase(run + "ezgd-window: game window opened\nezgd-frames: drawing frames\n").reached == \
+        ["Proton started", "graphics started", "game window opened", "drawing frames"]
+    assert "game window opened" in history.phase("info:  Presenter: Actual swapchain properties:").reached
 
 
 @pytest.mark.proton

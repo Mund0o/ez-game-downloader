@@ -64,6 +64,7 @@ def _anonymous_fix(fx: dict) -> dict | None:
 
 def reports(solved: list[dict], machine: dict, sent: set[str]) -> tuple[list[dict], list[str]]:
     """This computer's solved failures as anonymous records not sent before: (records, their ids)."""
+    from ezgd.library import tracer
     from ezgd.platform.machine import gpu_vendor
     out, ids = [], []
     vendor = gpu_vendor(machine) or ""
@@ -71,8 +72,8 @@ def reports(solved: list[dict], machine: dict, sent: set[str]) -> tuple[list[dic
         if (rec.get("machine") or {}).get("id") not in (None, "", machine.get("id")):
             continue                                    # (only what this computer solved)
         sig = {k: v for k, v in (rec.get("sig") or {}).items() if k in _SIG_SHARED}
-        if not sig:
-            continue
+        if not sig or not tracer.has_evidence(sig):
+            continue                                    # (a fingerprint without evidence matches nothing)
         for fx in rec.get("fixes") or []:
             fix = _anonymous_fix(fx)
             if fix is None:

@@ -151,6 +151,22 @@ def changes(good: Run, bad: Run) -> list[tuple[str, str, object, object]]:
     return out
 
 
+_STOPPED = {-15, -9, -2, 130, 137, 143}      # stopped by the player / the app (SIGTERM, SIGKILL, Ctrl+C)
+
+
+def late_quits(rs: list[Run], after: int, until: int = 900, last: int = 10) -> list[int]:
+    """How long the game's recent starts ran before they quit by themselves (an error exit, not the player
+    stopping it) later than ``after`` seconds — what a test of ``after`` seconds cannot see (Ghost Recon Wildlands
+    quit at random from 5 s to 4 minutes in). Runs past ``until`` are a problem of playing, not of starting."""
+    out = []
+    for r in rs[-last:]:
+        if r.diagnostic or r.seconds is None or r.exit_code in (None, 0) or r.exit_code in _STOPPED:
+            continue
+        if after < r.seconds <= until:
+            out.append(r.seconds)
+    return out
+
+
 def last_worked(rs: list[Run], before: Run | None = None) -> Run | None:
     pool = rs[:rs.index(before)] if before in rs else rs
     return next((r for r in reversed(pool) if r.worked), None)
@@ -210,11 +226,16 @@ _MILESTONES = [
     ("Proton started", r"(Proton: |umu\.exe|wine: |ntsync: up)"),
     ("Steam API connected", r"(SteamAPI_Init|Steam ?API.*(OK|initiali[sz]ed|succeeded)|\[S_API\] SteamAPI_Init|"
                             r"OnlineFix.*(loaded|initiali)|steamclient.*loaded)"),
+    # (the game loading a graphics API counts too: Proton silences DXVK's own log, and an Unreal shipping build or
+    # Ubisoft's engine log nothing — Wildlands, Expedition 33 and Who's at the door all stopped at "Proton started")
     ("graphics started", r"(DXVK: v\d|vkd3d-proton|D3D11CoreCreateDevice|Vulkan API version|"
                          r"Initialize engine version|GfxDevice: creating device|LogD3D1[12]RHI|LogVulkanRHI|"
-                         r"Godot Engine v\d|OpenGL API|Vulkan \d\.\d+\.\d+ - Forward)"),
-    ("game window opened", r"(Presenter: Actual swap chain properties|Creating swapchain|SwapChain|"
-                           r"DxvkSwapchain|Swapchain created|wined3d_swapchain)"),
+                         r"Godot Engine v\d|OpenGL API|Vulkan \d\.\d+\.\d+ - Forward|"
+                         r'Loaded L"[^"]*[\\/](d3d9|d3d11|d3d12|d3d12core|dxgi|vulkan-1)\.dll")'),
+    # (DXVK says "swapchain" — "swap chain" never matched it; ezgd-window: KWin saw the game's window)
+    ("game window opened", r"(Presenter: Actual swap ?chain properties|Creating swapchain|SwapChain|"
+                           r"DxvkSwapchain|Swapchain created|wined3d_swapchain|ezgd-window: )"),
+    ("drawing frames", r"ezgd-frames: "),           # its picture moved / showed a menu, or MangoHud counted frames
     ("game loaded", r"(LogLoad: (Took|Game class)|Loading scene|UnloadTime|LogWorld: Bringing World|"
                     r"Scene loaded|Main menu|\(level \w*Main_?Menu\w*\))"),     # (the last: UE4SS's log)
 ]

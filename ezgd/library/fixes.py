@@ -160,10 +160,10 @@ def catalog(ctx: GameContext) -> list[FixState]:
             out.append(FixState(
                 "pcores", "Stability", f"Run on the performance cores only (CPUs {pcores})",
                 "This CPU has fast performance cores and slower efficiency cores, and Linux moves the game's threads "
-                "between them. Releases that emulate Denuvo (EMPRESS) give up at a random moment when that happens "
-                "and the game quits; keeping the game on the performance cores avoids it.", "pcores" in on,
-                "EMPRESS's EMP.dll is in the game's folder: its Denuvo emulation quits the game at random on this "
-                "CPU's mix of cores." if ctx.has("EMP.dll") else None, bool(shutil.which("taskset")),
+                "between them. Releases that emulate Denuvo (EMPRESS) can quit at a random moment; keeping the game "
+                "on the performance cores helped one such game once (not every time).", "pcores" in on,
+                "EMPRESS's EMP.dll is in the game's folder: its Denuvo emulation can quit the game at random — "
+                "worth a try." if ctx.has("EMP.dll") else None, bool(shutil.which("taskset")),
                 None if shutil.which("taskset") else "taskset (util-linux) is not installed."))
         out.append(FixState(
             "no_steam_overlay", "Performance & overlays", "Turn off the Steam overlay for this game",

@@ -1652,10 +1652,10 @@ def r_overlay(c: Context) -> list[Finding]:
 
 
 def r_empress(c: Context) -> list[Finding]:
-    """EMPRESS's Denuvo emulation (EMP.dll) on a CPU with performance and efficiency cores: Linux moves the game's
-    threads between both kinds and the emulation gives up at a random moment — it fails the same write again and
-    again, then one of its own threads calls ExitProcess(-1) (exit code 255): Ghost Recon Wildlands on an
-    i9-13900K quit after 5 s to 4 minutes on every Proton; kept on the P-cores it ran 10 minutes and drew its menu."""
+    """EMPRESS's Denuvo emulation (EMP.dll) gives up at a random moment — it fails the same write again and again,
+    then one of its own threads calls ExitProcess(-1) (exit code 255): Ghost Recon Wildlands on an i9-13900K quit
+    after 5 s to 4 minutes on every Proton. Kept on the P-cores it once ran 10 minutes, but a later run on them quit
+    the same way (2026-10-27) — so it is offered as something to try, never switched on by itself."""
     from ezgd.platform.machine import performance_cpus
     if not c.exe or not (c.exe.parent / "EMP.dll").is_file() or "pcores" in c.entry.compat_config.fixes:
         return []
@@ -1664,11 +1664,11 @@ def r_empress(c: Context) -> list[Finding]:
         return []
     ev = _lines(c.wine, r"(Call KERNEL32\.ExitProcess\(f{8,}\) ret=13|exited with code 255)", 3)
     return [Finding("empress-hybrid", "EMPRESS's Denuvo emulation and this CPU's mix of cores",
-                    "This release replaces Denuvo with EMPRESS's emulation (EMP.dll). On a CPU with performance and "
-                    "efficiency cores it gives up at a random moment — from a few seconds to minutes into the "
-                    "start — and ends the game itself (exit code 255). Running the game on the performance cores "
-                    f"only (CPUs {cpus}) avoids it. The first start is slow either way: the emulation needs about "
-                    "3–4 minutes before the game's window shows anything.", 0.9 if ev else 0.7, ev,
+                    "This release replaces Denuvo with EMPRESS's emulation (EMP.dll). It can give up at a random "
+                    "moment — from a few seconds to minutes into the start — and end the game itself (exit code "
+                    f"255). Running the game on the performance cores only (CPUs {cpus}) helped once and not "
+                    "another time: worth a try, not a known cure. The first start is slow either way: the emulation "
+                    "needs about 3–4 minutes before the game's window shows anything.", 0.5 if ev else 0.4, ev,
                     Fix("enable_fix", "pcores", "Run it on the performance cores"))]
 
 

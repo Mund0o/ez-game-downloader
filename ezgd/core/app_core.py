@@ -96,6 +96,14 @@ class PreparedDownload:
 
 
 
+def _duration(seconds: int) -> str:
+    """70 → "70 s", 240 → "4 min", 390 → "6.5 min"."""
+    if seconds < 100:
+        return f"{seconds} s"
+    m = round(seconds / 60, 1)
+    return f"{m:g} min"
+
+
 def _change_key(ov: dict, exe: str | None = None) -> str:
     """Two overrides with the same effect compare equal: key and list order left out, and the "game DLLs" fix
     counted as the DLL overrides it stands for (the trace sets dwmapi=n,b, the checks switch on game_dlls)."""
@@ -1351,6 +1359,11 @@ class AppCore:
                          protons: bool = True) -> list[dict]:
         """“Try fixes for me”: test candidate setups one after another (each in a throw-away prefix).
         ``deep`` (“Try everything”): many more setups; stops at the first one that keeps the game running."""
+        with self._watching_longer(entry_id):
+            return await self._run_trials(entry_id, findings, generated, deep, repairs, symptom, protons)
+
+    async def _run_trials(self, entry_id: int, findings: list[dict], generated: list[dict] | None, deep: bool,
+                          repairs: list | None, symptom: str, protons: bool) -> list[dict]:
         self._stops_with_the_app()
         if self.library.is_running(entry_id):
             raise SourceError("Stop the game first.")
@@ -1677,8 +1690,37 @@ class AppCore:
                           background: bool = False) -> dict:
         """One button: check, repair what has strong evidence, test setups, and give one answer.
         ``background``: the new-game check runs it (a press of the button stops that check first)."""
-        with self._watching(symptom):
+        with self._watching(symptom), self._watching_longer(entry_id):
             return await self._fix_my_game(entry_id, symptom, test, background)
+
+    WATCH_MAX = 480                      # the longest a test watches a game that quits at random
+
+    @contextlib.contextmanager
+    def _watching_longer(self, entry_id: int):
+        """A game whose recent starts quit by themselves later than a test lasts (Wildlands: from 5 s to 4 minutes
+        in, at random): every test meanwhile may run past the latest of those times — it still ends as soon as the
+        game fails. A 45-second run proved nothing there, and once a lucky run was taken for a fix. (Nested: the
+        outer wins.)"""
+        from ezgd.library import history
+        outer = self.library.trial_watch
+        if not outer:
+            quits = history.late_quits(history.runs(self.paths.logs / f"game-{entry_id}.log"),
+                                       self.library.TRIAL_SECONDS)
+            self._late_quits = quits
+            if quits:
+                self.library.trial_watch = min(self.WATCH_MAX, int(max(quits) * 1.5) + 30)
+        try:
+            yield
+        finally:
+            self.library.trial_watch = outer
+
+    def _watch_note(self) -> str:
+        """What the longer tests are about, in words ("" when tests are normal)."""
+        if not self.library.trial_watch:
+            return ""
+        when = ", ".join(_duration(x) for x in sorted(set(getattr(self, "_late_quits", None) or []))[:4])
+        return (f"its last starts quit by themselves after {when}, so every test watches it up to "
+                f"{_duration(self.library.trial_watch)} (and ends as soon as the game fails)")
 
     @contextlib.contextmanager
     def _watching(self, symptom: str):
@@ -1717,10 +1759,10 @@ class AppCore:
             self.emit("fixmygame", {"id": entry_id, "step": name, "status": status, "detail": detail,
                                     "progress": round(progress[0], 3)})
         before = {"launch_args": e.launch_args or "", "compat": e.compat_config.to_dict(),
-                  "proton_version": e.proton_version or "", "executable": e.executable}
+                  "proton_version": e.proton_version or "", "executable": e.executable, "at": time.time()}
         step("Checking the game", "running", "files, Steam setup, fix archives, logs and your system")
         d = await self.diagnose_game(entry_id, symptom)
-        step("Checking the game", "done", d["summary"])
+        step("Checking the game", "done", d["summary"] + (f" — {self._watch_note()}" if self._watch_note() else ""))
         late = self._late_crash(entry_id, symptom)
         if late is not None and test:
             # it crashed (or froze) while played, minutes in: a 45-second test cannot show that crash — start from
@@ -1877,10 +1919,16 @@ class AppCore:
                 break
             step("Testing", "running", f"✗ “{r['label']}” failed the second check ({again['detail']}) — not kept")
         if confirmed is not None and not confirmed["overrides"] and not (diff and diff.get("fix")):
-            verdict.update(status="not_fixed", kept=None,
-                           reason=(diff["text"] if diff else "The game runs in the test with its current setup, "
-                                   "so the problem is not in the launch setup.") + " Start it again; if it still "
-                                  "fails, choose what happens under “What goes wrong?” and check again.")
+            if self.library.trial_watch and not diff:
+                reason = (f"The game kept running {_duration(self.library.trial_watch)} in the test with its current "
+                          f"setup, twice — but {self._watch_note().split(', so ')[0]}. It quits at random, so the "
+                          "tests were lucky, not proof. Play it again: the next quit is read, and Fix my game starts "
+                          "from it.")
+            else:
+                reason = (diff["text"] if diff else "The game runs in the test with its current setup, so the "
+                          "problem is not in the launch setup.") + " Start it again; if it still fails, choose what " \
+                    "happens under “What goes wrong?” and check again."
+            verdict.update(status="not_fixed", kept=None, reason=reason)
             step("Testing", "done", "the current setup ran in the test")
             return verdict
         if confirmed is not None:
@@ -1889,14 +1937,12 @@ class AppCore:
                 await self.apply_trial(entry_id, best["overrides"], best.get("gen_id"),
                                        [f["key"] for f in d["findings"][:3]] + ([f"symptom:{symptom}"] if symptom else []))
                 if follow["first"] is not None:          # the crash memory learns from the list's finds too
-                    from ezgd.library import tracer
                     from ezgd.library.diagnose import engine_of
                     gen = next((g for g in (d2.get("generated") or []) + (d2.get("generated_deep") or [])
                                 if g.get("gen_id") and g["gen_id"] == best.get("gen_id")), None)
                     fixes = [{k: v for k, v in gen.items() if k != "overrides"}] if gen else []
-                    tracer.remember(self._memory_path(), follow["first"], engine_of(Path(e.executable)), e.title,
-                                    fixes, best["overrides"], [best["label"]])
-                    self._publish_memory()
+                    self._remember(follow["first"], engine_of(Path(e.executable)), e.title, fixes,
+                                   best["overrides"], [best["label"]])
             kept = best["label"] if best["overrides"] else diff["title"]
             verdict.update(status="fixed", kept=kept)
             step("Testing", "done", f"✓ {kept} kept the game running (checked twice)" if best["overrides"]
@@ -1951,6 +1997,24 @@ class AppCore:
 
     def _memory_path(self) -> Path:
         return self.library.paths.data / "crash_memory.json"
+
+    def _remember(self, first, engine, title: str, fixes: list[dict], overrides: dict, labels: list[str]) -> None:
+        """A solved failure into the crash memory (and shared). A switch of Proton is also kept as "a Proton of
+        that kind", which other games and other computers can use — the exact name only fits this game here, and
+        GE-Proton was the most common fix of all while nothing about it could be reused."""
+        from ezgd.library import tracer
+        p = next((x for x in self.library.protons() if x.name == overrides.get("proton_version")), None)
+        fx = tracer.proton_fix(p) if p is not None else None
+        if fx is not None and not any(f.get("proton_kind") for f in fixes):
+            fixes = [*fixes, fx]
+        tracer.remember(self._memory_path(), first, engine, title, fixes, overrides, labels)
+        self._publish_memory()
+
+    def _recall(self, cur, engine, e) -> list:
+        """Failures solved before that look like ``cur`` (this computer's memory and everyone's)."""
+        from ezgd.library import tracer
+        return tracer.recall(self._memory_path(), cur, engine, e.title, self._shared_records(),
+                             protons=self.library.protons(), current=self.library._proton_for(e))
 
     # ------------------------------------------------------------ everyone's knowledge (ezgd.library.crowd)
     CROWD_EVERY = 12 * 3600              # the published knowledge is fetched (and unsent reports sent) this often
@@ -2159,6 +2223,9 @@ class AppCore:
             step(name, status, text)
             report.append(f"[{name}] {text}")
 
+        if self._watch_note():
+            report.append(f"[Watching longer] {self._watch_note()}")
+
         async def trial(label: str, overrides: dict, **kw) -> tuple[dict, dict | None]:
             cand = {"label": label, "overrides": overrides}
             kw = {k: v for k, v in kw.items() if v}       # (only what differs from a normal test)
@@ -2206,7 +2273,7 @@ class AppCore:
                         suspects.append(tracer.Suspect(f"proton-build:{p.name}", f"Use {p.name}",
                                                        f"It worked with {good['proton_build']}, which is {p.name}.",
                                                        0.8, overrides={"proton_version": p.name}))
-            suspects = tracer.recall(memory, cur, engine, e.title, self._shared_records()) + suspects
+            suspects = self._recall(cur, engine, e) + suspects
             suspects += await self._layer_suspects(entry_id, cur)
             d = await self.diagnose_game(entry_id, symptom, evidence=ev)      # the regular checks, same run
             suspects += self._finding_suspects(entry_id, d, cur)
@@ -2269,8 +2336,7 @@ class AppCore:
                     kept = await self._trim(entry_id, parts, kept, trial, say, name)
                     self._save_good_run(entry_id, after)
                     fixes = [x.fix.to_dict() for _l, _o, x in parts if x.fix is not None]
-                    tracer.remember(memory, res["first"], engine, e.title, fixes, kept, [p[0] for p in parts])
-                    self._publish_memory()
+                    self._remember(res["first"], engine, e.title, fixes, kept, [p[0] for p in parts])
                     say(name, f"✓ fixed by: {'; '.join(p[0] for p in parts)}", "done")
                     return finish("fixed")
                 break
@@ -2391,7 +2457,7 @@ class AppCore:
                                                        "brings other versions of both.",
                                                        0.5 if "ge" in p.name.lower() else 0.4,
                                                        overrides={"proton_version": p.name}))
-        suspects = tracer.recall(self._memory_path(), cur, engine, e.title, self._shared_records()) + suspects
+        suspects = self._recall(cur, engine, e) + suspects
         suspects += await self._layer_suspects(entry_id, cur)
         d = await self.diagnose_game(entry_id, symptom or "crash_later", evidence=ev)
         suspects += self._finding_suspects(entry_id, d, cur)
@@ -2507,10 +2573,8 @@ class AppCore:
             self._write_followups(fol)
             self._record_outcome(e.title, True, [cur.get("title", "the fix")], [f"trial:{cur.get('key')}"], e)
             if first is not None:
-                tracer.remember(self._memory_path(), first, engine, e.title,
-                                [cur["fix"]] if cur.get("fix") else [], cur.get("overrides") or {},
-                                [cur.get("title", "")])
-                self._publish_memory()
+                self._remember(first, engine, e.title, [cur["fix"]] if cur.get("fix") else [],
+                               cur.get("overrides") or {}, [cur.get("title", "")])
             self.emit("notify", ("The fix held", f"{e.title} ran {played // 60} min without crashing (it used to "
                                  f"crash after {max(1, after // 60)} min) — “{cur.get('title')}” is kept."))
             return
@@ -2597,6 +2661,10 @@ class AppCore:
         self.library.update(entry_id, **changes)
         if before.get("executable") and before["executable"] != self.library.get(entry_id).executable:
             self.library.set_executable(entry_id, before["executable"])
+        if before.get("at"):                       # what this run remembered as solved was not: taken back
+            from ezgd.library import tracer
+            if tracer.forget(self._memory_path(), self.library.get(entry_id).title, float(before["at"])):
+                log.info("crash memory: Fix my game's result for entry %s taken back", entry_id)
         return "The game's previous launch setup is back (file repairs are kept)."
 
     FIX_LABELS = {"repair_files": "repairing the game's files", "apply_archive": "applying the fix archive",
@@ -2961,7 +3029,7 @@ class AppCore:
         e = self.library.get(entry_id)
         cur = self._trace(ev, Path(e.executable))
         _chain, suspects = tracer.follow(cur, e)
-        suspects += tracer.recall(self._memory_path(), cur, None, e.title, self._shared_records())
+        suspects += self._recall(cur, None, e)
         for sx in sorted(suspects, key=lambda x: -x.confidence):
             ov = sx.changes(e)
             if sx.confidence < 0.88 or not ov or ov.get("winetricks") or ov.get("registry") or ov.get("edits"):
