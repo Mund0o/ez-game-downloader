@@ -191,6 +191,8 @@ def _run(args, paths, log_file, previous_crash) -> int:
     # everything loaded at start (modules, classes, the window) lives as long as the app: the full garbage
     # collection skips it from now on (200,000 objects: 33 ms → 2 ms, a dropped frame every 30 s in couch mode)
     QTimer.singleShot(4000, gcguard.freeze_startup)
+    from ezgd.ui import stalls
+    stalls.install(win.where, app)               # a frozen window is logged with where it was stuck (stalls.py)
     if args.page == "couch":
         QTimer.singleShot(1500, win.open_couch)               # smoke testing couch mode
     elif args.page != "home":

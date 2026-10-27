@@ -1099,6 +1099,16 @@ def shutdown() -> None:
     _INTERCEPTOR = None
 
 
+def keep_clickable(dlg: QDialog) -> None:
+    """Opened from a modal dialog (the game page runs with exec()), a window that is not its child is blocked by Qt:
+    clicks and its ✕ are dropped while the page goes on drawing — the browser looked half frozen (since 0.2.0; it
+    is owned by the main window so that closing the game page does not stop its download). It becomes the modal
+    window on top instead: the game page waits behind it and works again once the browser hides or closes."""
+    from PySide6.QtWidgets import QApplication
+    if QApplication.activeModalWidget() is not None:
+        dlg.setWindowModality(Qt.ApplicationModal)
+
+
 def open_browser_download(actions, game, url: str, host_label: str, parent):
     if not AVAILABLE:
         QMessageBox.information(parent, "In-app browser not installed",
@@ -1108,5 +1118,6 @@ def open_browser_download(actions, game, url: str, host_label: str, parent):
     # owned by the main window, not the game page: closing the game page must not stop the download
     dlg = BrowserDownloadDialog(actions, game, url, host_label, actions.parent() or parent)
     dlg.setAttribute(Qt.WA_DeleteOnClose, False)     # disposed explicitly once its downloads are done
+    keep_clickable(dlg)
     dlg.show()
     return dlg

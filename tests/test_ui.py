@@ -453,6 +453,46 @@ def _click_element(qtbot, dlg, element_id: str) -> None:
     QTest.mouseClick(target, Qt.LeftButton, Qt.NoModifier, QPoint(int(x), int(y)))
 
 
+def test_the_browser_opened_from_the_game_page_takes_clicks(ui, qtbot, server):
+    """The game page runs modally (exec): the browser it opens belongs to the main window (so closing the page does
+    not stop a download) and was blocked by Qt — no clicks, its ✕ ignored, the page still drawing: "half frozen".
+    It must be usable while the game page is open, and the page usable again once the browser goes."""
+    from PySide6.QtCore import QEvent, QObject, QTimer
+    from PySide6.QtWidgets import QDialog
+    from ezgd.ui.dialogs import browser
+    if not browser.AVAILABLE:
+        pytest.skip("Qt WebEngine not installed")
+    win, core, _ = ui
+    server.add("/host", content_type="text/html", data=b"<html><body>host</body></html>")
+    g = Game("steamrip", "80", "Modal Game", "https://steamrip.com/modal-game/")
+    core.games.save(g)
+    events = []
+
+    class Watch(QObject):
+        def eventFilter(self, o, e):
+            if e.type() in (QEvent.WindowBlocked, QEvent.WindowUnblocked):
+                events.append((o.objectName(), e.type()))
+            return False
+    watch = Watch()
+    page = QDialog(win)
+    page.setObjectName("page")
+    page.installEventFilter(watch)
+    got = {}
+
+    def from_the_page():
+        browser.open_browser_download(win.actions, g, server.url("/host"), "TestHost", page)
+        dlg = got["dlg"] = next(w for w in win.findChildren(browser.BrowserDownloadDialog) if w.game.id == g.id)
+        dlg.setObjectName("browser")
+        dlg.installEventFilter(watch)
+        QTimer.singleShot(300, lambda: (got.setdefault("open", list(events)), dlg.close()))
+        QTimer.singleShot(600, page.accept)
+    QTimer.singleShot(100, from_the_page)
+    page.exec()
+    assert ("page", QEvent.WindowBlocked) in got["open"]                 # the page waits behind the browser
+    assert ("browser", QEvent.WindowBlocked) not in got["open"]          # the browser takes clicks and its ✕
+    assert events[-1] == ("page", QEvent.WindowUnblocked)               # closed: the page works again
+
+
 def test_in_app_browser_follows_clicks_into_other_sites(ui, qtbot, server):
     """SteamRIP-style pages open the host in a new tab on another site: the user's click must work (that was
     blocked as a pop-up); script pop-ups stay blocked; program downloads (ads) are refused."""

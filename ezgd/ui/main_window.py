@@ -274,6 +274,16 @@ class MainWindow(QMainWindow):
             return True
         return super().eventFilter(obj, e)
 
+    def where(self) -> str:
+        """What is on screen, for the log's UI stall lines (see stalls.py)."""
+        couch = self.couch
+        if couch is not None and couch.isVisible():
+            from ezgd.ui.couch import TABS
+            tab = TABS[couch.tab] if 0 <= getattr(couch, "tab", -1) < len(TABS) else "?"
+            return f"couch mode ({tab}{', a page over it' if getattr(couch, 'stack', None) else ''})"
+        key = next((k for k, p in self.pages.items() if p is self.stack.currentWidget()), "?")
+        return f"the {key} page" + ("" if self.isVisible() else " (window hidden)")
+
     def refresh_page(self) -> None:
         key = next((k for k, p in self.pages.items() if p is self.stack.currentWidget()), "")
         page = self.pages.get(key)
