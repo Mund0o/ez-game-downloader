@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
+import shiboken6
 from PySide6.QtCore import QEasingCurve, QPointF, QRectF, Qt, QTimer, QVariantAnimation
 from PySide6.QtGui import QColor, QFontMetrics, QLinearGradient, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QApplication, QWidget
@@ -128,6 +129,13 @@ class Row:
         return self.kind not in ("header", "msg")
 
 
+def _let_go(bridge, token: int, ms: int = 1000) -> None:
+    """Hand the layout kept for a menu (``token``) back to Steam after ``ms`` — not tied to any window."""
+    if token:
+        QTimer.singleShot(ms, lambda: bridge.call(bridge.core.library_call("let_go_input_layout", token), None,
+                                                  lambda _e: None))
+
+
 class QuickMenu(QWidget):
     GRID_COLS = 4
 
@@ -170,6 +178,8 @@ class QuickMenu(QWidget):
         self.opened_at = 0.0
         self._steam_tip = False            # this time the menu shows the one-time Steam-button tip
         self._still = None                 # the game's picture taken just before the menu opened (a QPixmap)
+        self._holding = False              # asking Steam to keep the game's controller layout (the menu opens next)
+        self._layout_token = 0             # … what to hand back to Steam when the menu goes (see steaminput)
         self._anim = QVariantAnimation(self)
         self._anim.setEasingCurve(QEasingCurve.OutCubic)
         self._anim.valueChanged.connect(self._shown_step)
@@ -194,7 +204,47 @@ class QuickMenu(QWidget):
 
     # ================================================================= open / close
     def open_for(self, game) -> None:
-        """Show the menu for ``game`` (a library entry the app is running; None when every game is suspended)."""
+        """Show the menu for ``game`` (a library entry the app is running; None when every game is suspended).
+
+        Over a game, Steam is first asked to keep the game's controller layout while the menu is open (see
+        steaminput: the menu taking the focus made Steam take away the virtual pad the game reads, and bring a new
+        one back afterwards — a friend's game never took it back). The menu shows once Steam switched (well under a
+        second; never more than 2.5 s)."""
+        if self._holding:
+            return                                       # (waiting for Steam: the same press reported twice)
+        if self.isVisible() or game is None or game.id in self.couch.suspended:
+            self._open(game)
+            return
+        self._holding = True
+        b = self.couch.bridge
+        shown = [False]
+
+        def show() -> None:
+            if shown[0] or not shiboken6.isValid(self):
+                return
+            shown[0] = True
+            self._holding = False
+            self._open(game)
+
+        def held(token) -> None:
+            token = int(token or 0)
+            if not shiboken6.isValid(self):              # the menu went meanwhile (its couch mode closed):
+                _let_go(b, token, 0)                     # nothing to keep the layout for
+                return
+            self._layout_token = token                   # (also when it came after the time limit)
+            if shown[0] and not self.isVisible():
+                self._release_layout()                   # (gone again already)
+            show()
+        # (not owned by this window: Steam's answer must reach a release even if the menu is gone by then)
+        b.call(b.core.library_call("hold_input_layout", game.id), held, lambda _e: show())
+        QTimer.singleShot(2500, self, show)
+
+    @property
+    def opening(self) -> bool:
+        """Asked for, not shown yet (Steam is switching): the menu is on its way — its couch mode must stay."""
+        return self._holding
+
+    def _open(self, game) -> None:
         self.game = game
         self.opened_at = time.monotonic()
         self.view = "main"
@@ -223,6 +273,7 @@ class QuickMenu(QWidget):
             self.windowHandle().setScreen(screen)
         if screen is not None:
             self.setGeometry(screen.geometry())
+        self.pointer(False)                       # (opened by a guide button or Shift+Tab, never the mouse)
         self.showFullScreen()
         self.raise_()
         self.activateWindow()
@@ -264,7 +315,22 @@ class QuickMenu(QWidget):
     # Steam gives the focused menu its desktop layout (keys) and the game its own back when it has the focus again.
     def hideEvent(self, event) -> None:
         self._still = None
+        self._release_layout()
         super().hideEvent(event)
+
+    def _release_layout(self) -> None:
+        """The layout kept for the menu goes back to Steam — a moment after the menu went, once the game has the
+        focus again (from then on Steam follows the focus, as before the menu). Not tied to this window: the hidden
+        couch mode of a desktop start closes before that."""
+        token, self._layout_token = self._layout_token, 0
+        _let_go(self.couch.bridge, token)
+
+    def pointer(self, shown: bool) -> None:
+        """The mouse pointer over the menu: hidden while a controller (or keys) drive it, as in couch mode — with a
+        Steam controller on Steam's desktop layout its right pad is a mouse, and the pointer stayed on screen."""
+        shape = Qt.ArrowCursor if shown else Qt.BlankCursor
+        if self.cursor().shape() != shape:
+            self.setCursor(shape)
 
     def _first_steam_tip(self) -> bool:
         """Once ever, with a Steam-held Steam Controller: say that a tap of its Steam button is Steam's overlay
@@ -1084,12 +1150,13 @@ class QuickMenu(QWidget):
             self.close_switch()
 
     def keyPressEvent(self, e) -> None:                       # noqa: N802
+        self.pointer(False)
         kb = self.keyboard
         steam = self.couch.key_action(e.key())          # (a Steam controller's buttons, sent as keys by Steam)
         if kb is not None:
             # the same typing as couch mode's keyboard: a Steam controller's A arrives as Enter, which finished
             # (sent) the message at once, so nothing could be typed with it
-            from_pad = bool(self.couch.pads.steam_hw) or not kb.typed
+            from_pad = self.couch.pads.steam_as_keys() or not kb.typed
             done = kb.key(e.key(), e.text(), steam, from_pad, e.isAutoRepeat())
             if done == "a":
                 self.couch.sounds.play("select")
@@ -1137,6 +1204,7 @@ class QuickMenu(QWidget):
         return None
 
     def mouseMoveEvent(self, e) -> None:                      # noqa: N802
+        self.pointer(True)
         h = self._hit_at(e.position())
         if h is None:
             return

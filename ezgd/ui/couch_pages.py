@@ -77,12 +77,8 @@ class Page:
 
     # ---------------------------------------------------------- helpers
     def _smooth(self, attr: str, target: float) -> float:
-        cur = getattr(self, attr, 0.0)
-        if self.w.reduce_motion or abs(cur - target) < 0.6:
-            cur = target
-        else:
-            cur += (target - cur) * 0.25
-            self.w._schedule_frame()
+        """A scroll position gliding to ``target`` (see CouchWindow.ease: by the clock, on every frame)."""
+        cur = self.w.ease((id(self), attr), getattr(self, attr, 0.0), target)
         setattr(self, attr, cur)
         return cur
 
@@ -1341,11 +1337,7 @@ class StorePage(Page):
             c = min(self.cols.get(k, 0), len(groups) - 1)
             tgt = max(0.0, c * (tw + gap) - (W * 0.33 - left))
             tgt = min(tgt, max(0.0, len(groups) * (tw + gap) - gap - (W - 2 * left)))
-            cur = self.hscroll.get(k, 0.0)
-            cur = tgt if w.reduce_motion or abs(cur - tgt) < 0.6 else cur + (tgt - cur) * 0.25
-            if cur != tgt:
-                w._schedule_frame()
-            self.hscroll[k] = cur
+            cur = self.hscroll[k] = w.ease((id(self), "shelf", k), self.hscroll.get(k, 0.0), tgt)
             ty = y + 44 * s
             for j, g in enumerate(groups):
                 x = left + j * (tw + gap) - cur

@@ -1106,14 +1106,41 @@ that PC can check:
   from a game). If full screen still will not stay, Settings → Window → *Custom size* at the screen's resolution
   filled the tester's screen every time in the logs.
 
-* **The Steam Controller after the quick menu (0.6.4)** — in an OnlineFix game (Expedition 33, Risk of Rain 2), in Dark
-  Souls III and in Bloodborne, with *Our overlay* on and off: hold the Steam button, close the menu, play on. Steam's
-  rules behind it were measured on Steam itself (a forced layout survives focus changes, the Steam button and Big
-  Picture; `forceinputappid/0` switches nothing until the focus moves), but not with a Steam Controller — the log says
-  what Steam chose at every step. **Reported broken on 0.6.7** (2026-10-28): after opening and closing the quick menu
-  the game takes up/down but not A, the mouse pointer shows over the menu, and with *Our overlay* off the controller
-  does nothing in the game at all. Not fixed yet — it needs the `ezgd.log` of such a run (Settings → *Open log
-  folder*) to see which layout Steam chose when.
+* **The Steam Controller after the quick menu (0.6.4)** — in an OnlineFix game (Expedition 33, Risk of Rain 2), in
+  Dark Souls III and in Bloodborne, with *Our overlay* on and off: hold the Steam button, close the menu, play on.
+  Steam's rules behind it were measured on Steam itself (a forced layout survives focus changes, the Steam button and
+  Big Picture; `forceinputappid/0` switches nothing until the focus moves), but not with a Steam Controller — the log
+  says what Steam chose at every step. **Reported broken on 0.6.7** (2026-10-28): after opening and closing the quick
+  menu the game takes up/down but not A, the mouse pointer shows over the menu, and with *Our overlay* off the
+  controller does nothing in the game at all. Up/down on the stick, nothing on A, B, X, Y and a mouse pointer is
+  exactly what Steam's own desktop layout for the Steam Controller sends (stick = arrow keys, A Enter, B Space, X/Y
+  Page Up/Down, right pad = mouse), which points at Steam's desktop layout while the game had the screen (unconfirmed:
+  the tester uses a saved desktop layout of their own); Steam picks the layout by which X11 window has the focus.
+  Found in the code since, and fixed in 0.6.9: for a game started from the desktop, the request that gives
+  the game the focus back after the menu was dropped whenever listing the game's processes took longer than 400 ms; a
+  controller Steam takes away (its virtual pad goes whenever Steam switches layouts) left anything held at that moment
+  stuck (a stick kept scrolling, a held guide button opened the menu by itself, a held A blocked A on the next pad);
+  the menu never hid the mouse pointer. A second pass found more: which desktop layout the player uses was looked for
+  only in the last 256 KB of Steam's controller logs (past that, the player's own layout silently became Steam's
+  default, and with it what each button means); with Steam closed, the keyboard's Space, Tab and Page Down still
+  counted as a Steam Controller's B, ✕ and Manage; Flatpak's and Snap's Steam never counted as running (no Steam
+  button, no Steam keys); a held d-pad repeated twice as fast on pads that repeat keys themselves; with two games
+  running, a quick menu opened from the desktop picked either one. Whether the first of these is what happened on the
+  tester's PC is not known yet. The log now says, each time the menu hands a game the screen back, whether KWin was
+  asked to bring its window forward and which X11 window had the focus 0.7 s later, next to Steam's own choices
+  ("Steam controller layout: …"). **The cause, measured on Steam (2026-10-28, a controller, the real quick menu):**
+  Steam gives a controller the layout of the focused X11 window's game (its process: a game Steam started, or one
+  carrying SteamGameId / signed in like OnlineFix). The quick menu is a Wayland window, so the moment it took the
+  focus Steam switched to its desktop layout, which removed the virtual pad the game reads from, and made a new one
+  when the game had the focus again — every opening and closing, four times in four tries; a game that does not take a
+  re-plugged pad back loses the controller. Forcing the layout Steam already uses keeps the pad (same device), also
+  through focus changes. So the menu now forces the game's own layout (Steam's last decision for it) before it takes
+  the focus and releases it a second after it went: in the same test the pad — and the game's open handle on it,
+  checked in a real Proton game — stayed for all four openings, and afterwards Steam followed the focus as usual. Only
+  when there is a virtual pad to keep (a layout that sends keys keeps the old behaviour). Found on the way: a second
+  press right after closing the menu of a desktop start was lost (the hidden couch mode closed under the opening
+  menu). The earlier note that Steam makes no virtual pad without a game process was wrong: it was a layout that sends
+  no pad at all.
 
 * **Pages of a site that is "not found" for a moment (0.6.8)** — a tester's cracked-games.org page said *could not
   resolve … Name or service not known* and loaded on the second *Try again*; the app now tries twice more by itself.

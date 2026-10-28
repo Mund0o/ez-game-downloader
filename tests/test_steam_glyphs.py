@@ -62,7 +62,7 @@ NEPTUNE_V3 = """
 
 def _use(couch, text, kind):
     """Couch mode reads this configuration as the Steam controller's (what DesktopKeys does with Steam's files)."""
-    couch.pads.steam_hw = True
+    couch.pads.steam_hw = couch.pads.steam_up = True                 # (and Steam runs)
     couch.pads.desktop.keys = si.normalise(si.keys_of(text))
     couch.pads.desktop.labels = si.labels_of(text, kind)
     couch.pads.desktop.browser = si.browser_hints(text, couch.pads.desktop.labels)
@@ -79,7 +79,7 @@ def test_valve_controllers_are_found_on_the_hid_bus(tmp_path):
 def test_keys_from_a_steam_controller_keep_its_buttons(ui, qtbot, monkeypatch):
     win, core, _ = ui
     couch = _open_couch(win, qtbot)
-    couch.pads.steam_hw = True                                       # Steam has the controller (no gamepad node)
+    couch.pads.steam_hw = couch.pads.steam_up = True                 # Steam has the controller (no gamepad node)
     couch.pad_family = ""
     couch.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Right, Qt.NoModifier))
     assert couch.pad_family == "steam"                               # A / B / L1 / R1, not Enter / Esc / Tab

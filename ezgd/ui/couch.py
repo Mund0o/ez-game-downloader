@@ -20,13 +20,14 @@ from __future__ import annotations
 import logging
 import math
 import os
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import (QBuffer, QByteArray, QEasingCurve, QIODevice, QObject, QPointF, QRect, QRectF, Qt,
+from PySide6.QtCore import (QBuffer, QByteArray, QIODevice, QObject, QPointF, QRect, QRectF, Qt,
                             QTimer, QVariantAnimation, Signal)
 from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QImageReader, QLinearGradient, QPainter,
                            QPainterPath, QPen, QPixmap, QRegion)
@@ -89,6 +90,19 @@ class Overlay:
 
 class _ArtSignals(QObject):
     ready = Signal(object, object)         # job key, QImage | None
+
+
+def _log_x_focus(why: str) -> None:
+    """Which X11 window has the focus a moment after a game was given the screen — what Steam picks a Steam
+    controller's layout by (a game it knows: its layout; a Wayland window or nothing: the desktop layout)."""
+    import shutil
+    from ezgd.ui import steam_bpm
+    if not shutil.which("xprop") or not os.environ.get("DISPLAY"):
+        return                                          # (nothing to read it with)
+    time.sleep(0.7)
+    title = steam_bpm.active_x_title()
+    log.info("%s: the active X11 window is now %s", why, f"“{title}”" if title else
+             "none (a Wayland window has the focus, or nothing)")
 
 
 def image_size(data: bytes) -> tuple[int, int] | None:
@@ -540,20 +554,20 @@ class _Couch:
         self._shown: dict[tuple, tuple] = {}     # tile → the picture it showed last
         self._tab_fit: dict[tuple, tuple[float, bool]] = {}
         self._paint_failed = False
-        self._frame_pending = False
+        self._frame_timer = QTimer(self)                 # a frame asked for in a while (see _schedule_frame)
+        self._frame_timer.setSingleShot(True)
+        self._frame_timer.setTimerType(Qt.PreciseTimer)
+        self._frame_timer.timeout.connect(self.update)
+        self._frame_due = 0.0
+        self.frame_now = 0.0                             # when the frame being drawn started (the glides' clock)
+        self._ease_at: dict = {}                         # glide → when it last moved (see ease)
+        self._focus_t0: float | None = None              # the focus growing in since then (see _kick_focus)
         self._minimize_timer = QTimer(self)
         self._minimize_timer.setSingleShot(True)
         self._minimize_timer.timeout.connect(self._step_aside)
         self.toasts = CouchToasts(self)
         self.toasts.reduce_motion = self.reduce_motion
 
-        self._tick = QTimer(self)                 # animations (only runs while something moves)
-        self._tick.setInterval(16)
-        self._tick.timeout.connect(self._animate)
-        self._focus_va = QVariantAnimation(self)
-        self._focus_va.setDuration(170)
-        self._focus_va.setEasingCurve(QEasingCurve.OutCubic)
-        self._focus_va.valueChanged.connect(self._focus_value)
         self._bg_va = QVariantAnimation(self)
         self._bg_va.setDuration(200)
         self._bg_va.valueChanged.connect(self._bg_value)
@@ -1548,15 +1562,14 @@ class _Couch:
         elif self._last_game in self.running:
             game = next((x for x in self.entries if x.id == self._last_game), None)
             if game is not None and self._last_game not in self.suspended:
-                self.bridge.call(self.bridge.core.library_call("game_processes", game.id),
-                                 lambda pids: bring_game_forward(pids), lambda _err: None, owner=self)
+                self.give_game_screen(game.id, f"Steam's window put away: back to {game.title}")
 
     def _steam_tap_over_game(self) -> None:
         """A Steam Controller's Steam button tapped (Steam logged it) over one of our games: with Steam's overlay in
         the game the tap is Steam's — its overlay opens (friends, invites); a hold is the quick menu (Steam skips long
         holds). Without the overlay it is the quick menu, as for other controllers."""
         playing = [i for i in self.running if i not in self.suspended]
-        gid = self._last_game if self._last_game in playing else (playing[0] if playing else None)
+        gid = self._game_played(playing)
 
         def got(has: bool) -> None:
             if self._exiting:
@@ -1582,6 +1595,7 @@ class _Couch:
         if name == "home":
             self.guide_pressed()
         if self.quick is not None and self.quick.isVisible():
+            self.quick.pointer(False)
             self.quick.command(name)                      # the quick menu is over the game
             return
         if name == "home" and self._game_in_front():
@@ -1670,21 +1684,23 @@ class _Couch:
         """Back to the game from the quick menu of a desktop-started game: the hidden couch mode goes again (not
         while it holds a suspended game — closing would let that one run again)."""
         if self.background and not self._exiting and not self.suspended and \
-                not (self.quick is not None and self.quick.isVisible()):
-            self.force_close()
+                not (self.quick is not None and (self.quick.isVisible() or self.quick.opening)):
+            self.force_close()                          # (not while the menu is on its way: pressed again just now)
 
     def bring_forward_soon(self, e) -> None:
         """A game switched to from the quick menu: the screen is its as soon as its window is there (a big game
         takes a while to show one)."""
         self._last_game = e.id
+        import shiboken6
 
-        def once() -> None:
-            if self.quick is not None and self.quick.isVisible():
+        def once(n: int) -> None:
+            quick = self.quick                          # (a Python attribute: readable after the window is gone)
+            if quick is not None and shiboken6.isValid(quick) and quick.isVisible():
                 return
-            self.bridge.call(self.bridge.core.library_call("game_processes", e.id),
-                             lambda pids: bring_game_forward(pids), lambda _err: None, owner=self)
-        for ms in (0, 3000, 10_000):
-            QTimer.singleShot(ms, self, once)
+            self.give_game_screen(e.id, f"switched to {e.title} ({n}/3)")
+        for n, ms in enumerate((0, 3000, 10_000), 1):
+            # not owned by this window: the hidden couch mode of a desktop start may be gone before the last try
+            QTimer.singleShot(ms, lambda n=n: once(n))
         if self.background:
             QTimer.singleShot(400, self, self._dismiss_background)
 
@@ -1795,9 +1811,9 @@ class _Couch:
             self.command(steam)
             return
         if name is not None and k not in (Qt.Key_Escape, Qt.Key_Backspace, Qt.Key_Return, Qt.Key_Enter) and \
-                self.pad_family and not self.pads.steam_hw:
+                self.pad_family and not self.pads.steam_as_keys():
             self.pad_family = ""                  # typing on the keyboard: show keyboard keys
-        elif name is not None and self.pads.steam_hw and self.pad_family != "steam" and not self.pads.devices:
+        elif name is not None and self.pads.steam_as_keys() and self.pad_family != "steam" and not self.pads.devices:
             self.pad_family = "steam"             # Steam turns its controller into keys outside games
         if name is None:
             page = self.current_page()
@@ -1838,8 +1854,8 @@ class _Couch:
     def _keys_from_a_pad(self) -> bool:
         """Do the keys reaching the on-screen keyboard come from a controller? (A Steam controller is connected, or
         nothing has been typed on a real keyboard into it.)"""
-        return bool(self.pads.steam_hw) or not getattr(self.keyboard, "typed", False)
-    _FOCUS_ATTRS = ("focus", "row", "col", "chip", "gi", "shelf", "filter")
+        return self.pads.steam_as_keys() or not getattr(self.keyboard, "typed", False)
+    _FOCUS_ATTRS = ("focus", "row", "col", "chip", "gi", "shelf", "filter", "cols")
 
     def _focus_key(self) -> tuple:
         """Where the selector is (to hear it move only when it really moved)."""
@@ -1849,7 +1865,10 @@ class _Couch:
                 key.append(None)
                 continue
             d = vars(obj)
-            key.append((id(obj),) + tuple(d.get(a) for a in self._FOCUS_ATTRS if isinstance(d.get(a), (int, str))))
+            # (a dict too: Discover keeps the focused tile of each shelf in one — left / right made no sound)
+            key.append((id(obj),) + tuple(tuple(sorted(v.items())) if isinstance(v, dict) else v
+                                          for a in self._FOCUS_ATTRS for v in [d.get(a)]
+                                          if isinstance(v, (int, str, dict))))
         return tuple(key)
 
     def _sound(self, name: str, before: tuple) -> None:
@@ -2299,14 +2318,65 @@ class _Couch:
         self._update_bg()
         self.update()
 
-    def _schedule_frame(self, ms: int = 16) -> None:
-        if not self._frame_pending:
-            self._frame_pending = True
+    def _schedule_frame(self, ms: int = 0) -> None:
+        """Another frame. ``ms`` 0: the next one — a glide or a growing focus moves on every frame of the screen, at
+        the frame pump's pace; else in ``ms``. A later request never pushes back an earlier one: one flag for all of
+        them let the background's wait (255 ms after every move) swallow every glide's next frame — the Store's
+        shelves moved one jump per press and stood still in between."""
+        if ms <= 0:
+            if self._pump.isActive() and self.gpu_paint:
+                # straight from this frame: Qt delivers it on the compositor's next frame (the screen's refresh).
+                # The pump's own timer (8 ms) beat against a 120 Hz screen (8.33 ms): every few dozen frames a
+                # refresh got nothing new — a hitch several times a second while scrolling
+                self._request()
+                return
+            if self._pump.isActive():
+                self._dirty = True                      # (drawn by the CPU: at the pump's pace, at most 75 Hz)
+                return
+            ms = 16
+        due = time.monotonic() + ms / 1000
+        if self._frame_timer.isActive() and self._frame_due <= due:
+            return
+        self._frame_due = due
+        self._frame_timer.start(ms)                     # (tied to this window: never runs after it closed)
 
-            def go() -> None:
-                self._frame_pending = False
-                self.update()
-            QTimer.singleShot(ms, self, go)              # tied to this window: never runs after it closed
+    GLIDE_TIME = 0.11                                    # seconds: how evenly a held direction slides (settles)
+    GLIDE_KICK = 0.058                                   # … and a glide from rest starts this quick (the old start)
+
+    def ease(self, key, cur: float, target: float, smooth: float = GLIDE_TIME) -> float:
+        """One frame of a glide (scrolling to the focus) from ``cur`` towards ``target``: a critically damped spring
+        that keeps its speed when the target moves on (a held direction slides evenly), by the clock (the same at
+        60, 120 or 144 frames a second, and with uneven frames). Before: a quarter of the remaining way per frame —
+        fastest right after each press, so a held direction pulsed fast-slow-fast, and faster on a faster screen.
+        A glide from rest starts at the old glide's speed (a single press answers at once: half a tile in ~33 ms);
+        measured on a held direction (a tile every 110 ms, 120 frames a second) the speed now varies ±14 % instead of
+        ±53 %. ``key`` names the glide. Asks for the next frame until it has arrived."""
+        state = self._ease_at.get(key)
+        vel = state[1] if state is not None else 0.0
+        if self.reduce_motion or (abs(cur - target) < 0.6 and abs(vel) < 6.0):
+            self._ease_at.pop(key, None)
+            return target
+        now = self.frame_now or time.perf_counter()
+        if state is None or now - state[0] > 0.05:       # a new glide (or the first frame after a pause): one frame
+            dt = (self._pump.interval() if self._pump.isActive() else 16) / 1000
+            vel = (target - cur) / self.GLIDE_KICK
+        else:
+            dt = max(0.0005, now - state[0])
+        omega = 2.0 / max(0.01, smooth)                  # (Game Programming Gems 4, "critically damped" smoothing)
+        x = omega * dt
+        k = 1.0 / (1.0 + x + 0.48 * x * x + 0.235 * x * x * x)
+        change = cur - target
+        temp = (vel + omega * change) * dt
+        vel = (vel - omega * temp) * k
+        cur = target + (change + temp) * k
+        if (target - cur) * change > 0:                  # (never past the target)
+            cur, vel = target, 0.0
+        if abs(cur - target) < 0.6 and abs(vel) < 6.0:
+            self._ease_at.pop(key, None)
+            return target
+        self._ease_at[key] = (now, vel)
+        self._schedule_frame()
+        return cur
 
     LAYERS = 260                                         # finished bars, chip strips, titles, glows kept
     LAYER_BYTES = 160 << 20                              # … and at most this much of them (a 4K top bar is 3 MB)
@@ -3200,7 +3270,7 @@ class _Couch:
         playing = [i for i in self.running if i not in self.suspended]
         if not playing and not self.suspended:
             return                                    # no game of ours: couch mode is never steered otherwise
-        current = self._last_game if self._last_game in playing else (playing[-1] if playing else None)
+        current = self._game_played(playing)
         game = next((e for e in self.entries if e.id == current), None)
         self.keyboard = None
         if current is not None and game is None:          # started a moment ago: not in couch mode's list yet
@@ -3208,6 +3278,15 @@ class _Couch:
                              owner=self)
             return
         self.open_quick(game)
+
+    def _game_played(self, playing: list[int]) -> int | None:
+        """Of the running (not suspended) games, the one being played: the last started or continued here — else
+        (a quick menu made for a desktop start knows none) the one started last. It was the first or last of a set,
+        i.e. any of them, with two games running."""
+        if self._last_game in playing:
+            return self._last_game
+        when = {e.id: e.last_played_at or 0 for e in self.entries}
+        return max(playing, key=lambda i: (when.get(i, float("inf")), i), default=None)   # (not listed yet: newest)
 
     def open_quick(self, game) -> None:
         if self._exiting:
@@ -3234,13 +3313,27 @@ class _Couch:
                 self._minimize_timer.stop()
                 self.wc.keep_above(False)
                 self.showMinimized()
-            self.bridge.call(self.bridge.core.library_call("game_processes", e.id),
-                             lambda pids: bring_game_forward(pids), lambda _err: None, owner=self)
+            self.give_game_screen(e.id, f"back to {e.title}")
         if e.id in self.suspended:
             self.bridge.call(self.bridge.core.library_call("resume", e.id), front,
                              lambda err: self.message("Could not continue the game", str(err)), owner=self)
         else:
             front()
+
+    def give_game_screen(self, entry_id: int, why: str) -> None:
+        """The game's window to the front, with the focus. Not tied to this window: the hidden couch mode of a desktop
+        start closes 400 ms after the quick menu, and when the game's processes took longer to list, the answer was
+        dropped — the game never got the focus back. (Steam picks a Steam controller's layout by that focus.) Where
+        the focus landed is written to the log."""
+        def got(pids) -> None:
+            if not bring_game_forward(pids):
+                log.info("%s: the game's window could not be brought forward (%s)", why,
+                         "no processes found" if not pids else "no KWin here")
+                return
+            log.info("%s: asked KWin to bring the game's window forward (%d processes)", why, len(pids))
+            threading.Thread(target=_log_x_focus, args=(why,), name="x-focus", daemon=True).start()
+        self.bridge.call(self.bridge.core.library_call("game_processes", entry_id), got,
+                         lambda err: log.info("%s: the game's processes could not be listed: %s", why, err))
 
     def _starting_ids(self) -> set[int]:
         """Games started from couch mode a moment ago that are not running yet (Steam can take a while)."""
@@ -3353,7 +3446,7 @@ class _Couch:
             browser._tick.stop()                         # (the window outlives couch mode: no more stick steps)
             browser.overlay.hide()
             browser.dlg.close()                          # (a download keeps going: the window only hides)
-        for t in (self._tick, self._clock, self._poll, self._minimize_timer, self._pump, self._idle_away,
+        for t in (self._frame_timer, self._clock, self._poll, self._minimize_timer, self._pump, self._idle_away,
                   self._bpm_timer, self._refocus):
             t.stop()
         self.wc.forget()
@@ -3372,7 +3465,6 @@ class _Couch:
         self.images.shutdown()
         if self._closing_watchdog is not None:
             self._closing_watchdog.stop()
-        self._focus_va.stop()
         self._bg_va.stop()
         try:
             self.pads.stop()
@@ -3380,23 +3472,27 @@ class _Couch:
             log.exception("couch mode: closing the controllers failed")
 
     # ============================================================== animation
-    def _kick_focus(self) -> None:
-        if self.reduce_motion:
-            self._focus_anim = 1.0
-        else:
-            self._focus_va.stop()
-            self._focus_va.setStartValue(0.0)
-            self._focus_va.setEndValue(1.0)
-            self._focus_va.start()
-        if not self._tick.isActive():
-            self._tick.start()
+    FOCUS_GROW = 0.17                                    # seconds the focused tile takes to grow
 
-    def _focus_value(self, v) -> None:
-        self._focus_anim = float(v)
-        if self._focus_rect is not None:                # only the focused tile grows
-            self.update_area(self._focus_rect)
+    def _kick_focus(self) -> None:
+        """The focused tile grows in (by the clock, on every frame of the screen — Qt's own animation stepped at
+        60 Hz on a 120/144 Hz screen)."""
+        if self.reduce_motion:
+            self._focus_anim, self._focus_t0 = 1.0, None
+            return
+        self._focus_t0 = time.perf_counter()
+        self._focus_anim = 0.0
+        self.update()
+
+    def _focus_step(self) -> None:
+        """Start of a frame: how far the focus has grown."""
+        if self._focus_t0 is None:
+            return
+        x = (self.frame_now - self._focus_t0) / self.FOCUS_GROW
+        if x >= 1.0:
+            self._focus_anim, self._focus_t0 = 1.0, None
         else:
-            self.update()
+            self._focus_anim = 1.0 - (1.0 - max(0.0, x)) ** 3          # (out-cubic)
 
     def _bg_value(self, v) -> None:
         self._bg_t = float(v)
@@ -3423,20 +3519,6 @@ class _Couch:
     def _update_bg(self) -> None:
         """The background follows the focus; it changes (with a short fade) once its picture is ready."""
         self.update()
-
-    def _animate(self) -> None:
-        moving = False
-        for k in (0, 1):
-            cur, tgt = self._scroll[k], self._scroll_target[k]
-            if abs(cur - tgt) > 0.5:
-                self._scroll[k] = tgt if self.reduce_motion else cur + (tgt - cur) * 0.22
-                moving = True
-            else:
-                self._scroll[k] = tgt
-        if moving:
-            self.update()
-        elif self._focus_va.state() != QVariantAnimation.Running:
-            self._tick.stop()
 
     # ============================================================== painting
     MIN_DESIGN_H = 600                    # the layouts need at least this many design units of height (1080 = 100 %)
@@ -3479,7 +3561,8 @@ class _Couch:
         to draw (this window when None)."""
         if rect.width() <= 1 and rect.height() <= 1 and not self._dirty:
             return                                      # the frame pump's keep-alive: the picture stays as it is
-        t0 = time.perf_counter()
+        t0 = self.frame_now = time.perf_counter()
+        self._focus_step()
         p = QPainter(device if device is not None else self)
         self.images.frame_dpr = max(1.0, float(self.devicePixelRatioF()))   # (one answer for every tile)
         try:
@@ -3538,6 +3621,11 @@ class _Couch:
         finally:
             p.end()
             self.images.frame_dpr = 0.0
+            if self._focus_t0 is not None:              # still growing: that tile again on the next frame
+                if self._focus_rect is not None:
+                    self.update_area(self._focus_rect)
+                else:
+                    self._schedule_frame()
             opening = getattr(self, "_dl_open", None)
             if opening is not None and opening["data"] is not None and self.tab == T_DOWNLOADS:
                 self._dl_open = None
@@ -4284,9 +4372,7 @@ class _Couch:
         target = max(0.0, i * (tile_w + gap) - (W * 0.33 - left))
         maxoff = max(0.0, len(items) * (tile_w + gap) - gap - (W - 2 * left))
         self._scroll_target[0] = min(target, maxoff)
-        if abs(self._scroll[0] - self._scroll_target[0]) > 0.5 and not self._tick.isActive():
-            self._tick.start()
-        off = self._scroll[0]
+        off = self._scroll[0] = self.ease("home", self._scroll[0], self._scroll_target[0])
         focused_draw = None
         for k, ent in enumerate(items):
             x = left + k * (tile_w + gap) - off
@@ -4356,9 +4442,7 @@ class _Couch:
         elif row_bottom - target > view:
             target = row_bottom - view
         self._scroll_target[1] = max(0.0, target)
-        if abs(self._scroll[1] - self._scroll_target[1]) > 0.5 and not self._tick.isActive():
-            self._tick.start()
-        off = self._scroll[1]
+        off = self._scroll[1] = self.ease("library", self._scroll[1], self._scroll_target[1])
         p.save()
         p.setClipRect(QRectF(0, top - 40 * s, W, bottom - top + 40 * s), Qt.IntersectClip)
         focused_draw = None
@@ -4412,11 +4496,7 @@ class _Couch:
         elif sel * row_h + row_h - target > view:
             target = sel * row_h + row_h - view
         self._dl_t = max(0.0, target)
-        cur = getattr(self, "_dl", 0.0)
-        cur = self._dl_t if self.reduce_motion or abs(cur - self._dl_t) < 0.6 else cur + (self._dl_t - cur) * 0.25
-        if cur != self._dl_t:
-            self._schedule_frame()
-        self._dl = cur
+        cur = self._dl = self.ease("downloads", getattr(self, "_dl", 0.0), self._dl_t)
         p.save()
         p.setClipRect(QRectF(0, y - 10 * s, W, bottom - y + 10 * s), Qt.IntersectClip)
         for k, (kind, d) in enumerate(rows):
@@ -4626,8 +4706,6 @@ class _Couch:
                 p.setBrush(QColor(255, 255, 255, int(255 * a)))
                 p.drawEllipse(QPointF(x + 14 * s + k * 34 * s, r.bottom() - 52 * s), 9 * s, 9 * s)
             p.setBrush(Qt.NoBrush)
-            if not self._tick.isActive():
-                self._tick.start()
             self._schedule_frame(60)
             return
         if o.menu:

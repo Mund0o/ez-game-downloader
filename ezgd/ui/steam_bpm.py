@@ -40,18 +40,49 @@ def active_x_title() -> str:
     return t.group(1) if t else ""
 
 
+_seen = (0.0, False)                                    # (when, answer) of the last look at the processes
+
+
 def steam_running() -> bool:
-    """Is Steam running? (Its pid file, ~/.steam/steam.pid — no process listing needed.)"""
+    """Is Steam running? Its pid file (~/.steam/steam.pid) — no process listing needed. Flatpak's and Snap's Steam
+    keep that file inside their own home (Flatpak's even holds a process id of its own sandbox), so with those
+    installed the processes are looked at instead (named "steam", at most every 3 seconds): the Steam button and
+    Steam's keys were never read there."""
     import os
+    import time
     from pathlib import Path
     forced = os.environ.get("EZGD_STEAM_ROOT")
     if forced and not Path(forced).is_dir():
         return False                                    # (the tests: never this computer's real Steam)
-    try:
-        pid = int((Path.home() / ".steam" / "steam.pid").read_text().strip())
-        return pid > 0 and Path(f"/proc/{pid}").exists() and os.name != "nt"
-    except (OSError, ValueError):
+    if os.name == "nt":
         return False
+    home = Path.home()
+    try:
+        pid = int((home / ".steam" / "steam.pid").read_text().strip())
+        if pid > 0 and Path(f"/proc/{pid}").exists():
+            return True
+    except (OSError, ValueError):
+        pass
+    if forced or not any((home / d).is_dir() for d in (".var/app/com.valvesoftware.Steam", "snap/steam")):
+        return False
+    global _seen
+    now = time.monotonic()
+    if now - _seen[0] >= 3.0:
+        _seen = (now, _steam_process())
+    return _seen[1]
+
+
+def _steam_process(proc: str = "/proc") -> bool:
+    import os
+    for name in os.listdir(proc):
+        if name.isdigit():
+            try:
+                with open(f"{proc}/{name}/comm", encoding="utf-8") as f:
+                    if f.read().strip() == "steam":
+                        return True
+            except OSError:
+                continue
+    return False
 
 
 def big_picture_in_front() -> bool:
@@ -63,12 +94,13 @@ def close_big_picture() -> bool:
     """Close Big Picture (Steam's own ``steam://close/bigpicture``; Steam keeps running, it is never restarted) and
     keep Steam in the background: leaving Big Picture makes Steam show its desktop window, which is minimized again
     as it appears."""
+    from ezgd.platform.steam import steam_command
     from ezgd.ui.window_control import hide_steam_windows
-    steam = shutil.which("steam")
+    steam = steam_command()                               # (Flatpak's Steam too: "flatpak run …")
     if not steam:
         return hide_steam_windows(only_active=True)
     try:
-        subprocess.Popen([steam, "steam://close/bigpicture"], env=host_env(), stdout=subprocess.DEVNULL,
+        subprocess.Popen(steam + ["steam://close/bigpicture"], env=host_env(), stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, start_new_session=True)
     except OSError:
         return hide_steam_windows(only_active=True)

@@ -1030,7 +1030,8 @@ class LibraryManager:
             took = steaminput.took(root, since, steaminput.GAME_LAYOUT)
             got = {a for _c, a in steaminput.activations(root, since)}
             note = ("Steam switched the controller to the game layout (Spacewar 480)" if took else
-                    "no controller switched (none connected, or Steam Input is off for it)" if took is None else
+                    "Steam logged no switch (no controller connected, Steam Input off for it, or the game layout "
+                    "was already in use)" if took is None else
                     f"Steam did not take the game layout (switched to {sorted(got)})")
             log.info("game %s: %s", e.id, note)
             try:
@@ -1039,6 +1040,42 @@ class LibraryManager:
             except OSError:
                 pass
         threading.Thread(target=check, daemon=True, name=f"steam-input-{e.id}").start()
+
+    def hold_input_layout(self, entry_id: int) -> int:
+        """The quick menu is about to take the focus over this game: Steam keeps the game's own controller layout
+        while it is open (see steaminput — the menu's focus made Steam take away the virtual pad the game reads, and
+        bring a new one back afterwards). Only when Steam has the game's layout now and a virtual pad to keep (a
+        layout that sends keys has none: the menu then gets Steam's desktop layout, as before). Returns the token for
+        let_go_input_layout (0: nothing held)."""
+        if not (IS_LINUX and steaminput.enabled()) or entry_id in self._suspended or not self.is_running(entry_id):
+            return 0
+        if self.input_layout.games:
+            return 0                                       # forced already: kept through the menu anyway
+        root = self.steam_root()
+        app = steaminput.game_layout_now(root)
+        pads = steaminput.virtual_pads()
+        if app is None or not pads:
+            log.info("quick menu over game %s: Steam's layout left alone (%s)", entry_id,
+                     "Steam has no game layout now" if app is None else "no virtual pad to keep")
+            return 0
+        t = time.monotonic()
+        token = self.input_layout.hold(entry_id, app)
+        log.info("quick menu over game %s: Steam keeps its layout (app %s, pads %s) while the menu is open "
+                 "(%.0f ms)", entry_id, app, ", ".join(pads), (time.monotonic() - t) * 1000)
+        return token
+
+    def let_go_input_layout(self, token: int) -> bool:
+        """The quick menu is gone: the layout it kept is released (Steam follows the focus again)."""
+        held = self.input_layout.held
+        if not token or held is None:
+            return False
+        running = self.is_running(held[0])
+        others = [i for i in self.running_ids() if i != held[0]]
+        done = self.input_layout.let_go(token, running=running, others=bool(others))
+        if done:
+            log.info("quick menu closed: Steam follows the focus again (game %s %s)", held[0],
+                     "goes on" if running else "ended")
+        return done
 
     def _input_layout_ended(self, entry_id: int, how: str = "") -> None:
         """A game ended: a forced layout goes back to Steam with the last one — via the desktop layout when no game

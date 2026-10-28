@@ -24,10 +24,14 @@ the focus, until ``…/0``. Measured on Steam (2026-10-27, with a controller, re
   once Steam logged the first.
 
 The app forces Spacewar's layout (480 — the one OnlineFix games already get, Steam's gamepad template unless the
-player changed it) only for direct starts Steam cannot know, and leaves everything else to Steam. The quick menu
-changes nothing: over a forced game the controller stays the game's virtual pad (the menu reads that pad too — taking
-it away made the pad disappear and come back as a new device, which a game may never pick up again); over a game
-Steam knows, Steam itself gives the menu its desktop layout and the game its layout back when it has the focus again.
+player changed it) only for direct starts Steam cannot know, and leaves everything else to Steam. The quick menu keeps
+the game's layout: over a forced game nothing changes (the controller stays the game's virtual pad, which the menu
+reads too); over a game Steam knows (OnlineFix games as Spacewar, games Steam started) the menu would get Steam's
+desktop layout the moment it takes the focus — Steam's virtual pad, the one the game reads, goes away and comes back
+as a new device when the game has the focus again (a game may never pick it up again: a friend's Steam Controller
+"fell off a cliff" after the menu). So the layout Steam chose for the focused game (its own log says which: ``to game
+window type: AppID N``) is forced just before the menu takes the focus, and released once the game has it back
+(:meth:`Forced.hold` / :meth:`Forced.let_go`).
 While a game runs, Steam's choices are written to the app's log (evidence for the next report), and a forced layout
 Steam lost (a Steam restart) is asked for again. A marker file remembers a forced layout, so one left by a crashed
 app is handed back at the next start.
@@ -49,6 +53,7 @@ GAME_LAYOUT = 480                # Spacewar: what OnlineFix games already get
 DESKTOP = 413080                 # Steam's desktop configuration
 BIG_PICTURE = 413090             # Steam's Big Picture configuration
 CHORD = 443510                   # Steam's guide-chord configuration (while the Steam button is held)
+CLIENT_UI = 769                  # Steam's own windows and on-screen keyboard
 ACTIVATED = re.compile(r"Queueing activation for controller: (\d+) app: (-?\d+)")
 FOCUS = re.compile(r"OnFocusWindowChanged (.+?)\s*$")
 NAMES = {DESKTOP: "desktop", BIG_PICTURE: "Big Picture", CHORD: "Steam button", GAME_LAYOUT: "game (Spacewar)"}
@@ -105,7 +110,7 @@ def read_focus(root: Path | None, since: int) -> tuple[list[str], int]:
     return [m.group(1) for m in map(FOCUS.search, text.splitlines()) if m], end
 
 
-def took(root: Path | None, since: int, appid: int, wait: float = 6.0) -> bool | None:
+def took(root: Path | None, since: int, appid: int, wait: float = 6.0, step: float = 0.5) -> bool | None:
     """Did Steam switch a controller to ``appid``'s layout? None: no controller switched at all (none connected,
     or Steam Input is off for it — nothing to judge)."""
     end = time.monotonic() + wait
@@ -115,7 +120,52 @@ def took(root: Path | None, since: int, appid: int, wait: float = 6.0) -> bool |
             return True
         if time.monotonic() >= end:
             return False if got else None
-        time.sleep(0.5)
+        time.sleep(step)
+
+
+GAME_WINDOW = re.compile(r"OnFocusWindowChanged (?:to game window type: AppID|URL Forcing to window type: "
+                         r"k_EWindowTypeGame,) (\d+)")
+
+
+def game_layout_now(root: Path | None) -> int | None:
+    """The game layout Steam has now, from its last decision (controller_ui.txt): ``to game window type: AppID N``
+    for the focused game — or ``URL Forcing … N``: a layout forced by a link stays Steam's until the next focus
+    change, also after ``…/0`` (the quick menu's own hold, released while the game had the focus again: the next
+    opening found "no game layout" and Steam took the pad away). Steam's own windows and keyboard flashing up in
+    between (the Steam button) are skipped; the desktop and Steam's other layouts mean no game layout (None)."""
+    if root is None:
+        return None
+    try:
+        with open(root / "logs" / "controller_ui.txt", "rb") as fh:
+            size = fh.seek(0, 2)
+            fh.seek(max(0, size - 64 * 1024))
+            text = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    for line in reversed(text.splitlines()):
+        if "OnFocusWindowChanged" not in line:
+            continue
+        m = GAME_WINDOW.search(line)
+        if m:
+            app = int(m.group(1))
+            return None if app in (DESKTOP, BIG_PICTURE, CLIENT_UI, CHORD) else app
+        if "ClientUI" in line or "On Screen Keyboard" in line:
+            continue
+        return None
+    return None
+
+
+def virtual_pads(base: Path = Path("/sys/class/input")) -> list[str]:
+    """Steam's virtual pads now (Steam Input: vendor 28de, product 11ff) — what a game reads the controller from."""
+    out = []
+    for d in base.glob("input*"):
+        try:
+            if (d / "id" / "vendor").read_text().strip() == "28de" and \
+                    (d / "id" / "product").read_text().strip() == "11ff":
+                out.append(d.name)
+        except OSError:
+            continue
+    return sorted(out)
 
 
 def name(appid: int) -> str:
@@ -148,11 +198,55 @@ class Forced:
         self._next_try = 0.0
         self._generation = 0               # bumped by every start: a hand-back under way must not undo it
         self._from: tuple[int, int] | None = None    # where the next watcher starts reading Steam's two logs
+        self._held: tuple[int, int] | None = None    # (game, app) whose layout is kept while the quick menu is open
+        self._hold_token = 0               # bumped by every hold: a release meant for an earlier opening is ignored
 
     @property
     def active(self) -> bool:
-        """A game layout is forced."""
-        return bool(self.games)
+        """A game layout is forced (also only while the quick menu is open)."""
+        return bool(self.games) or self._held is not None
+
+    @property
+    def held(self) -> tuple[int, int] | None:
+        return self._held
+
+    def hold(self, entry_id: int, appid: int, wait: float = 1.5) -> int:
+        """The quick menu is about to take the focus over a game Steam knows: keep its layout ``appid`` (forced) until
+        :meth:`let_go`. Returns once Steam switched (at most ``wait`` s), with a token for let_go (0: nothing to do —
+        a game layout is forced already)."""
+        with self._lock:
+            self._hold_token += 1
+            if self.games:
+                return 0
+            token = self._hold_token
+            again = self._held is not None and self._held[1] == appid
+            self._held = (entry_id, appid)
+            if again:
+                return token                   # (opened again before the last release: still held)
+            root = self._root() if self._root else None
+            since = log_size(root)
+            self._remember(appid)
+            self._ask(appid)
+        if root is not None:
+            took(root, since, appid, wait=wait, step=0.03)
+        return token
+
+    def let_go(self, token: int, running: bool, others: bool = False) -> bool:
+        """The quick menu is gone (``token`` from its :meth:`hold`). The game still ``running``: Steam follows the focus
+        again from the next change (``…/0`` keeps the layout until then — the game's own, it has the focus back).
+        Ended meanwhile: handed back as for a forced game (``others``: games of the app still run)."""
+        with self._lock:
+            if token != self._hold_token or self._held is None:
+                return False                   # (opened again since, or handed back already)
+            self._held = None
+            if self.games:
+                return False                   # a game started meanwhile is forced: its layout stays
+            if running:
+                self._ask(0)
+                self._forget()
+                return True
+        self.hand_back(desktop=not others)
+        return True
 
     def _remember(self, appid: int) -> None:
         try:
@@ -248,6 +342,11 @@ class Forced:
         """The game ended. True when it was the last forced one: the layout is handed back (``desktop``: no game of
         the app is left, so the desktop layout is switched to first — see :meth:`hand_back`)."""
         self.unwatch(entry_id)
+        if self._held is not None and self._held[0] == entry_id:
+            self._held = None                  # the game the quick menu kept the layout for ended (quit from it)
+            if not self.games:
+                self.hand_back(desktop=desktop)
+                return True
         if entry_id not in self.games:
             return False
         self.games.discard(entry_id)
@@ -263,6 +362,7 @@ class Forced:
         background."""
         with self._lock:
             self.games.clear()
+            self._held = None
             self._tries = 0
             self._next_try = 0.0
             generation = self._generation

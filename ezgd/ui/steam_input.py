@@ -23,7 +23,6 @@ Nothing of Steam's is ever changed: its files and logs are only read.
 from __future__ import annotations
 
 import logging
-import os
 import re
 from pathlib import Path
 
@@ -273,37 +272,38 @@ def steam_root() -> Path | None:
         return None
 
 
-def _tail(path: Path, size: int = 256 * 1024) -> str:
-    try:
-        with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            n = f.tell()
-            f.seek(max(0, n - size))
-            return f.read().decode("utf-8", "replace")
-    except OSError:
-        return ""
-
-
-_log_cache: dict[str, tuple[tuple, list]] = {}
+FIRST_READ = 16 * 1024 * 1024      # a log is read whole the first time (up to this much of its end), then only what
+#                                    Steam adds — the line naming the layout is written when Steam loads it, and a
+#                                    long session can push it far back (it used to be looked for in the last 256 KB
+#                                    only: past that, a player's own layout silently became Steam's default)
+_log_cache: dict[str, tuple[int, int, list]] = {}       # log → (inode, bytes read, lines found)
 
 
 def _loaded_lines(path: Path) -> list[tuple[str, str, str]]:
-    """(timestamp, controller, path) of every desktop-configuration load in one log — read again only when it
-    changed."""
+    """(timestamp, controller, path) of every desktop-configuration load in one log (the whole current log; only
+    what was added since is read again)."""
     try:
         st = path.stat()
-        key = (st.st_size, st.st_mtime_ns, st.st_ino)
     except OSError:
         return []
-    hit = _log_cache.get(str(path))
-    if hit is not None and hit[0] == key:
-        return hit[1]
-    found = []
-    for line in _tail(path).splitlines():
-        m = _LOADED.search(line)
-        if m:
-            found.append((line[1:20] if line.startswith("[") else "", m.group(1), m.group(2)))
-    _log_cache[str(path)] = (key, found)
+    ino, pos, found = _log_cache.get(str(path), (None, 0, []))
+    if ino != st.st_ino or st.st_size < pos:                 # a new log (Steam restarted) or emptied: from the top
+        ino, pos, found = st.st_ino, max(0, st.st_size - FIRST_READ), []
+    if st.st_size == pos:
+        return found
+    try:
+        with open(path, "rb") as f:
+            f.seek(pos)
+            data = f.read(st.st_size - pos)
+    except OSError:
+        return found
+    end = data.rfind(b"\n") + 1                             # a line Steam is still writing: next time
+    if b"Loaded Config for" in data[:end]:                  # (most of a log is other lines: skipped fast)
+        lines = (ln for ln in data[:end].decode("utf-8", "replace").splitlines() if "Loaded Config for" in ln)
+        found = found + [(line[1:20] if line.startswith("[") else "", m.group(1), m.group(2))
+                         for line in lines for m in [_LOADED.search(line)] if m]
+    found = found[-50:]                                      # (only the latest per controller matters)
+    _log_cache[str(path)] = (ino, pos + end, found)
     return found
 
 
@@ -319,6 +319,9 @@ def logged_desktop_configs(root: Path) -> dict[str, Path]:
             path = root / path
         out[ctl] = path
     return out
+
+
+_said: tuple = ()                 # what the log last said the buttons send
 
 
 class DesktopKeys:
@@ -366,7 +369,9 @@ class DesktopKeys:
             keys = dict(DEFAULT_KEYS["gordon" if kind == "gordon" else "neptune"])
             used = f"built-in {kind or 'neptune'} defaults"
         keys = normalise(keys)
-        if keys != self.keys or used != self.source:
+        global _said
+        if (used, keys) != _said:                        # (once per change — each listener starts empty)
+            _said = (used, keys)
             log.info("Steam controller: buttons read from %s — %s", used,
                      ", ".join(f"{k}={v}" for k, v in sorted(keys.items())))
         self.keys, self.labels, self.source = keys, labels, used

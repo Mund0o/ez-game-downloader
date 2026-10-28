@@ -54,6 +54,7 @@ def _log_pad(fmt: str, name: str, *args) -> None:
     if not quiet:
         _pad_logged[key] = now
     (log.debug if quiet else log.info)(fmt, name, *args)
+_steam_hw_logged = False                            # what the log last said about a Valve controller
 HOME_HOLD = 0.8                                     # seconds the guide button is held for the quick menu
 DUPLICATE_WINDOW = 0.25                             # the same press from two devices (Steam's virtual pad + the real):
 #                                                     Steam's copy can come late — even after the real button is up
@@ -185,6 +186,7 @@ class Gamepads(QObject):
         self.devices: dict[str, _Device] = {}
         self._denied: set[str] = set()
         self._held: str | None = None
+        self._held_by: str | None = None                 # the device holding that direction
         self._held_since = 0.0
         self._last: dict[str, tuple[float, str]] = {}
         self._raw_owner: dict[str, tuple[str, float, bool]] = {}    # button → (device, pressed at, still down)
@@ -195,6 +197,7 @@ class Gamepads(QObject):
         self._home_timer.timeout.connect(self.home_held.emit)
         self.family = ""                                 # "" until a controller is connected
         self.steam_hw = False                            # a Valve controller is plugged in (see steam_products)
+        self.steam_up = False                            # … and Steam runs (only then can keys come from it)
         from ezgd.ui.steam_input import DesktopKeys, GuideWatch
         self.desktop = DesktopKeys()                     # … the keys Steam turns its buttons into (steam_input)
         self.guide = GuideWatch(self)                    # … and its Steam button, from Steam's log
@@ -263,14 +266,16 @@ class Gamepads(QObject):
         return any(not d.virtual and d.family == "steam" for d in self.devices.values())
 
     def steam_key(self, qt_key: int) -> str | None:
-        """A key that Steam sent for its controller's button → the couch action of that button (None: not one)."""
-        if not self.steam_hw or self._steam_direct():
+        """A key that Steam sent for its controller's button → the couch action of that button (None: not one).
+        Only while Steam runs: without Steam no key comes from the controller (a Steam Controller's receiver is
+        always plugged in), and the keyboard's own Space, Tab or Page Down meant B, ✕ and Manage."""
+        if not self.steam_as_keys():
             return None
         return self.desktop.action(qt_key)
 
     def steam_as_keys(self) -> bool:
         """Steam has the Valve controller and turns it into keys and mouse input (outside games)."""
-        return self.steam_hw and not self._steam_direct()
+        return self.steam_hw and self.steam_up and not self._steam_direct()
 
     def reachable(self, action: str) -> bool:
         """Can the controller in use do ``action`` here? Always — except a Steam controller sent as keys, whose
@@ -302,9 +307,11 @@ class Gamepads(QObject):
     def rescan(self) -> None:
         products = steam_products()
         steam_hw = bool(products)
+        self.steam_up = False
         if steam_hw and not self._steam_direct():
             from ezgd.ui import steam_bpm
-            if steam_bpm.steam_running():
+            self.steam_up = steam_bpm.steam_running()
+            if self.steam_up:
                 self.desktop.update(products)
                 self.guide.start()
             else:
@@ -313,8 +320,11 @@ class Gamepads(QObject):
             self.guide.stop()
         if steam_hw != self.steam_hw:
             self.steam_hw = steam_hw
-            log.info("Steam controller %s", "connected (Steam may hand it over as keyboard and mouse)" if steam_hw
-                     else "gone")
+            global _steam_hw_logged
+            if steam_hw != _steam_hw_logged:             # (once per change, not per listener: the desktop's and each
+                _steam_hw_logged = steam_hw              #  quick menu's controllers start "not connected")
+                log.info("Steam controller %s", "connected (Steam may hand it over as keyboard and mouse)"
+                         if steam_hw else "gone")
             if steam_hw and not self.devices:
                 self._set_family("steam")
             elif not steam_hw and self.family == "steam" and not self.devices:
@@ -358,6 +368,7 @@ class Gamepads(QObject):
         dev = self.devices.pop(path, None)
         if dev is None:
             return
+        self._let_go(path)
         if dev.notifier is not None:
             dev.notifier.setEnabled(False)
             try:
@@ -371,6 +382,24 @@ class Gamepads(QObject):
         except OSError:
             pass
         _log_pad("controller disconnected: %s", dev.name)
+
+    def _let_go(self, path: str) -> None:
+        """A controller went away with a direction or buttons held (unplugged — or Steam took its virtual pad away to
+        switch a Steam controller's layout): they are let go. Its release never comes: a held stick kept scrolling
+        forever, a held guide button opened the quick menu by itself, and a held button stayed "down" — the same
+        button from the pad Steam made next was dropped as a copy."""
+        if self._held is not None and self._held_by == path:
+            self._held = self._held_by = None
+            self._repeat.stop()
+        for name, (owner, _at, down) in list(self._raw_owner.items()):
+            if owner != path:
+                continue
+            del self._raw_owner[name]
+            if down:
+                if name == "home":
+                    self._home_timer.stop()
+                self.button.emit(name, False)            # (a held click in the couch browser is let go)
+        self._raw_ignored = {(n, p) for n, p in self._raw_ignored if p != path}
 
     # --------------------------------------------------------------- input
     def _read(self, path: str) -> None:
@@ -398,6 +427,8 @@ class Gamepads(QObject):
             if name is None:
                 return
             if code in BTN_DPAD:
+                if value == 2:
+                    return                       # the kernel's own key repeat: holding repeats here (as buttons do)
                 self._direction(dev, name if value else None, name)
             else:
                 if value in (0, 1):
@@ -450,7 +481,7 @@ class Gamepads(QObject):
                 self._repeat.stop()
             return
         self._emit(dev, pressed)
-        self._held = pressed
+        self._held, self._held_by = pressed, dev.path
         self._held_since = time.monotonic()
         self._repeat.setInterval(int(REPEAT_EVERY * 1000))
         self._repeat.start()

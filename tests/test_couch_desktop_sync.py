@@ -23,8 +23,10 @@ def test_a_suspended_game_shows_on_the_desktop_with_resume(ui, qtbot, tmp_path):
     assert lib._status_text(lib.entries[a.id]) == "Suspended"
     lib._render(a.id)
     from PySide6.QtWidgets import QPushButton
-    texts = [b.text().strip() for b in lib.findChildren(QPushButton) if b.isVisible()]
-    assert "Resume" in texts and "Stop" in texts
+
+    def texts():                       # (a new page's buttons show a moment later, the old ones go a moment later:
+        return [b.text().strip() for b in lib.findChildren(QPushButton) if b.isVisible()]    # read once settled)
+    qtbot.waitUntil(lambda: "Resume" in texts() and "Stop" in texts(), timeout=5000)
     couch = _open_couch(win, qtbot)                                  # couch mode knows it is suspended
     assert a.id in couch.suspended and couch.state_text(next(e for e in couch.entries if e.id == a.id)) == \
         "Suspended"
