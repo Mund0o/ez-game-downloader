@@ -1051,7 +1051,7 @@ See **TEST_REPORT.md** for the results of the last run.
 
 | Symptom | What to do |
 |---|---|
-| *Source unavailable* banner | The site is down or blocked on your network; cached results are shown. *Retry* later. |
+| *Source unavailable* banner | The site is down or blocked on your network; cached results are shown. *Retry* later. A site whose address could not be found or that refused the connection is tried twice more first (after 1 s and 3 s; 0.6.8) — a moment's DNS hiccup no longer needs *Try again* — and the message says so in words ("… could not be found", "could not connect to …"). |
 | *Layout changed* | The site's HTML changed. Use *Report a problem* (saves a local report in the data folder) and update the app. |
 | `CERTIFICATE_VERIFY_FAILED` for a source | Your system clock may be wrong, or a network middlebox intercepts TLS. The app never disables verification. |
 | Torrent stays at *Fetching metadata* / *Stalled* | Nobody is sharing it right now, or your firewall blocks the listen port (Settings → Torrents; try enabling UPnP or forwarding the port). |
@@ -1110,7 +1110,13 @@ that PC can check:
   Souls III and in Bloodborne, with *Our overlay* on and off: hold the Steam button, close the menu, play on. Steam's
   rules behind it were measured on Steam itself (a forced layout survives focus changes, the Steam button and Big
   Picture; `forceinputappid/0` switches nothing until the focus moves), but not with a Steam Controller — the log says
-  what Steam chose at every step.
+  what Steam chose at every step. **Reported broken on 0.6.7** (2026-10-28): after opening and closing the quick menu
+  the game takes up/down but not A, the mouse pointer shows over the menu, and with *Our overlay* off the controller
+  does nothing in the game at all. Not fixed yet — it needs the `ezgd.log` of such a run (Settings → *Open log
+  folder*) to see which layout Steam chose when.
+
+* **Pages of a site that is "not found" for a moment (0.6.8)** — a tester's cracked-games.org page said *could not
+  resolve … Name or service not known* and loaded on the second *Try again*; the app now tries twice more by itself.
 
 * **Joining from the quick menu (0.6.5)** — a friend opens a lobby in the game (hosts / creates a lobby), sends an
   invite from the quick menu (*Invite* now says when the game gave Steam nothing to invite to), the other presses

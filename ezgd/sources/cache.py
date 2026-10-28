@@ -15,7 +15,7 @@ import httpx
 
 from ezgd.database.repositories import CachedResponse, HttpCacheRepository
 from ezgd.net.client import FetchResult, HttpError, SafeHttpClient
-from ezgd.net.urls import UnsafeURLError
+from ezgd.net.urls import LookupFailed, UnsafeURLError, host_of
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +24,19 @@ KEEP_HEADERS = ("content-type", "x-wp-total", "x-wp-totalpages", "etag", "last-m
 
 class SourceUnavailableError(Exception):
     """Network problem or server error; the site could not be reached."""
+
+
+def _why(url: str, exc: BaseException) -> str:
+    """Why a page could not be loaded, as the player reads it. A site that could not be found or reached (after the
+    connection's own tries, see net.client.GuardedBackend) says so in words — it showed "OSError: could not resolve
+    cracked-games.org: Name or service not known"."""
+    if isinstance(exc, LookupFailed):
+        what = str(exc)
+    elif isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        what = f"could not connect to {host_of(url)} ({str(exc) or type(exc).__name__})"
+    else:
+        return f"{type(exc).__name__}: {exc}"
+    return f"{what}. The site or the connection is down for the moment — try again in a minute."
 
 
 @dataclass
@@ -74,7 +87,7 @@ class CachedFetcher:
             if cached:
                 log.warning("Serving stale cache for %s (%s)", url, exc)
                 return Fetched(url, cached.status, cached.body, cached.headers, from_cache=True, stale=True)
-            raise SourceUnavailableError(f"{type(exc).__name__}: {exc}") from exc
+            raise SourceUnavailableError(_why(url, exc)) from exc
 
         if res.status == 304 and cached:
             if self.cache:

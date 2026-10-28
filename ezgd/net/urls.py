@@ -17,6 +17,10 @@ class UnsafeURLError(ValueError):
     """The URL is malformed or points somewhere the app must not connect to."""
 
 
+class LookupFailed(OSError):
+    """The site's address could not be found (DNS). Often only for a moment — the connection tries again."""
+
+
 def is_public_ip(addr: str) -> bool:
     """True only for globally routable unicast addresses."""
     try:
@@ -97,7 +101,7 @@ async def resolve_public(host: str, port: int, *, allow_private: bool = False) -
     try:
         infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
-        raise OSError(f"could not resolve {host}: {exc.strerror or exc}") from exc
+        raise LookupFailed(f"{host} could not be found ({exc.strerror or exc})") from exc
     addrs = []
     for family, _t, _p, _c, sockaddr in infos:
         if family not in (socket.AF_INET, socket.AF_INET6):
@@ -108,5 +112,5 @@ async def resolve_public(host: str, port: int, *, allow_private: bool = False) -
         if addr not in addrs:
             addrs.append(addr)
     if not addrs:
-        raise OSError(f"no usable address for {host}")
+        raise LookupFailed(f"{host} could not be found (no usable address)")
     return addrs

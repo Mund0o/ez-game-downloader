@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import AsyncIterator, Mapping
@@ -23,7 +24,7 @@ import httpx
 from ezgd import __version__
 from ezgd.net.ratelimit import HostRateLimiter
 from ezgd.net.tls import ssl_context
-from ezgd.net.urls import UnsafeURLError, host_of, resolve_public, resolve_redirect, validate_url
+from ezgd.net.urls import LookupFailed, UnsafeURLError, host_of, resolve_public, resolve_redirect, validate_url
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +36,15 @@ REDIRECT_CODES = {301, 302, 303, 307, 308}
 
 
 class GuardedBackend(httpcore.AsyncNetworkBackend):
+    """Connects only to vetted addresses. A connection that failed at once — the site's address not found, or
+    refused / unreachable — is tried again after RETRY_DELAYS: a DNS hiccup of a moment showed "could not load the
+    page" until the player pressed Try again (a friend, cracked-games.org, 2026-10-28). A try that took long to fail
+    (a timeout) is not repeated: that wait was long enough already. Nothing has been sent before a connection
+    exists, so this is safe for every request."""
+
+    RETRY_DELAYS = (1.0, 3.0)      # seconds before the second and the third try
+    QUICK_FAILURE = 5.0            # a try that failed after longer than this is not repeated
+
     def __init__(self, allow_private: bool = False):
         self.allow_private = allow_private
         self._inner = httpcore.AnyIOBackend()
@@ -42,6 +52,24 @@ class GuardedBackend(httpcore.AsyncNetworkBackend):
     async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
         if isinstance(host, bytes):
             host = host.decode("ascii")
+        tries = 0
+        while True:
+            tries += 1
+            began = time.monotonic()
+            try:
+                stream = await self._connect_once(host, port, timeout, local_address, socket_options)
+            except (LookupFailed, httpcore.ConnectError) as exc:
+                if tries > len(self.RETRY_DELAYS) or time.monotonic() - began > self.QUICK_FAILURE:
+                    raise
+                delay = self.RETRY_DELAYS[tries - 1]
+                log.debug("%s: %s — trying again in %g s", host, exc or type(exc).__name__, delay)
+                await self.sleep(delay)
+                continue
+            if tries > 1:
+                log.info("%s reached on try %d", host, tries)
+            return stream
+
+    async def _connect_once(self, host, port, timeout, local_address, socket_options):
         addrs = await resolve_public(host, port, allow_private=self.allow_private)
         last_exc: Exception | None = None
         for addr in addrs:
