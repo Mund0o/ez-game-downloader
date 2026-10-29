@@ -339,6 +339,8 @@ def test_the_steam_button_is_read_from_steams_log(tmp_path, qtbot):
 
 
 def test_a_steam_button_logged_is_home_unless_the_controller_said_so(qtbot, monkeypatch):
+    """A tap Steam logged is "home"; a long press is Steam's own — its chord (the right pad moves the mouse): the
+    quick menu opening when it ended took that away from a Steam Controller in games (2026-10-29)."""
     import time
     pads = gamepad.Gamepads()
     got = []
@@ -347,10 +349,10 @@ def test_a_steam_button_logged_is_home_unless_the_controller_said_so(qtbot, monk
     pads.steam_hw = True
     pads._steam_guide(False)
     pads._steam_guide(True)
-    assert got == ["home", "held"] and pads.family == "steam"
+    assert got == ["home"] and pads.family == "steam"
     pads._home_seen = time.monotonic()                               # a DualSense's PS button, read directly
     pads._steam_guide(False)
-    assert got == ["home", "held"]                                   # the same press: not twice
+    assert got == ["home"]                                           # the same press: not twice
     pads.stop()
 
 

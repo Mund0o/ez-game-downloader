@@ -1551,11 +1551,16 @@ class LibraryManager:
         return False
 
     def steam_overlay_game_ids(self) -> set[str]:
-        """The game ids Steam's overlay runs under in the app's running games — what Steam's overlay windows are
+        """The game ids Steam's overlay runs under in the app's running games (see steam_overlay_ids_by_game)."""
+        return set().union(*self.steam_overlay_ids_by_game().values())
+
+    def steam_overlay_ids_by_game(self) -> dict[int, set[str]]:
+        """Per running game of the app, the game ids its Steam overlay runs under — what Steam's overlay windows are
         known by (steambridge.Bridge.guard_guide): ``SteamOverlayGameId`` / ``SteamGameId`` of each game process that
-        has Steam's overlay library preloaded ("0": the overlay without a game id)."""
-        out: set[str] = set()
+        has Steam's overlay library preloaded ("0": the overlay without a game id). Games without it are left out."""
+        found: dict[int, set[str]] = {}
         for eid in self.running_ids():
+            out: set[str] = set()
             for pid in self.game_processes(eid):
                 try:
                     raw = Path(f"/proc/{pid}/environ").read_bytes()
@@ -1569,7 +1574,9 @@ class LibraryManager:
                 ids = {env.get(k, b"").decode("ascii", "replace").strip()
                        for k in (b"SteamOverlayGameId", b"SteamGameId")}
                 out |= {i for i in ids if i.isdigit()} or {"0"}
-        return out
+            if out:
+                found[eid] = out
+        return found
 
     # ------------------------------------------------- suspend / resume (quick menu)
     def game_processes(self, entry_id: int) -> list[int]:

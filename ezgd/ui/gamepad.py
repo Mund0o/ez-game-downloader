@@ -356,15 +356,18 @@ class Gamepads(QObject):
         return self.desktop.labels
 
     def _steam_guide(self, held: bool) -> None:
-        """Steam logged its Steam button: a tap means "home", a long hold the quick menu — unless the button was read
-        from the controller itself just now (the same press)."""
+        """Steam logged its Steam button: a tap means "home" (over a game: the quick menu) — unless the button was read
+        from the controller itself just now (the same press). A long press is Steam's own: Steam skips it ("Guide
+        button skipped due to length") because it was its chord — the right pad moving the mouse, the triggers
+        clicking, … —, and so does the app now: opening the quick menu when it ended took the mouse away from a
+        friend's Steam Controller in games (2026-10-29)."""
         if time.monotonic() - self._home_seen < 1.5 or self._steam_direct():
             return
         self._set_family("steam")
         if held:
-            self.home_held.emit()
-        else:
-            self.action.emit("home")
+            log.info("Steam button held: Steam's own (its chord — the right pad moves the mouse), not the quick menu")
+            return
+        self.action.emit("home")
 
     def rescan(self) -> None:
         products = steam_products()

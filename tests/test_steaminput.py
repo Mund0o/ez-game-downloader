@@ -123,6 +123,45 @@ def test_a_forced_layout_is_kept_through_the_steam_button_and_the_menu(tmp_path,
     assert f.end(1, desktop=False) and sent[-1] == "steam://forceinputappid/0"
 
 
+def test_a_chord_layout_left_on_after_the_steam_button_is_asked_away(tmp_path, monkeypatch, caplog):
+    """A friend's Steam Controller "half worked" after the quick menu — the sticks reached the game, the buttons did
+    not — until the Steam button was pressed again (2026-10-29): what Steam's chord layout does while it is on. If
+    Steam stays on it after the button was let go, that is logged and the game's layout asked for again. A normal
+    press (chord, let go, the game's layout back) and a press still held are left alone."""
+    import logging
+    caplog.set_level(logging.INFO, logger="ezgd.platform.steaminput")
+    root, sent, opener = fake_steam(tmp_path)
+    monkeypatch.setattr(steaminput.Forced, "WATCH_SECONDS", 0.05)
+    monkeypatch.setattr(steaminput.Forced, "STUCK_CHORD_SECONDS", 0.3)
+    log, ui = root / "logs" / "controller.txt", root / "logs" / "controller_ui.txt"
+    ui.write_text("")
+    game_layout = "steam://forceinputappid/480"
+
+    def steam(*apps, let_go=False):
+        with open(log, "a") as fh:
+            for a in apps:
+                fh.write(f"[2026-10-29 01:20:00] Queueing activation for controller: 0 app: {a}\n")
+        if let_go:
+            with open(ui, "a") as fh:
+                fh.write(f"[2026-10-29 01:20:00] {steaminput.GUIDE_TAP}\n")
+    f = steaminput.Forced(tmp_path / "marker", opener, root=lambda: root)
+    f.start(1)
+    assert sent == [game_layout]
+    time.sleep(0.2)
+    steam(443510, 480, let_go=True)                    # a press: the chord, then the game's layout again
+    time.sleep(0.6)
+    assert sent == [game_layout] and "kept its Steam-button layout" not in caplog.text
+    steam(443510)                                      # held (the chord in use: the right pad is the mouse)
+    time.sleep(0.6)
+    assert sent == [game_layout]
+    steam(let_go=True)                                 # let go — and Steam stays on the chord layout
+    assert until(lambda: len(sent) == 2) and sent[-1] == game_layout
+    assert "Steam kept its Steam-button layout after the button was let go" in caplog.text
+    time.sleep(0.5)
+    assert len(sent) == 2                              # (once: the game's layout is Steam's again)
+    assert f.end(1, desktop=False)
+
+
 def test_a_line_steam_is_still_writing_is_read_next_time(tmp_path):
     root, _sent, _opener = fake_steam(tmp_path)
     log = root / "logs" / "controller.txt"

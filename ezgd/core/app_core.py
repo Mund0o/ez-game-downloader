@@ -662,8 +662,11 @@ class AppCore:
         or our overlay is switched off (a crashed app: Steam takes it back by itself 30 s later). Shift+Tab never
         reaches Steam's overlay anyway (LibraryManager.quick_menu_key)."""
         want: frozenset[str] = frozenset()
+        by_game: dict[int, set[str]] = {}
         if self.settings.settings.own_overlay and self.library.running_ids():
-            want = frozenset(await asyncio.to_thread(self.library.steam_overlay_game_ids))
+            by_game = await asyncio.to_thread(self.library.steam_overlay_ids_by_game)
+            want = frozenset(set().union(*by_game.values()))
+        self._overlay_ids = by_game                      # (steam_overlay_busy / steam_overlay_show read it)
         have, at = getattr(self, "_guide_guard", (frozenset(), 0.0))
         now = time.monotonic()
         if want == have and (not want or now - at < self.GUIDE_RENEW):
@@ -692,6 +695,40 @@ class AppCore:
         elif r.startswith("on:") and r != getattr(self, "_guide_held", "on:0"):
             self._guide_held = r
             log.info("our overlay: Steam's overlay held back from %s Steam-button press(es) so far", r[3:])
+
+    async def steam_overlay_busy(self, entry_id: int) -> bool:
+        """Is Steam's overlay open in this game (opened from the quick menu), or was the Steam button just handed to it
+        to close it? Then that press is Steam's: the quick menu does not open over it."""
+        ids = getattr(self, "_overlay_ids", {}).get(entry_id)
+        if not ids or not self.settings.settings.own_overlay:
+            return False
+        from ezgd.platform.steambridge import BridgeError
+        try:
+            st = await self._bridge().overlay_state(sorted(ids))
+        except BridgeError:
+            return False
+        passed = st.get("passed", -1)
+        return bool(st.get("open")) or (isinstance(passed, (int, float)) and 0 <= passed < 1500)
+
+    async def steam_overlay_show(self, entry_id: int) -> str:
+        """Steam's overlay over this game (the quick menu's "Steam overlay"): friends, the browser, guides — Steam's
+        own. While it is open the Steam button is Steam's: it closes it."""
+        ids = getattr(self, "_overlay_ids", {}).get(entry_id)
+        if not ids:
+            ids = (await asyncio.to_thread(self.library.steam_overlay_ids_by_game)).get(entry_id)
+        if not ids:
+            raise RuntimeError("Steam's overlay is not in this game (Settings → Steam overlay in games, then start it "
+                               "again).")
+        from ezgd.platform.steambridge import BridgeError
+        try:
+            r = await self._bridge().show_overlay(sorted(ids))
+        except BridgeError as exc:
+            raise RuntimeError(str(exc)) from None
+        if r not in ("opened", "open"):
+            raise RuntimeError("Steam did not open its overlay for this game"
+                               + (" (Steam has not attached it to the game yet)." if r == "none" else f" ({r})."))
+        log.info("our overlay: Steam's overlay opened over game %s (the Steam button closes it)", entry_id)
+        return r
 
     def _keep_awake(self) -> None:
         """The screen stays on while a game runs (a controller is not activity to the desktop): one idle hold per

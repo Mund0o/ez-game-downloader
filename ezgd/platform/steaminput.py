@@ -122,6 +122,20 @@ def read_activations(root: Path | None, since: int) -> tuple[list[tuple[int, int
     return [(int(c), unsigned(int(a))) for c, a in ACTIVATED.findall(text)], end
 
 
+GUIDE_TAP = "Guide button sent to JS"                # (controller_ui.txt) the Steam button let go after a tap …
+GUIDE_HOLD = "Guide button skipped due to length"    # … or after a long press (its chord: Steam's own)
+
+
+def read_ui(root: Path | None, since: int) -> tuple[list[str], int, int]:
+    """:func:`read_focus`, and how many times the Steam button was let go, since byte ``since``."""
+    if root is None:
+        return [], 0, since
+    text, end = _read_new(root / "logs" / "controller_ui.txt", since)
+    lines = text.splitlines()
+    return ([m.group(1) for m in map(FOCUS.search, lines) if m],
+            sum(GUIDE_TAP in ln or GUIDE_HOLD in ln for ln in lines), end)
+
+
 def read_focus(root: Path | None, since: int) -> tuple[list[str], int]:
     """Steam's reasons for its layout choices (controller_ui.txt) since byte ``since``."""
     if root is None:
@@ -225,6 +239,7 @@ class Forced:
     RETRY_SECONDS = 2.0            # between two requests for the game layout
     MAX_TRIES = 8                  # requests in a row that Steam did not answer with the game layout: give up
     ACK_SECONDS = 3.0              # how long Steam may take to switch to a forced layout (before the next link)
+    STUCK_CHORD_SECONDS = 1.5      # the Steam button let go, its chord layout still Steam's that long: left on
 
     def __init__(self, marker: Path, opener=None, root: Callable[[], Path | None] | None = None,
                  steam_up: Callable[[], bool] | None = None):
@@ -401,10 +416,11 @@ class Forced:
         pos, fpos = self._from or (log_size(root), log_size(root, "controller_ui.txt"))
         self._from = None
         last, said = self._appid if self.games else None, None
+        stuck_from: float | None = None
         while self.watched or self.games:
             self._wake.wait(self.WATCH_SECONDS)
             self._wake.clear()
-            why, fpos = read_focus(root, fpos)
+            why, released, fpos = read_ui(root, fpos)
             got, pos = read_activations(root, pos)
             for reason in why:
                 log.info("Steam controller layout: %s", reason)
@@ -414,8 +430,24 @@ class Forced:
                     log.info("Steam switched the controller to the %s layout", name(app))
             if got:
                 last = got[-1][1]
+                stuck_from = None
                 if last == self._appid:
                     self._tries = 0
+            if last == CHORD and released and stuck_from is None:
+                stuck_from = time.monotonic()
+            if last == CHORD and stuck_from is not None and time.monotonic() - stuck_from >= self.STUCK_CHORD_SECONDS:
+                # The Steam button was let go, but Steam stayed on its chord layout — which takes the buttons (the
+                # sticks still reach the game): a friend's Steam Controller "half worked" after the quick menu until
+                # the Steam button was pressed again (2026-10-29; cause not confirmed — this line says when it is)
+                stuck_from = None
+                with self._lock:
+                    if self.games:
+                        log.warning("Steam kept its Steam-button layout after the button was let go (the buttons "
+                                    "would do nothing in the game) — asking for the game's layout again")
+                        self._ask(self._appid)
+                    else:
+                        log.warning("Steam kept its Steam-button layout after the button was let go (the buttons "
+                                    "do nothing in the game until it is pressed again)")
             if not self.games or last not in (DESKTOP, BIG_PICTURE):
                 continue                   # (the chord while the button is held; a game Steam knows)
             now = time.monotonic()

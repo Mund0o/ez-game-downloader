@@ -3240,8 +3240,20 @@ class _Couch(OwnAppId):
         when = {e.id: e.last_played_at or 0 for e in self.entries}
         return max(playing, key=lambda i: (when.get(i, float("inf")), i), default=None)   # (not listed yet: newest)
 
-    def open_quick(self, game) -> None:
+    def open_quick(self, game, checked: bool = False) -> None:
         if self._exiting or not self.own_overlay():
+            return
+        if game is not None and not checked:
+            # Steam's overlay open in the game (the quick menu's "Steam overlay"): this press is Steam's — its Steam
+            # button closes it — and the quick menu does not open over it
+            def answer(busy) -> None:
+                if not busy:
+                    self.open_quick(game, checked=True)
+                    return
+                log.info("couch mode: Steam's overlay is open in %s — the button is Steam's (it closes it)", game.title)
+                if self.background:
+                    QTimer.singleShot(0, self, self._dismiss_background)
+            self.bridge.call(self.bridge.core.steam_overlay_busy(game.id), answer, lambda _e: answer(False), owner=self)
             return
         log.info("couch mode: guide button held — quick menu for %s", game.title if game else "suspended games")
         from ezgd.ui.couch_quick import QuickMenu

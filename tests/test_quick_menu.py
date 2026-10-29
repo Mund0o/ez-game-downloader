@@ -647,3 +647,64 @@ def test_with_our_overlay_a_steam_tap_is_the_quick_menu(ui, qtbot, tmp_path, mon
     monkeypatch.undo()
     win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
     couch.force_close()
+
+
+@linux_only
+def test_steams_overlay_from_the_quick_menu_and_its_steam_button(ui, qtbot, tmp_path, monkeypatch):
+    """A friend lost Steam's overlay with our overlay on (2026-10-29): the quick menu opens it over the game ("Steam
+    overlay"), and while it is open the Steam button is Steam's — it closes it — so the menu does not open over it."""
+    win, core, _ = ui
+    a = _running(win, core, tmp_path, qtbot, "Overlay Game")
+    couch = _open_couch(win, qtbot)
+    qtbot.waitUntil(lambda: a.id in couch.running, timeout=5000)
+    busy, shown = [True], []
+
+    async def steam_overlay_busy(entry_id):
+        return busy[0]
+
+    async def steam_overlay_show(entry_id):
+        shown.append(entry_id)
+        return "opened"
+    monkeypatch.setattr(core, "steam_overlay_busy", steam_overlay_busy)
+    monkeypatch.setattr(core, "steam_overlay_show", steam_overlay_show)
+    couch._home_held()                                               # Steam's overlay is up: the press is Steam's
+    qtbot.wait(400)
+    assert couch.quick is None or not couch.quick.isVisible()
+    busy[0] = False
+    couch._home_held()                                               # it is gone: the quick menu
+    qtbot.waitUntil(lambda: couch.quick is not None and couch.quick.isVisible(), timeout=5000)
+    q = couch.quick
+    row = next(r for r in q.rows if r.key == "steamoverlay")
+    row.action()                                                     # "Steam overlay": back to the game, then Steam's
+    qtbot.waitUntil(lambda: not q.isVisible(), timeout=3000)
+    qtbot.waitUntil(lambda: shown == [a.id], timeout=3000)
+    monkeypatch.undo()
+    win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
+    couch.force_close()
+
+
+def test_the_core_says_when_the_steam_button_is_steams(monkeypatch):
+    """steam_overlay_busy: Steam's overlay open in that game, or the Steam button handed to it to close it just now —
+    asked of Steam only for a game with Steam's overlay, with our overlay on."""
+    import asyncio
+    import types
+    from ezgd.core.app_core import AppCore
+    from ezgd.platform.steambridge import BridgeError
+    answers, asked = [], []
+
+    class FakeBridge:
+        async def overlay_state(self, ids):
+            asked.append(list(ids))
+            a = answers.pop(0)
+            if isinstance(a, Exception):
+                raise a
+            return a
+    core = types.SimpleNamespace(settings=types.SimpleNamespace(settings=types.SimpleNamespace(own_overlay=True)),
+                                 _overlay_ids={3: {"480"}}, _bridge=lambda: FakeBridge())
+    busy = lambda eid: asyncio.run(AppCore.steam_overlay_busy.__get__(core)(eid))   # noqa: E731
+    answers[:] = [{"open": True, "passed": -1}, {"open": False, "passed": 300}, {"open": False, "passed": 9000},
+                  {"open": False, "passed": -1}, BridgeError("no Steam")]
+    assert [busy(3) for _ in range(5)] == [True, True, False, False, False]
+    assert busy(4) is False and len(asked) == 5                      # no overlay known in that game: not asked
+    core.settings.settings.own_overlay = False
+    assert busy(3) is False and len(asked) == 5

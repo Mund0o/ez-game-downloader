@@ -257,13 +257,24 @@ let g=window.__ezgdGuide;
 if(!ids.length){if(g){ui.RegisterForSystemKeyEvents=g.orig;for(const w of ovs()){const h=w.DesktopOverlay.m_systemKeyEventsCallbackHandle;
 if(h&&h.__ezgd)again(w.DesktopOverlay,cb=>g.orig.call(ui,cb))}delete window.__ezgdGuide}return 'off'}
 if(!g){g=window.__ezgdGuide={orig:ui.RegisterForSystemKeyEvents,ids:new Set(),until:0,held:0,at:0};
-ui.RegisterForSystemKeyEvents=function(cb){const h=g.orig.call(ui,e=>{if(e&&Date.now()<g.until&&ovs().some(w=>
-g.ids.has(String(w.params.gameid))&&w.params.appid==e.nAppID)){const t=Date.now();if(t-g.at>100)g.held++;g.at=t;return}
-return cb(e)});if(h)h.__ezgd=1;return h}}
+ui.RegisterForSystemKeyEvents=function(cb){const h=g.orig.call(ui,e=>{if(e&&Date.now()<g.until){const m=ovs().filter(w=>
+g.ids.has(String(w.params.gameid))&&w.params.appid==e.nAppID);if(m.length){if(m.some(w=>w.DesktopOverlay.m_bIsOverlayActive))g.passed=Date.now();
+else{const t=Date.now();if(t-g.at>100)g.held++;g.at=t;return}}}return cb(e)});if(h)h.__ezgd=1;return h}}
 g.ids=new Set(ids.map(String));g.until=Date.now()+ttl*1000;
 for(const w of ovs()){const h=w.DesktopOverlay.m_systemKeyEventsCallbackHandle;if(h&&!h.__ezgd)again(w.DesktopOverlay,cb=>ui.RegisterForSystemKeyEvents(cb))}
 return 'on:'+g.held})(%s,%d)"""
 GUARD_SECONDS = 30                 # the guard lapses this long after the app last renewed it (a crashed app: gone)
+# Steam's overlay opened from the quick menu ("Steam overlay"): the guard above lets the Steam button through while a
+# game's overlay is open — Steam's own handler then closes it — and notes when (``passed``), so the app does not
+# open the quick menu over it for that same press.
+_JS_OVERLAY_SHOW = """((ids)=>{const ws=window.SteamUIStore&&SteamUIStore.WindowStore;if(!ws)return 'unsupported';
+const w=(ws.SteamUIWindows||[]).find(x=>x.IsDesktopOverlayWindow&&x.IsDesktopOverlayWindow()&&x.params&&x.DesktopOverlay&&
+x.DesktopOverlay.m_eState!==2&&ids.includes(String(x.params.gameid)));if(!w)return 'none';const d=w.DesktopOverlay;
+if(d.m_bIsOverlayActive)return 'open';SteamClient.Overlay.SetOverlayState(d.gameid,2);return 'opened'})(%s)"""
+_JS_OVERLAY_STATE = """((ids)=>{const ws=window.SteamUIStore&&SteamUIStore.WindowStore;if(!ws)return null;const g=window.__ezgdGuide;
+const open=(ws.SteamUIWindows||[]).some(x=>x.IsDesktopOverlayWindow&&x.IsDesktopOverlayWindow()&&x.params&&x.DesktopOverlay&&
+ids.includes(String(x.params.gameid))&&x.DesktopOverlay.m_bIsOverlayActive);
+return {open:open,passed:g&&g.passed?Date.now()-g.passed:-1}})(%s)"""
 
 
 # ------------------------------------------------------------------ the connection
@@ -350,6 +361,17 @@ class Bridge:
         "on:<presses held back so far>" | "off" | "unsupported" (this Steam has no such handler)."""
         out = await self.eval(_JS_GUIDE_GUARD % (json.dumps([str(g) for g in gameids]), int(seconds)))
         return str(out)
+
+    async def show_overlay(self, gameids: list[str]) -> str:
+        """Steam's overlay over the game whose overlay goes by one of these game ids — as Steam's own Steam-button
+        handler opens it. "opened" | "open" (already) | "none" (no overlay of that game) | "unsupported"."""
+        return str(await self.eval(_JS_OVERLAY_SHOW % json.dumps([str(g) for g in gameids])))
+
+    async def overlay_state(self, gameids: list[str]) -> dict:
+        """{"open": that game's Steam overlay is open, "passed": ms since the guard last let the Steam button through to
+        an open overlay (-1: never)}."""
+        out = await self.eval(_JS_OVERLAY_STATE % json.dumps([str(g) for g in gameids]))
+        return out if isinstance(out, dict) else {"open": False, "passed": -1}
 
     async def close(self) -> None:
         w, self._writer, self._reader = self._writer, None, None

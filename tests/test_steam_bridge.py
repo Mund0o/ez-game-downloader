@@ -214,11 +214,13 @@ _FAKE_PAGE = r"""
 const regs = new Set(); const states = [];
 globalThis.window = globalThis;
 globalThis.SteamClient = {System: {UI: {RegisterForSystemKeyEvents(cb) { const h = {cb, unregister() { regs.delete(h) }};
-  regs.add(h); return h }}}, Overlay: {SetOverlayState(gid, s) { states.push([gid, s]) }}};
+  regs.add(h); return h }}}, Overlay: {SetOverlayState(gid, s) { states.push([gid, s]);      // (Steam opens / closes it)
+  for (const w of SteamUIStore.WindowStore.SteamUIWindows) if (w.DesktopOverlay && w.DesktopOverlay.m_eState !== 2 &&
+    String(w.params.gameid) === String(gid)) w.DesktopOverlay.m_bIsOverlayActive = s === 2 }}};
 function overlay(appid, gameid) {
   const d = {appid, gameid, m_eState: 1, m_bIsOverlayActive: false};
-  d.HandleGamepadGuideButtonEvents = e => { if (e.nAppID == d.appid) { d.m_bIsOverlayActive = !d.m_bIsOverlayActive;
-    SteamClient.Overlay.SetOverlayState(d.gameid, d.m_bIsOverlayActive ? 2 : 0) } };
+  d.HandleGamepadGuideButtonEvents = e => { if (e.nAppID == d.appid)
+    SteamClient.Overlay.SetOverlayState(d.gameid, d.m_bIsOverlayActive ? 0 : 2) };
   d.Init = () => { d.m_systemKeyEventsCallbackHandle = SteamClient.System?.UI?.RegisterForSystemKeyEvents(d.HandleGamepadGuideButtonEvents) };
   d.Shutdown = () => { d.m_eState = 2; d.m_systemKeyEventsCallbackHandle?.unregister() };
   const w = {params: {appid, gameid}, DesktopOverlay: d, IsDesktopOverlayWindow: () => true};
@@ -236,6 +238,7 @@ press(2959482844); out.guarded = ours.m_bIsOverlayActive;
 press(620); out.others = steams.m_bIsOverlayActive; press(620);
 const later = overlay(2959482844, '12710882028086624256');          // its overlay came back (a second window)
 press(2959482844); out.later = later.m_bIsOverlayActive || ours.m_bIsOverlayActive;
+later.Shutdown();                                                    // (one overlay per game from here on)
 out.renewed = guard(['12710882028086624256'], 30); out.regs = regs.size;
 out.lapsed = guard(['12710882028086624256'], 0); press(2959482844); out.afterLapse = ours.m_bIsOverlayActive;
 press(2959482844);
@@ -243,6 +246,15 @@ out.off = guard([], 30); press(2959482844); out.afterOff = ours.m_bIsOverlayActi
 out.restored = SteamClient.System.UI.RegisterForSystemKeyEvents === window.__ezgdGuide;   // (undefined === undefined)
 out.leftover = 'undefined' !== typeof window.__ezgdGuide; out.regsAfter = regs.size;
 const fresh = overlay(5, '5'); press(5); out.freshAfterOff = fresh.m_bIsOverlayActive;
+// the quick menu's "Steam overlay": the app opens it; while it is open the Steam button is Steam's — it closes it
+const run = (js, ids) => eval(js.replace('%s', JSON.stringify(ids)));
+out.on2 = guard(['12710882028086624256'], 30);
+out.shown = run(SHOW, ['12710882028086624256']); out.openNow = ours.m_bIsOverlayActive;
+out.again = run(SHOW, ['12710882028086624256']); out.none = run(SHOW, ['1']);
+out.busy = run(STATE, ['12710882028086624256']);
+press(2959482844); out.closedBySteam = !ours.m_bIsOverlayActive;
+out.justPassed = run(STATE, ['12710882028086624256']);
+press(2959482844); out.guardedAgain = !ours.m_bIsOverlayActive;     // closed: the button is the menu's again
 SteamClient.System = {}; out.unsupported = guard(['1'], 30);
 console.log(JSON.stringify(out));
 """
@@ -254,7 +266,8 @@ def test_the_steam_button_guard_in_a_page_like_steams(tmp_path):
     them is the quick menu's: the exact script the bridge sends, run against a page built like Steam's."""
     import subprocess
     page = tmp_path / "page.js"
-    page.write_text(f"const GUARD = {json.dumps(sb._JS_GUIDE_GUARD)};\n" + _FAKE_PAGE)
+    page.write_text(f"const GUARD = {json.dumps(sb._JS_GUIDE_GUARD)};\nconst SHOW = {json.dumps(sb._JS_OVERLAY_SHOW)};\n"
+                    f"const STATE = {json.dumps(sb._JS_OVERLAY_STATE)};\n" + _FAKE_PAGE)
     r = subprocess.run(["node", str(page)], capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr
     out = json.loads(r.stdout)
@@ -262,10 +275,17 @@ def test_the_steam_button_guard_in_a_page_like_steams(tmp_path):
     assert out["on"] == "on:0" and out["guarded"] is False      # guarded: nothing opens
     assert out["others"] is True                        # a game Steam started keeps its overlay on the button
     assert out["later"] is False                        # an overlay that registers after the guard: held too
-    assert out["renewed"] == "on:2" and out["regs"] == 3        # renewing registers nothing twice
+    assert out["renewed"] == "on:2" and out["regs"] == 2        # renewing registers nothing twice
     assert out["afterLapse"] is True                    # not renewed in time (the app gone): Steam's again
     assert out["off"] == "off" and out["afterOff"] is True and out["leftover"] is False
-    assert out["regsAfter"] == 3 and out["freshAfterOff"] is True   # Steam's own registration back
+    assert out["regsAfter"] == 2 and out["freshAfterOff"] is True   # Steam's own registration back
+    assert out["on2"].startswith("on:")
+    assert out["shown"] == "opened" and out["openNow"] is True      # the quick menu's "Steam overlay"
+    assert out["again"] == "open" and out["none"] == "none"
+    assert out["busy"]["open"] is True                              # (the menu does not open over it)
+    assert out["closedBySteam"] is True                             # its Steam button closes it — Steam's handler
+    assert out["justPassed"] == {"open": False, "passed": 0}        # … and that press is not the menu's
+    assert out["guardedAgain"] is True                              # closed: the next press is the menu's again
     assert out["unsupported"] == "unsupported"
 
 
@@ -289,7 +309,8 @@ def test_core_renews_the_steam_button_guard_and_gives_it_back(monkeypatch, caplo
     settings = types.SimpleNamespace(own_overlay=False)
     core = types.SimpleNamespace(settings=types.SimpleNamespace(settings=settings), GUIDE_RENEW=AppCore.GUIDE_RENEW,
                                  library=types.SimpleNamespace(running_ids=lambda: running,
-                                                               steam_overlay_game_ids=lambda: set(ids)),
+                                                               steam_overlay_ids_by_game=lambda: {3: set(ids)}
+                                                               if ids else {}),
                                  _bridge=lambda: FakeBridge())
     monkeypatch.setattr(app_core.time, "monotonic", lambda: clock[0])
     tick = lambda: asyncio.run(AppCore._guard_steam_button.__get__(core)())   # noqa: E731

@@ -33,8 +33,7 @@ log = logging.getLogger(__name__)
 DESKTOP_APP = 413080          # Steam's "Desktop Configuration" (Steam's UI code: Settings_Controller_DesktopConfig)
 LOGS = ("controller_ui.txt", "controller.txt")
 _LOADED = re.compile(r"Loaded Config for [A-Za-z ]+ Path for App ID %d, Controller (\d+): (.+?)\s*$" % DESKTOP_APP)
-GUIDE_TAP = "Guide button sent to JS"
-GUIDE_HOLD = "Guide button skipped due to length"
+from ezgd.platform.steaminput import GUIDE_HOLD, GUIDE_TAP  # noqa: E402 (Steam's lines for its button let go)
 
 # Valve's product ids (USB / Bluetooth). The original Steam Controller ("gordon": kernel hid-steam 1102 / 1142, its
 # Bluetooth ids 1105 / 1106 and the 1201 / 1202 variant in SDL's mappings) and the Steam Deck ("neptune", 1205).

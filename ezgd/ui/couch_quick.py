@@ -36,7 +36,7 @@ VOLUME_STEP = 10
 SPACEWAR = "480"                 # the app OnlineFix games sign in to Steam as (their invites are all "480")
 
 
-ICONS = ("resume", "switch", "couch", "friends", "volume", "mangohud", "settings", "quit")
+ICONS = ("resume", "switch", "couch", "friends", "steamoverlay", "volume", "mangohud", "settings", "quit")
 
 
 def draw_icon(p: QPainter, key: str, r: QRectF, color: QColor, s: float) -> None:
@@ -70,6 +70,11 @@ def draw_icon(p: QPainter, key: str, r: QRectF, color: QColor, s: float) -> None
         p.drawArc(QRectF(x + w * 0.0, y + h * 0.5, w * 0.56, h * 0.62), 0, 180 * 16)
         p.drawEllipse(QRectF(x + w * 0.58, y + h * 0.18, w * 0.26, h * 0.26))
         p.drawArc(QRectF(x + w * 0.5, y + h * 0.54, w * 0.46, h * 0.5), 0, 180 * 16)
+    elif key == "steamoverlay":                            # a panel laid over a window
+        p.drawRoundedRect(QRectF(x + w * 0.02, y + h * 0.1, w * 0.72, h * 0.6), 3 * s, 3 * s)
+        p.setBrush(color)
+        p.drawRoundedRect(QRectF(x + w * 0.38, y + h * 0.38, w * 0.6, h * 0.52), 3 * s, 3 * s)
+        p.setBrush(Qt.NoBrush)
     elif key == "volume":                                  # a speaker and two waves
         path = QPainterPath()
         path.moveTo(x + w * 0.05, y + h * 0.36)
@@ -431,6 +436,8 @@ class QuickMenu(OwnAppId, QWidget):
             rows.append(Row("couch", "Go to couch mode", "Suspends the game while you look around",
                             action=self.to_couch))
             rows.append(self._friends_row())
+            rows.append(Row("steamoverlay", "Steam overlay", "Steam's own over the game — its Steam button closes it",
+                            action=self._steam_overlay))
             if self.volume is not None:
                 rows.append(Row("volume", "Game volume", "", "choice", f"{self.volume} %",
                                 action=lambda: self._step_volume(VOLUME_STEP),
@@ -1034,6 +1041,19 @@ class QuickMenu(OwnAppId, QWidget):
                    lambda verdict: self.couch.toasts.show(f"{g.title} stopped", f"Kept what it was doing: {verdict}"),
                    lambda err: self.couch.toasts.show("Could not stop the game", str(err), "error"), owner=self.couch)
         self.close_menu(go)
+
+    def _steam_overlay(self) -> None:
+        """Steam's own overlay over the game — friends, its browser, guides; what the Steam button opens without our
+        overlay (a friend missed it, 2026-10-29). Back to the game first, then Steam opens it there; its Steam button
+        closes it again (while it is open the button is Steam's: steambridge, couch.open_quick)."""
+        g = self.game
+        if g is None:
+            return
+        b, actions = self.couch.bridge, self.couch.actions
+        self.resume()
+        # (not owned by this window: a desktop start's menu is gone by then)
+        QTimer.singleShot(600, lambda: b.call(b.core.steam_overlay_show(g.id), None,
+                                              lambda err: actions.toasts.show("Steam overlay", str(err), "error")))
 
     def _toggle_mangohud(self) -> None:
         g = self.game
