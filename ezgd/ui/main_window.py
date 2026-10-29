@@ -540,6 +540,8 @@ class MainWindow(QMainWindow):
         self.pages["settings"].load(s, info=False)        # a change made in couch mode shows here too
         if self.couch is not None:
             self.couch.settings_changed(changed_key)      # … and one made here, in couch mode
+        if changed_key == "own_overlay":
+            self._watch_quick_button()                    # the guide button / Shift+Tab: the quick menu's, or Steam's
         if changed_key in ("sources_enabled", "hide_withdrawn_games", "hide_adult_games"):
             self.pages["games"].reload()
             self.pages["home"].load_sources()
@@ -676,13 +678,15 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------- the quick menu over a game started from the desktop
     def _watch_quick_button(self) -> None:
         """While one of our games runs and couch mode is closed: listen for the guide button (tap or hold) to show
-        the quick menu over the game. Nothing listens otherwise."""
-        self._watch_quick_key(bool(self.pages["library"].running))
-        want = bool(self.pages["library"].running) and self.couch is None
+        the quick menu over the game. Nothing listens otherwise — nor without our overlay (Settings): then Steam's
+        overlay is the one over the game, and the quick menu does not show at all."""
+        ours = bool(self.settings.get("own_overlay", False))
+        self._watch_quick_key(bool(self.pages["library"].running) and ours)
+        want = bool(self.pages["library"].running) and self.couch is None and ours
         if want and self._quick_pads is None:
             from ezgd.ui.gamepad import Gamepads
             pads = Gamepads(self)
-            pads.action.connect(lambda n: self._desktop_guide(pads) if n == "home" else None)
+            pads.action.connect(lambda n: self._quick_menu_from_desktop() if n == "home" else None)
             pads.home_held.connect(self._quick_menu_from_desktop)
             pads.start()
             self._quick_pads = pads
@@ -697,32 +701,9 @@ class MainWindow(QMainWindow):
         else:
             self._bpm_timer.stop()
 
-    def _desktop_guide(self, pads) -> None:
-        """The guide button tapped over a game started from the desktop: the quick menu — unless it was a Steam
-        Controller's tap (Steam logged it) and Steam's overlay is in the game: then the tap is Steam's (its overlay:
-        friends, invites) and a hold is the quick menu."""
-        lib = self.pages["library"]
-        ids = sorted(i for i in lib.running if i not in lib.suspended)
-        if not pads.home_from_steam or not ids or self.settings.get("own_overlay", False):
-            self._quick_menu_from_desktop()
-            return
-        answers: list[bool] = []
-
-        def got(has: bool) -> None:
-            answers.append(bool(has))
-            if len(answers) < len(ids):
-                return
-            if any(answers):
-                log.info("Steam button tapped over a game with Steam's overlay: Steam's (hold it for the quick menu)")
-            else:
-                self._quick_menu_from_desktop()
-        for gid in ids:
-            self.bridge.call(self.bridge.core.library_call("has_steam_overlay", gid), got, lambda _e: got(False),
-                             owner=self)
-
     def _bpm_tick(self) -> None:
         from ezgd.ui import steam_bpm
-        if self.couch is not None or not self.pages["library"].running:
+        if self.couch is not None or not self.pages["library"].running or not self.settings.get("own_overlay", False):
             self._bpm_timer.stop()
             return
         if steam_bpm.big_picture_in_front() and steam_bpm.close_big_picture():
@@ -732,8 +713,9 @@ class MainWindow(QMainWindow):
 
     def _quick_menu_from_desktop(self) -> None:
         """The guide button over a game started from the desktop (couch mode closed): the quick menu, with couch
-        mode made in the background behind it — shown only if the menu asks for it (couch mode, switch game, …)."""
-        if self.couch is not None or not self.pages["library"].running:
+        mode made in the background behind it — shown only if the menu asks for it (couch mode, switch game, …).
+        Only with our overlay (Settings)."""
+        if self.couch is not None or not self.pages["library"].running or not self.settings.get("own_overlay", False):
             return
         from ezgd.ui.couch import make_couch
         try:

@@ -198,6 +198,7 @@ def test_with_two_games_running_the_menu_is_for_the_one_started_last(ui, qtbot, 
     so the game added to the library first lost even when it was the one just started."""
     from test_quick_menu import _install
     win, core, _ = ui
+    win.settings["own_overlay"] = True                            # (the quick menu shows only with our overlay)
     older = _install(core.library, tmp_path, "Added First")
     newer = _install(core.library, tmp_path, "Added Second")
     assert older.id < newer.id
@@ -361,3 +362,155 @@ def test_a_menu_gone_before_steam_answered_hands_the_layout_back(ui, qtbot, tmp_
     qtbot.waitUntil(lambda: released == [9], timeout=4000)
     monkeypatch.undo()
     win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
+
+
+# --------------------------------------------------------------- the quick menu keeps the game's pad to itself
+class _Grabs:
+    """EVIOCGRAB calls (the kernel's own test of them: tmp scratchpad grabprobe.py on Steam's real pad, 2026-10-28 —
+    a read-only handle may take it, a second reader is then refused with EBUSY)."""
+
+    def __init__(self, monkeypatch, gp, absinfo=None, keys=b""):
+        self.calls = []
+        real = gp.fcntl.ioctl
+
+        def ioctl(fd, req, arg=0, *a):
+            if req == gp.EVIOCGRAB:
+                self.calls.append(arg)
+                return 0
+            if req == gp.EVIOCSCLOCKID:
+                return 0
+            if req == gp.EVIOCGKEY:
+                return keys.ljust(gp.KEY_BYTES, b"\0")
+            if absinfo is not None and req in absinfo:
+                return gp.ABSINFO.pack(*absinfo[req])
+            return real(fd, req, arg, *a)
+        monkeypatch.setattr(gp.fcntl, "ioctl", ioctl)
+
+
+def _pad(gp, fd=-1):
+    dev = gp._Device("/dev/input/event90", "Microsoft X-Box 360 pad 0", fd, 0x28DE, 0x11FF, 0)
+    dev.ranges.update({gp.ABS_X: (-32768, 32767), gp.ABS_Y: (-32768, 32767), gp.ABS_Z: (0, 255),
+                       gp.ABS_RZ: (0, 255), gp.ABS_HAT0X: (-1, 1), gp.ABS_HAT0Y: (-1, 1)})
+    return dev
+
+
+def _feed(gp, g, dev, w, events, at=None):
+    """Input events through the real read path (a pipe in place of the device)."""
+    import os as _os
+    t = time.monotonic() if at is None else at
+    data = b"".join(gp.EVENT.pack(int(t), int((t % 1) * 1e6), typ, code, value) for typ, code, value in events)
+    _os.write(w, data)
+    g._read(dev.path)
+
+
+def test_the_quick_menu_takes_the_games_pad_for_itself_and_gives_it_back(qtbot, monkeypatch):
+    """The game reads the same virtual pad as the menu (Steam's layout for it is kept while the menu is open): a
+    press in the menu — B to close it, A on Quit — reached the game too. While the menu is open the pad is read
+    by the app alone; when it goes, the game has it back."""
+    from ezgd.ui import gamepad as gp
+    grabs = _Grabs(monkeypatch, gp)
+    g = gp.Gamepads()
+    dev = _pad(gp)
+    g.devices[dev.path] = dev
+    real = gp._Device("/dev/input/event91", "DualSense Wireless Controller", -1, 0x054C, 0x0CE6, 0)
+    g.devices[real.path] = real
+    g.hold_virtual(True)
+    assert grabs.calls == [1] and dev.grabbed                     # only Steam's pad (the game reads the real one raw)
+    g.hold_virtual(False)
+    assert grabs.calls == [1, 0] and not dev.grabbed
+    g.devices.clear()
+    g.stop()
+    g.deleteLater()
+    qtbot.wait(50)
+
+
+def test_a_pad_held_when_the_menu_opens_is_taken_once_let_go(qtbot, monkeypatch):
+    """Taken while the stick is held, the game would never see it let go — the character kept running after the
+    menu. It is taken at the first report that has everything at rest."""
+    import os as _os
+    from ezgd.ui import gamepad as gp
+    grabs = _Grabs(monkeypatch, gp)
+    g = gp.Gamepads()
+    r, w = _os.pipe()
+    _os.set_blocking(r, False)
+    dev = _pad(gp, r)
+    g.devices[dev.path] = dev
+    _feed(gp, g, dev, w, [(gp.EV_ABS, gp.ABS_Y, -30000), (gp.EV_SYN, 0, 0)])       # running forward
+    g.hold_virtual(True)
+    assert grabs.calls == []
+    _feed(gp, g, dev, w, [(gp.EV_ABS, gp.ABS_RZ, 200), (gp.EV_SYN, 0, 0)])         # … and a trigger
+    _feed(gp, g, dev, w, [(gp.EV_ABS, gp.ABS_Y, 0), (gp.EV_SYN, 0, 0)])
+    assert grabs.calls == []                                       # (the trigger is still held)
+    _feed(gp, g, dev, w, [(gp.EV_ABS, gp.ABS_RZ, 0), (gp.EV_SYN, 0, 0)])
+    assert grabs.calls == [1]                                      # everything let go: the menu's alone now
+    g.hold_virtual(False)
+    assert grabs.calls == [1, 0]
+    g.devices.clear()
+    _os.close(r)
+    _os.close(w)
+    g.stop()
+    g.deleteLater()
+    qtbot.wait(50)
+
+
+def test_a_press_from_just_before_the_pad_was_taken_gives_it_back(qtbot, monkeypatch):
+    """A press made a moment before the pad was taken reached the game, but its release would not: the pad goes
+    back to the game until everything is let go again (event times, monotonic clock)."""
+    import os as _os
+    from ezgd.ui import gamepad as gp
+    grabs = _Grabs(monkeypatch, gp)
+    g = gp.Gamepads()
+    r, w = _os.pipe()
+    _os.set_blocking(r, False)
+    dev = _pad(gp, r)
+    g.devices[dev.path] = dev
+    g.hold_virtual(True)
+    assert grabs.calls == [1]
+    _feed(gp, g, dev, w, [(gp.EV_KEY, gp.BTN_SOUTH, 1), (gp.EV_SYN, 0, 0)], at=dev.grabbed - 0.01)
+    assert grabs.calls == [1, 0]                                   # the game saw A go down: it sees it go up
+    _feed(gp, g, dev, w, [(gp.EV_KEY, gp.BTN_SOUTH, 0), (gp.EV_SYN, 0, 0)])
+    assert grabs.calls == [1, 0, 1]
+    _feed(gp, g, dev, w, [(gp.EV_KEY, gp.BTN_EAST, 1), (gp.EV_SYN, 0, 0)])         # taken: a press is the menu's
+    assert grabs.calls == [1, 0, 1]
+    g.devices.clear()
+    _os.close(r)
+    _os.close(w)
+    g.stop()
+    g.deleteLater()
+    qtbot.wait(50)
+
+
+def test_a_pad_opened_while_a_stick_is_held_knows_it(qtbot, monkeypatch):
+    """The quick menu of a game started from the desktop opens the pads the moment it appears: a stick already
+    held then (the player was running) counted as at rest, and the pad was taken under it."""
+    from ezgd.ui import gamepad as gp
+    _Grabs(monkeypatch, gp, absinfo={gp._eviocgabs(gp.ABS_X): (25000, -32768, 32767, 16, 128, 0),
+                                     gp._eviocgabs(gp.ABS_Y): (0, -32768, 32767, 16, 128, 0)},
+           keys=bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                       0, 0, 0, 0, 0, 0, 1]))                    # BTN_SOUTH (0x130) held
+    dev = gp._Device("/dev/input/event92", "Microsoft X-Box 360 pad 0", -1, 0x28DE, 0x11FF, 0)
+    assert dev.axes[gp.ABS_X] > 0.7 and gp.BTN_SOUTH in dev.down
+    assert not gp.Gamepads._at_rest(dev)
+    qtbot.wait(10)
+
+
+@linux_only
+def test_the_quick_menu_holds_the_pads_while_it_is_open(ui, qtbot, tmp_path, monkeypatch):
+    from test_couch_ui import _open_couch
+    from ezgd.ui.gamepad import Gamepads
+    win, core, _ = ui
+    a = _running(win, core, tmp_path, qtbot, "Held Pad Game")
+    holds = []
+    monkeypatch.setattr(Gamepads, "hold_virtual", lambda self, on: holds.append(on))
+    couch = _open_couch(win, qtbot)
+    qtbot.waitUntil(lambda: a.id in couch.running, timeout=5000)
+    monkeypatch.setattr(couch, "isActiveWindow", lambda: False)  # the game has the screen
+    couch._home_held()
+    qtbot.waitUntil(lambda: couch.quick is not None and couch.quick._shown >= 1.0, timeout=5000)
+    assert holds == [True]
+    couch.quick.command("b")
+    qtbot.waitUntil(lambda: not couch.quick.isVisible(), timeout=3000)
+    assert holds == [True, False]
+    monkeypatch.undo()
+    win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
+    couch.force_close()

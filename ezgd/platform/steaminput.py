@@ -23,14 +23,28 @@ the focus, until ``…/0``. Measured on Steam (2026-10-27, with a controller, re
 * steam:// links reach Steam asynchronously (the ``steam`` command returns in ~10 ms), so a second link is sent only
   once Steam logged the first.
 
-The app forces Spacewar's layout (480 — the one OnlineFix games already get, Steam's gamepad template unless the
-player changed it) only for direct starts Steam cannot know, and leaves everything else to Steam. The quick menu keeps
-the game's layout: over a forced game nothing changes (the controller stays the game's virtual pad, which the menu
-reads too); over a game Steam knows (OnlineFix games as Spacewar, games Steam started) the menu would get Steam's
-desktop layout the moment it takes the focus — Steam's virtual pad, the one the game reads, goes away and comes back
-as a new device when the game has the focus again (a game may never pick it up again: a friend's Steam Controller
-"fell off a cliff" after the menu). So the layout Steam chose for the focused game (its own log says which: ``to game
-window type: AppID N``) is forced just before the menu takes the focus, and released once the game has it back
+**Which layout** (measured 2026-10-28, links sent in the background, Steam 1792618285):
+
+* Spacewar's (480) is not a gamepad: Steam picks Valve's own Steam Input API layout for Spacewar ("Space War Action
+  Set Config Sample", workshop 1417465272) by itself the first time anything runs as 480 — every binding a Spacewar
+  action, so Steam makes **no virtual pad** (``mapping uses xinput : false``) and a game that is not Spacewar gets
+  nothing from a Steam Controller. OnlineFix games get it too, by themselves (they sign in as 480);
+* a shortcut of the app (or the player's own shortcut for the game) is: Steam's gamepad template for it, or the
+  layout the player chose for that shortcut in Steam — and a virtual pad within ~50 ms. Steam writes that switch
+  with the id as a *signed* 32-bit number (``app: -1335484452`` for 2959482844); everything here compares ids
+  unsigned (:func:`unsigned`);
+* an id Steam does not know is ignored: nothing is switched or logged.
+
+So with a Valve controller connected (one games cannot read themselves) the app asks for the game's own Steam
+layout, else another of its shortcuts' (a gamepad template), and Spacewar's only as the last resort — and keeps the
+first one that makes Steam's virtual pad (the manager checks; :meth:`Forced.retarget`). Without one, games read their
+controller themselves and Spacewar's layout only keeps Steam's desktop layout (stick = mouse) out of the game.
+The quick menu keeps the game's layout: over a forced game nothing changes (the controller stays the game's virtual
+pad, which the menu reads too); over a game Steam knows (games Steam started) the menu would get Steam's desktop
+layout the moment it takes the focus — Steam's virtual pad, the one the game reads, goes away and comes back as a new
+device when the game has the focus again (a game may never pick it up again: a friend's Steam Controller "fell off a
+cliff" after the menu). So the layout Steam chose for the focused game (its own log says which: ``to game window
+type: AppID N``) is forced just before the menu takes the focus, and released once the game has it back
 (:meth:`Forced.hold` / :meth:`Forced.let_go`).
 While a game runs, Steam's choices are written to the app's log (evidence for the next report), and a forced layout
 Steam lost (a Steam restart) is asked for again. A marker file remembers a forced layout, so one left by a crashed
@@ -49,22 +63,28 @@ from typing import Callable
 
 log = logging.getLogger(__name__)
 
-GAME_LAYOUT = 480                # Spacewar: what OnlineFix games already get
+GAME_LAYOUT = 480                # Spacewar: what OnlineFix games get — Valve's layout for Spacewar, no gamepad
 DESKTOP = 413080                 # Steam's desktop configuration
 BIG_PICTURE = 413090             # Steam's Big Picture configuration
 CHORD = 443510                   # Steam's guide-chord configuration (while the Steam button is held)
 CLIENT_UI = 769                  # Steam's own windows and on-screen keyboard
 ACTIVATED = re.compile(r"Queueing activation for controller: (\d+) app: (-?\d+)")
 FOCUS = re.compile(r"OnFocusWindowChanged (.+?)\s*$")
-NAMES = {DESKTOP: "desktop", BIG_PICTURE: "Big Picture", CHORD: "Steam button", GAME_LAYOUT: "game (Spacewar)"}
+NAMES = {DESKTOP: "desktop", BIG_PICTURE: "Big Picture", CHORD: "Steam button", GAME_LAYOUT: "Spacewar"}
 
 
 def enabled() -> bool:
     return os.environ.get("EZGD_STEAM_INPUT", "1") != "0"      # (tests: never the real Steam client)
 
 
+def unsigned(appid: int) -> int:
+    """Steam's app ids are 32 bits: it writes a shortcut's (2³¹ and up) as a negative number in controller.txt
+    (``app: -1335484452`` for 2959482844) and unsigned in its links and controller_ui.txt."""
+    return int(appid) & 0xFFFFFFFF
+
+
 def url(appid: int) -> str:
-    return f"steam://forceinputappid/{int(appid)}"
+    return f"steam://forceinputappid/{unsigned(appid)}"
 
 
 def log_size(root: Path | None, name: str = "controller.txt") -> int:
@@ -99,7 +119,7 @@ def read_activations(root: Path | None, since: int) -> tuple[list[tuple[int, int
     if root is None:
         return [], since
     text, end = _read_new(root / "logs" / "controller.txt", since)
-    return [(int(c), int(a)) for c, a in ACTIVATED.findall(text)], end
+    return [(int(c), unsigned(int(a))) for c, a in ACTIVATED.findall(text)], end
 
 
 def read_focus(root: Path | None, since: int) -> tuple[list[str], int]:
@@ -113,6 +133,7 @@ def read_focus(root: Path | None, since: int) -> tuple[list[str], int]:
 def took(root: Path | None, since: int, appid: int, wait: float = 6.0, step: float = 0.5) -> bool | None:
     """Did Steam switch a controller to ``appid``'s layout? None: no controller switched at all (none connected,
     or Steam Input is off for it — nothing to judge)."""
+    appid = unsigned(appid)
     end = time.monotonic() + wait
     while True:
         got = activations(root, since)
@@ -147,12 +168,35 @@ def game_layout_now(root: Path | None) -> int | None:
             continue
         m = GAME_WINDOW.search(line)
         if m:
-            app = int(m.group(1))
+            app = unsigned(int(m.group(1)))
             return None if app in (DESKTOP, BIG_PICTURE, CLIENT_UI, CHORD) else app
         if "ClientUI" in line or "On Screen Keyboard" in line:
             continue
         return None
     return None
+
+
+OPTED_IN = re.compile(r"Opted-in Controller Mask for AppId (\d+): ([0-9a-fA-F]+)")
+OTHERS = 0xFFF                   # the opt-in bits of controllers other than Valve's (0x1000: every app has it)
+
+
+def opted_in(root: Path | None, appid: int) -> int | None:
+    """Which controllers Steam Input drives in ``appid``, from Steam's last start of it (controller.txt: ``Opted-in
+    Controller Mask for AppId 3802265475: 1001``). 0x1000 is set for every app — Valve's own controllers are always
+    Steam's —, the low bits are the other kinds' (measured 2026-10-28: a DualSense got a layout from an app with
+    1001, Steam's "empty.vdf" from one with 1000). None: not in the log."""
+    if root is None:
+        return None
+    appid = unsigned(appid)
+    try:
+        with open(root / "logs" / "controller.txt", "rb") as fh:
+            size = fh.seek(0, 2)
+            fh.seek(max(0, size - 512 * 1024))
+            text = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    found = [int(m, 16) for a, m in OPTED_IN.findall(text) if unsigned(int(a)) == appid]
+    return found[-1] if found else None
 
 
 def virtual_pads(base: Path = Path("/sys/class/input")) -> list[str]:
@@ -169,6 +213,7 @@ def virtual_pads(base: Path = Path("/sys/class/input")) -> list[str]:
 
 
 def name(appid: int) -> str:
+    appid = unsigned(appid)
     return f"{appid} ({NAMES[appid]})" if appid in NAMES else str(appid)
 
 
@@ -181,14 +226,19 @@ class Forced:
     MAX_TRIES = 8                  # requests in a row that Steam did not answer with the game layout: give up
     ACK_SECONDS = 3.0              # how long Steam may take to switch to a forced layout (before the next link)
 
-    def __init__(self, marker: Path, opener=None, root: Callable[[], Path | None] | None = None):
+    def __init__(self, marker: Path, opener=None, root: Callable[[], Path | None] | None = None,
+                 steam_up: Callable[[], bool] | None = None):
         self.marker = marker
-        self.games: set[int] = set()               # forced: games Steam cannot know
+        self.games: dict[int, int] = {}            # forced: game → its layout (the last one's is Steam's now)
         self.watched: set[int] = set()             # every running game of the app (Steam's choices are logged)
         if opener is None:
-            from ezgd.platform.steam import open_steam_url
-            opener = open_steam_url
+            from ezgd.platform import steam
+            opener = steam.open_steam_url
+            steam_up = steam_up or (lambda: steam.is_steam_running())
         self._open = opener
+        # Steam runs: links go to it. When it does not, they are not sent — ``steam -silent <link>`` starts Steam,
+        # and a Steam that quit has forgotten any forced layout anyway (None: always sent)
+        self._steam_up = steam_up
         self._root = root                  # Steam's folder (its controller logs); None: no watching, no waiting
         self._wake = threading.Event()
         self._watcher: threading.Thread | None = None
@@ -262,19 +312,50 @@ class Forced:
             pass
 
     def start(self, entry_id: int, appid: int = GAME_LAYOUT) -> None:
-        """A game Steam cannot know started: its layout is forced (and kept) until it ends."""
+        """A game started: layout ``appid`` is forced (and kept) until it ends."""
         first = not self.games
         self._mark()                       # (Steam's answer to the link below is logged too)
         with self._lock:
             self._generation += 1
-            self.games.add(entry_id)
+            self.games.pop(entry_id, None)
+            self.games[entry_id] = unsigned(appid)
             if first:
                 self._remember(appid)
-            self._appid = appid
-            self._tries = 0
-            self._next_try = 0.0
-            self._ask(appid)
+            self._switch(unsigned(appid))
         self.watch(entry_id)
+
+    def _switch(self, appid: int) -> None:
+        """(Under the lock.) Steam is asked for ``appid``, the layout the app keeps from now on."""
+        self._appid = appid
+        self._tries = 0
+        self._next_try = 0.0
+        self._ask(appid)
+
+    def _current(self) -> int | None:
+        return next(reversed(self.games)) if self.games else None
+
+    def retarget(self, entry_id: int, appid: int) -> bool:
+        """Another layout for a forced game (the one asked for made no gamepad). Asked for at once when that game's
+        is Steam's now; False when it is not (the game ended, or another started meanwhile)."""
+        with self._lock:
+            if entry_id not in self.games:
+                return False
+            self.games[entry_id] = unsigned(appid)
+            if self._current() != entry_id:
+                return False
+            self._switch(unsigned(appid))
+            return True
+
+    def prefer(self, entry_id: int) -> None:
+        """The player is back in this game (continued from the quick menu): its own layout again, when another
+        game's is Steam's now."""
+        with self._lock:
+            appid = self.games.pop(entry_id, None)
+            if appid is None:
+                return
+            self.games[entry_id] = appid               # (now the last: the game being played)
+            if appid != self._appid:
+                self._switch(appid)
 
     def _running(self) -> bool:
         return self._watcher is not None and self._watcher.is_alive()
@@ -298,7 +379,16 @@ class Forced:
         self.watched.discard(entry_id)
         self._wake.set()
 
+    def _up(self) -> bool:
+        try:
+            return self._steam_up is None or bool(self._steam_up())
+        except Exception:
+            return True
+
     def _ask(self, appid: int) -> None:
+        if not self._up():
+            log.info("Steam is not running: the controller layout (app %s) is not asked for", appid)
+            return
         try:
             self._open(url(appid))
         except Exception:
@@ -347,11 +437,15 @@ class Forced:
             if not self.games:
                 self.hand_back(desktop=desktop)
                 return True
-        if entry_id not in self.games:
-            return False
-        self.games.discard(entry_id)
-        if self.games:
-            return False
+        with self._lock:
+            if entry_id not in self.games:
+                return False
+            del self.games[entry_id]
+            if self.games:                     # another game of the app still runs: its layout
+                appid = self.games[self._current()]
+                if appid != self._appid:
+                    self._switch(appid)
+                return False
         self.hand_back(desktop=desktop)
         return True
 
@@ -366,6 +460,9 @@ class Forced:
             self._tries = 0
             self._next_try = 0.0
             generation = self._generation
+            if not self._up():                     # (Steam quit: it forgot the forced layout — nothing to hand back)
+                self._forget()
+                return
             if not desktop:
                 self._ask(0)
                 self._forget()

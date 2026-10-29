@@ -1,4 +1,6 @@
-"""The quick menu: hold the guide button (PS / Xbox / Steam) while playing a game the app started.
+"""The quick menu: hold the guide button (PS / Xbox / Steam) while playing a game the app started — with "Our overlay
+instead of Steam's" on (Settings). Off, Steam's overlay is the one over the game and the quick menu does not show at
+all (the user's rule, 2026-10-28).
 
 It slides in over the game — the game stays visible behind it — and offers: back to the game, switch to another
 game (the one being played is suspended: frozen, using no processor or graphics time, and continues exactly where
@@ -176,7 +178,6 @@ class QuickMenu(QWidget):
         self._closing_then: Callable[[], None] | None = None
         self._pending_art = False
         self.opened_at = 0.0
-        self._steam_tip = False            # this time the menu shows the one-time Steam-button tip
         self._still = None                 # the game's picture taken just before the menu opened (a QPixmap)
         self._holding = False              # asking Steam to keep the game's controller layout (the menu opens next)
         self._layout_token = 0             # … what to hand back to Steam when the menu goes (see steaminput)
@@ -255,7 +256,6 @@ class QuickMenu(QWidget):
         self.session = None
         self.friend = None
         self._row_top = 0
-        self._steam_tip = self._first_steam_tip()
         self._build()
         self.focus = self._first()
         self._refresh()
@@ -275,6 +275,7 @@ class QuickMenu(QWidget):
             self.setGeometry(screen.geometry())
         self.pointer(False)                       # (opened by a guide button or Shift+Tab, never the mouse)
         self.showFullScreen()
+        self.couch.pads.hold_virtual(game is not None)    # the game's pad answers the menu alone (gamepad.py)
         self.raise_()
         self.activateWindow()
         self.wc.keep_above(True)
@@ -315,6 +316,10 @@ class QuickMenu(QWidget):
     # Steam gives the focused menu its desktop layout (keys) and the game its own back when it has the focus again.
     def hideEvent(self, event) -> None:
         self._still = None
+        try:
+            self.couch.pads.hold_virtual(False)           # the game reads its pad again
+        except RuntimeError:
+            pass                                          # (couch mode's window already gone: its pads went too)
         self._release_layout()
         super().hideEvent(event)
 
@@ -331,18 +336,6 @@ class QuickMenu(QWidget):
         shape = Qt.ArrowCursor if shown else Qt.BlankCursor
         if self.cursor().shape() != shape:
             self.setCursor(shape)
-
-    def _first_steam_tip(self) -> bool:
-        """Once ever, with a Steam-held Steam Controller: say that a tap of its Steam button is Steam's overlay
-        (friends, invites) and a hold this menu — it used to be the menu alone (0.5.3)."""
-        settings = self.couch.actions.settings
-        if self.game is None or settings.get("steam_button_tip_seen", False) or settings.get("own_overlay", False) \
-                or not self.couch.pads.steam_as_keys():
-            return False
-        settings["steam_button_tip_seen"] = True
-        b = self.couch.bridge
-        b.call(b.core.set_setting("steam_button_tip_seen", True), None, lambda _e: None, owner=self)
-        return True
 
     def close_menu(self, then: Callable[[], None] | None = None) -> None:
         """Slide out, then hide, then ``then`` (runs even if the menu is already gone)."""
@@ -428,10 +421,6 @@ class QuickMenu(QWidget):
         others = [e for e in self.couch.entries if e.id in self.couch.suspended and (g is None or e.id != g.id)]
         rows += self._invite_rows()
         if g is not None:
-            if self._steam_tip:
-                guide = self.couch._pad_labels("steam")["home"]
-                rows.append(Row("h-tip", f"Tip: tap {guide} for Steam's overlay — friends, invites. Hold it for this "
-                                "menu.", kind="header", extra={"note": True, "tip": True}))
             sus = self._suspended(g)
             rows.append(Row("resume", "Resume game" if sus else "Back to the game", "It continues right where it was"
                             if sus else "", "primary", action=self.resume))

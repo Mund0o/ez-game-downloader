@@ -55,8 +55,8 @@ Built with Python 3.12, PySide6 (Qt 6), SQLite, httpx, Beautiful Soup and libtor
 | **Settings** | *Find a setting* search box; folders, queue, torrent network & bandwidth, extraction, sources on/off, cache TTL & clearing, logs, accent colour / contrast / card size / reduced motion, notifications, database backup & restore. |
 | **Runs on Linux?** | Every card, couch tile and game page shows how well the game runs under Proton — "Linux 92%" = 92 % of ProtonDB players' reports say it works (offline index; game pages add ProtonDB's own tier). |
 | **Organise** | Favourites (always on top), collections, hiding, and the order of the Library (recently played, A–Z, recently added, most played) — on the desktop and in couch mode. |
-| **Quick menu** | Hold the PS / Xbox / Steam button while playing (couch mode open) — or press **Shift+Tab** on the keyboard (KDE Plasma; only while one of the app's games without Steam's overlay has the focus, so Shift+Tab stays everyone's elsewhere, and Shift+Tab closes it again): a panel slides in over the game — back to the game, **switch game** (the one you were playing is *suspended*: frozen, using no processor or graphics time, and it continues exactly where you left it), go to couch mode (suspending the game), the game's own volume, its settings, quit (press twice). Suspended games show in couch mode and the menu; A continues them. Only games the app runs — directly or through Steam for its overlay; a game started in Steam itself is never touched. Over a game started from the desktop window the menu works the same, but couch mode never takes over by itself: quitting the game there (or the game ending) goes back to the desktop window, *Game settings* shows couch mode's settings screen only until you go back to the game, and only *Go to couch mode* opens couch mode. Leaving couch mode or quitting the app lets every suspended game run again. |
-| **Screens & controllers** | Couch mode reads each monitor's real resolution from the desktop (KDE's kscreen-doctor, GNOME's Mutter, xrandr) — a 4K monitor at 150 % is 3840 × 2160, not the 5120 × 2880 Qt can report. On Wayland a full-screen window's size is the compositor's answer: couch mode never leaves full screen to "fix" it (that shrank it to 800 × 500 on some desktops); on Wayland *Borderless* is full screen (the same picture — and the only window the compositor always sizes to the monitor), and the desktop window comes back from couch mode the size it was (some KDE versions handed it couch mode's full-screen size) — KWin is asked to size it, and the log records the compositor and every size it sent for the first seconds ("couch display trace"). Interface size up to 200 % fits every page (on a 1440-high window 200 % is about 180 %, the most that fits). "Keep above" is for couch mode only and is released from every window when it closes. A Steam Deck / Steam Controller shows its own buttons (LB/RB on the original controller, L1/R1 on the Deck and the new one), also when Steam hands it to the app as keyboard and mouse: which key is which button is read from the Desktop Configuration Steam itself loaded (named in Steam's controller log — Steam's defaults, or the user's own), so every button means what its prompt says, and prompts for buttons Steam turns into mouse clicks are left out. The Steam button is read from Steam's log too: outside a game a tap goes Home and Big Picture is put away at once; over a game with Steam's overlay a **tap** is Steam's (its overlay — friends, invites, the game's own *Invite* buttons) and a **hold** opens the quick menu (Steam skips long holds); over a game without the overlay a tap opens the quick menu. The first time the quick menu opens this way it says so, and the "Starting…" screen does too. With **Our overlay instead of Steam's** (Settings → Library & launching, and couch mode's Settings → Playing) games start without Steam's overlay and the button — tap or hold — always opens the quick menu, which sits in the middle between you and Steam: your Steam chats are in it (unread counts, the conversation, replies typed on the on-screen keyboard), **Invite** is one press (Steam's own *Invite to Game* — lobby or connect string; invites that keep coming to the same friend wait out a cool-down that doubles each time, from 15 s up to 5 minutes, while an invite a minute after the last is never held up), a friend's invite shows as **Join <name>** at the top of the menu, and joining goes through Steam — no Steam window opens. Both work the way Steam's own client does (its code, read 2026-10-27): **Invite** sends the game's lobby or its connect string (the private one first) — with neither, Steam offers no invite, and the menu says so instead of sending an empty one nobody can join; **Join** is offered only for invites Steam can join (a lobby, a connect string or a Remote Play session), and with the same link Steam's chat opens. An empty invite (OnlineFix games send `[gameinvite appid="480"]` when the game published no lobby) used to show Join and start Spacewar. Joining a friend's game from the friends list also uses their game's connect string, like Steam's *Join Game*; joining a friend in the game you are playing never suspends it. The friends list then comes from the Steam client itself too — live, without a Steam Web API key: in a game first (green ring), then online (blue; away / snooze dimmer), then offline (grey), like Steam; **X / △** (or typing a name) finds a friend, B shows everyone again. It talks to the Steam client itself, like Decky Loader: off by default; the first time it is switched on, two lines say what it does, Steam's debugging interface is switched on (`<Steam>/.cef-enable-remote-debugging`) and Steam restarts once (never while a game runs); switching it off removes that again (`ezgd/platform/steambridge.py`). A game's own *Invite* button needs Steam's overlay, so it does nothing with this on. (0.5.3 left the overlay out while a Valve controller was connected — that also stopped in-game invites.) Without Steam, a thumb resting on the left trackpad no longer scrolls. The on-screen keyboard has the same shortcuts on every controller, drawn along its bottom in that controller's own buttons: **B** (○) Backspace — on an empty box it closes —, **X / Y** (□ / △) Space, **Start** (Options / Menu) Enter; a Steam controller sent as keys types with A (its Enter) instead of finishing at once, and a held button presses once (only moving and Backspace repeat). The clock shows 12-hour time. Couch mode and the desktop stay in step: settings changed on either side show on the other at once, couch mode opens on the game selected on the desktop and the desktop selects the game couch mode was on, suspended games show on the desktop (Resume / Stop, and More → Suspend there too). |
+| **Quick menu** | With *Our overlay instead of Steam's* on (Settings → Library & launching, and couch mode's Settings → Playing — off by default; off, Steam's overlay is the one over games and the quick menu does not show at all): hold the PS / Xbox / Steam button while playing (couch mode open) — or press **Shift+Tab** on the keyboard (KDE Plasma; only while one of the app's games without Steam's overlay has the focus, so Shift+Tab stays everyone's elsewhere, and Shift+Tab closes it again): a panel slides in over the game — back to the game, **switch game** (the one you were playing is *suspended*: frozen, using no processor or graphics time, and it continues exactly where you left it), go to couch mode (suspending the game), the game's own volume, its settings, quit (press twice). Suspended games show in couch mode and the menu; A continues them. Only games the app runs — directly or through Steam for its overlay; a game started in Steam itself is never touched. Over a game started from the desktop window the menu works the same, but couch mode never takes over by itself: quitting the game there (or the game ending) goes back to the desktop window, *Game settings* shows couch mode's settings screen only until you go back to the game, and only *Go to couch mode* opens couch mode. Leaving couch mode or quitting the app lets every suspended game run again. |
+| **Screens & controllers** | Couch mode reads each monitor's real resolution from the desktop (KDE's kscreen-doctor, GNOME's Mutter, xrandr) — a 4K monitor at 150 % is 3840 × 2160, not the 5120 × 2880 Qt can report. On Wayland a full-screen window's size is the compositor's answer: couch mode never leaves full screen to "fix" it (that shrank it to 800 × 500 on some desktops); on Wayland *Borderless* is full screen (the same picture — and the only window the compositor always sizes to the monitor), and the desktop window comes back from couch mode the size it was (some KDE versions handed it couch mode's full-screen size) — KWin is asked to size it, and the log records the compositor and every size it sent for the first seconds ("couch display trace"). Interface size up to 200 % fits every page (on a 1440-high window 200 % is about 180 %, the most that fits). "Keep above" is for couch mode only and is released from every window when it closes. A Steam Deck / Steam Controller shows its own buttons (LB/RB on the original controller, L1/R1 on the Deck and the new one), also when Steam hands it to the app as keyboard and mouse: which key is which button is read from the Desktop Configuration Steam itself loaded (named in Steam's controller log — Steam's defaults, or the user's own), so every button means what its prompt says, and prompts for buttons Steam turns into mouse clicks are left out. The Steam button is read from Steam's log too: outside a game a tap goes Home and Big Picture is put away at once. Over a game the button is Steam's alone unless *Our overlay instead of Steam's* is on (Steam's overlay — friends, invites, the game's own *Invite* buttons; the app does nothing then, and no quick menu shows). With **Our overlay instead of Steam's** (Settings → Library & launching, and couch mode's Settings → Playing) games start without Steam's overlay and the button — tap or hold — always opens the quick menu, which sits in the middle between you and Steam: your Steam chats are in it (unread counts, the conversation, replies typed on the on-screen keyboard), **Invite** is one press (Steam's own *Invite to Game* — lobby or connect string; invites that keep coming to the same friend wait out a cool-down that doubles each time, from 15 s up to 5 minutes, while an invite a minute after the last is never held up), a friend's invite shows as **Join <name>** at the top of the menu, and joining goes through Steam — no Steam window opens. Both work the way Steam's own client does (its code, read 2026-10-27): **Invite** sends the game's lobby or its connect string (the private one first) — with neither, Steam offers no invite, and the menu says so instead of sending an empty one nobody can join; **Join** is offered only for invites Steam can join (a lobby, a connect string or a Remote Play session), and with the same link Steam's chat opens. An empty invite (OnlineFix games send `[gameinvite appid="480"]` when the game published no lobby) used to show Join and start Spacewar. Joining a friend's game from the friends list also uses their game's connect string, like Steam's *Join Game*; joining a friend in the game you are playing never suspends it. The friends list then comes from the Steam client itself too — live, without a Steam Web API key: in a game first (green ring), then online (blue; away / snooze dimmer), then offline (grey), like Steam; **X / △** (or typing a name) finds a friend, B shows everyone again. It talks to the Steam client itself, like Decky Loader: off by default; the first time it is switched on, two lines say what it does, Steam's debugging interface is switched on (`<Steam>/.cef-enable-remote-debugging`) and Steam restarts once (never while a game runs); switching it off removes that again (`ezgd/platform/steambridge.py`). A game's own *Invite* button needs Steam's overlay, so it does nothing with this on. (0.5.3 left the overlay out while a Valve controller was connected — that also stopped in-game invites.) Without Steam, a thumb resting on the left trackpad no longer scrolls. The on-screen keyboard has the same shortcuts on every controller, drawn along its bottom in that controller's own buttons: **B** (○) Backspace — on an empty box it closes —, **X / Y** (□ / △) Space, **Start** (Options / Menu) Enter; a Steam controller sent as keys types with A (its Enter) instead of finishing at once, and a held button presses once (only moving and Backspace repeat). The clock shows 12-hour time. Couch mode and the desktop stay in step: settings changed on either side show on the other at once, couch mode opens on the game selected on the desktop and the desktop selects the game couch mode was on, suspended games show on the desktop (Resume / Stop, and More → Suspend there too). |
 | **Couch mode = desktop** | Everything the desktop Library does, by controller: **Finish setup** (a checklist from download to Play, one button for the next step — unpack, the repack's installer, the base game in Steam, the game's program), every fix, Run with, Steam App ID, DLL overrides, winecfg / Winetricks / reset prefix, *See what's wrong* (the debugging assistant's findings with their fixes), collections, rename, update check, repack check, add to Steam, remove from the Library, delete a save backup; and in Settings → Library: check every game for updates, Storage, clean up leftovers, import a game folder. Fix my game's test starts can be stopped (B / *Stop testing*). |
 | **Steam friends** | The quick menu's *Friends* and couch mode's *Friends* tab: who is online, away or playing, and what — live from Steam's Web API with your own key (Settings → Library & launching → Steam friends; made once at steamcommunity.com/dev/apikey, kept on this computer and sent only to api.steampowered.com, never logged). Without a key, or with a private friends list, the friends Steam keeps on this computer are shown; with *Our overlay instead of Steam's* on, the list comes live from the Steam client itself (see *Screens & controllers*). A friend: **Chat** (Steam's chat window comes up), **Invite to <your game>** (while Steam shows you in a game — or, without a key, while one of the app's games is played: Steam has no link or API that sends an invite, so it opens Steam's chat with them and says to choose *Invite to Game* in the menu by their name; the game is named as in your Library, not Steam's "Spacewar" for OnlineFix games), **Join their game** (when they are in a joinable lobby or server — Steam starts it), **Play** the game they play (through Steam) and their **Steam profile**. |
 | **Game settings (couch)** | Manage → Game settings, or from the quick menu: Proton version, Steam overlay, launch options (on-screen keyboard with symbols and capitals), FPS limit (DirectX games), MangoHud, GameMode — from the game's next start. |
@@ -345,7 +345,7 @@ On by default (switch in the browser window and in *Settings → Sources*):
 
 **Full overlay (default)** — *Settings → Library & launching → Full Steam overlay*: Steam only gives its complete
 overlay (Shift+Tab any time: friends, chat, browser, screenshots, FPS counter, Steam Input — in those games
-Shift+Tab stays Steam's; in the app's games without it Shift+Tab opens the quick menu) to games it starts
+Shift+Tab stays Steam's; the quick menu exists only with *Our overlay instead of Steam's*) to games it starts
 itself and knows. So every game gets a non-Steam shortcut in Steam that runs this app in play mode
 (`ezgd --play <id>`, which starts the game exactly like Play — same Proton, runtime, fixes, launch options —
 writes its log and records playtime), and Play asks Steam to start it. Steam reads its shortcut list only when it
@@ -381,12 +381,43 @@ the desktop, this app's windows, its quick menu — gets Steam's *desktop layout
 keys; the virtual Xbox pad games read is gone). Steam knows its own games, the games it starts from this app's
 shortcuts (Steam's gamepad template, or the layout chosen for the shortcut in Steam) and the games that sign in to it
 (OnlineFix games, as Spacewar 480). It never knows a game this app starts that does not talk to Steam — emulators (a
-friend's Bloodborne, shadPS4 from SteamRIP: "the mouse was moving with the controller"), most repacks. For those the
-app sends Steam `steam://forceinputappid/480` when the game starts: Spacewar's layout, the one OnlineFix games already
-get (Steam's gamepad template unless changed in Steam → Spacewar → Controller layout). Whether Steam took it is read
-back from Steam's `logs/controller.txt` ("Queueing activation for controller: 0 app: 480") and written to the game's
-log (`ezgd:steam-input …`). Off: *Settings → Library & launching*; games with *Without Steam Input* get nothing
-forced (`ezgd/platform/steaminput.py`).
+friend's Bloodborne, shadPS4 from SteamRIP: "the mouse was moving with the controller"), most repacks.
+
+**Spacewar's layout is not a gamepad** (measured 2026-10-28). The first time anything runs as Spacewar, Steam picks
+Valve's own Steam Input API layout for it ("Space War Action Set Config Sample", Workshop 1417465272): every binding
+is a Spacewar action, so Steam makes no virtual pad (`mapping uses xinput : false` in its log) and a game that is not
+Spacewar gets nothing. That is what every OnlineFix game gets by itself — started by the app or by Steam (Steam had
+readied the shortcut's gamepad template, then switched to Spacewar's the moment the game's window had the focus) —
+and what 0.6.9 and earlier asked for themselves for the other games. Other controllers did not show it: games read a
+PlayStation or Xbox pad themselves. A Steam Controller or a Steam Deck can only reach a game as Steam's virtual pad,
+so in those games it did nothing at all (unless the player had changed Spacewar's layout in Steam).
+
+What the app asks Steam for while one of its games runs (`steam://forceinputappid/<app>`, measured in the background
+with Steam's logs: Steam switches within ~50–100 ms, and an id it does not know is ignored without a trace):
+* **with a Valve controller connected** (Steam Controller, Steam Deck, the new Steam Controller): the game's own layout
+  in Steam — the app's shortcut for it, or the player's own shortcut for the same game: Steam's gamepad template, or
+  the layout chosen for it in Steam — else the layout of another of the app's Steam shortcuts, and Spacewar's only as
+  the last resort. The app checks that Steam made its virtual pad for the layout (`/sys/class/input`, 28de:11ff) and
+  moves on to the next one if not; when none does, a message says what helps (add the game to Steam, or choose a
+  gamepad layout for it in Steam). OnlineFix games get this too;
+* **with other controllers only**: Spacewar's layout for games Steam does not know (as before) — it sends nothing, so
+  Steam's desktop layout (stick = mouse) stays out of the game, which reads the controller itself, and there is no
+  second, virtual pad (the same controller twice); OnlineFix games are left to Steam;
+* **a game Steam started (play mode)**: Steam's own layout for its shortcut, as before — except an OnlineFix game:
+  Steam switches it to Spacewar's the moment its window has the focus, and hides the real controller from games it
+  starts, so its shortcut's layout is kept while it runs (play mode records which shortcut Steam started) — with a
+  Valve controller, or when Steam Input is on for other controllers in that game (Steam's "Opted-in Controller Mask"
+  at the start: 0x1000 is every app's, the low bits the other controllers'; measured: a DualSense got a layout with
+  1001, none with 1000). Otherwise the game reads its controller itself and Steam's choice is left alone;
+* a game that runs as a real Steam app (OnlineFix as the genuine app, *Tell Proton the Steam App ID*) keeps that
+  app's layout.
+
+Whether Steam took a layout, and made a pad for it, is read back from Steam's `logs/controller.txt` ("Queueing
+activation for controller: 0 app: …" — Steam writes a shortcut's id there as a negative number) and written to the
+game's log (`ezgd:steam-input …`). GE-Proton and Proton-CachyOS ignore Steam's virtual pad with *Without Steam Input*,
+*Controllers through SDL* or *Native Wayland* (their `winebus`: "ignoring steam input virtual controller"); with a
+Valve controller connected the app says so when such a game starts, and *Fix my game* no longer suggests the first two
+for controller problems. Off: *Settings → Library & launching* (`ezgd/platform/steaminput.py`).
 
 What Steam does with a forced layout was measured on Steam itself (2026-10-27, reading `controller.txt` and
 `controller_ui.txt`, which logs the reason for every choice: "OnFocusWindowChanged … URL Forcing … 480"):
@@ -397,18 +428,21 @@ What Steam does with a forced layout was measured on Steam itself (2026-10-27, r
   switched (a game still running keeps its layout); a Steam Controller no longer stays a gamepad on the desktop;
 * steam:// links reach Steam asynchronously, so the second link waits until Steam logged the first.
 
-**The quick menu leaves Steam's layout alone.** Over a forced game the controller stays the game's virtual pad: the
-menu reads that pad, and the game keeps its controller (0.6.3 forced the desktop layout for the menu — the pad went
-away and came back as a new device, which a game may never pick up again: a friend's Dark Souls III). Over a game Steam
-knows (OnlineFix games, games started through Steam), Steam itself gives the focused menu its desktop layout — a Steam
-Controller then drives the menu with keys — and the game its own layout back the moment it has the focus again
-(0.6.3's `/0` after the menu was the bug that left those games without a controller). Games started through Steam
-(Steam's overlay chosen) get nothing forced either: Steam's layout for its shortcut is a gamepad and works with its
-overlay. While any game of the app runs, Steam's choices go to the app's log ("Steam switched the controller to the …
-layout", "Steam controller layout: …"), and a forced layout Steam lost (Steam restarted) is asked for again. A layout
-still forced when the app quits — or left by a crash — is handed back (at the next start); play mode (a game Steam
-starts) never does that, and never thaws the games the quick menu froze to switch games — it ran next to the app and
-did both.
+**The quick menu keeps the game's layout.** Over a game whose layout the app asked for, nothing changes: the
+controller stays the game's virtual pad and the menu reads that pad (0.6.3 forced the desktop layout for the menu —
+the pad went away and came back as a new device, which a game may never pick up again: a friend's Dark Souls III).
+Over a game Steam chose the layout for (a game Steam started), the menu taking the focus would make Steam switch to
+its desktop layout, so the layout Steam chose for the game (its log names it: "to game window type: AppID …") is
+asked for just before the menu shows and released a second after it goes. While the menu is open, Steam's virtual pad
+is read by the app alone (the kernel's `EVIOCGRAB`): the game reads the same pad, and a press in the menu — B to
+close it, A on *Quit* — reached the game too. The pad is only taken once everything on it is let go (the current
+state is read when the pad is opened), and given back if a press from just before it was taken reached the game —
+otherwise the game would keep a stick or a button held that it never saw released. While any game of the app runs,
+Steam's choices go to the app's log ("Steam switched the controller to the … layout", "Steam controller layout: …"),
+and a forced layout Steam lost (Steam restarted) is asked for again; switching back to a suspended game asks for its
+own layout again. A layout still forced when the app quits — or left by a crash — is handed back (at the next start);
+play mode (a game Steam starts) never does that, and never thaws the games the quick menu froze to switch games — it
+ran next to the app and did both.
 
 **The screen stays on.** A controller is not activity to the desktop: KDE and GNOME dim and lock after their idle time
 while you play with one (Steam only prevents it for games it starts). While one of the app's games runs — not while it
@@ -454,8 +488,8 @@ focused game's artwork fills the background, with its playtime, a big **Play** a
   Steam does not know are hidden too. *Settings → Store* switches it off.
 * **Playing:** A starts the game the way Play does (the same confirmation, Proton setup and fixes). Couch mode
   steps aside while you play and comes back when the game ends ("Welcome back"). It never restarts Steam.
-* **Quit from the controller:** hold the PS / Xbox / Steam button while playing to open the quick menu; its *Quit*
-  (press twice) stops the game completely, like the ✕. Only games the app runs are touched.
+* **Quit from the controller:** with *Our overlay* on, hold the PS / Xbox / Steam button while playing to open the
+  quick menu; its *Quit* (press twice) stops the game completely, like the ✕. Only games the app runs are touched.
 * **The game behind the quick menu:** some games minimize themselves when another window takes the focus (Dark Souls III
   in full screen), and the see-through menu showed the desktop. On KDE the screen is photographed (KWin, ~30 ms) just
   before the menu opens and stays behind it; *Back to the game* brings the game itself to the front again.
@@ -1141,6 +1175,18 @@ that PC can check:
   press right after closing the menu of a desktop start was lost (the hidden couch mode closed under the opening
   menu). The earlier note that Steam makes no virtual pad without a game process was wrong: it was a layout that sends
   no pad at all.
+  **The deeper cause (2026-10-28, after 0.6.9):** that layout is Spacewar's own — Valve's Steam Input API layout for
+  Spacewar, which Steam picks by itself for anything running as 480. Every OnlineFix game (started by the app or by
+  Steam) and every game the app asked Spacewar's layout for got no gamepad at all from a Steam Controller, unless
+  Spacewar's layout had been changed in Steam. The app now asks for the game's own Steam layout with a Valve controller
+  (see *Controllers and the screen while playing*), checks that Steam made a pad, and says what helps when it cannot.
+  Also fixed: the quick menu over a game Steam started waited the full 1.5 s for Steam every time (Steam writes a
+  shortcut's id as a negative number), menu presses also reached the game, *Without Steam Input* never counted, a game
+  started before Steam got nothing once Steam ran, and handing the layout back after Steam had quit started Steam
+  again. **Still to check with a real controller:** the game's own Steam layout in an OnlineFix game and in a repack
+  with a Steam Controller (the game log's `ezgd:steam-input` line says whether Steam made a pad), and that Steam's
+  overlay (Steam button tap) can still be moved through with the D-pad while a layout is asked for — a 2022 Special K
+  report said Steam's overlay lost D-pad input after `forceinputappid`.
 
 * **Pages of a site that is "not found" for a moment (0.6.8)** — a tester's cracked-games.org page said *could not
   resolve … Name or service not known* and loaded on the second *Try again*; the app now tries twice more by itself.
@@ -1154,8 +1200,8 @@ that PC can check:
   page is in front and takes clicks (on KDE Wayland 0.6.5 left the main window in front, frozen; checked here on
   KWin 6.8.1, where KWin's window stack now shows the page on top and active).
 
-* **Shift+Tab** over a game without Steam's overlay (KDE Plasma) opens the quick menu and closes it again; Shift+Tab
-  keeps working normally in other windows.
+* **Shift+Tab** over a game without Steam's overlay (KDE Plasma, *Our overlay* on) opens the quick menu and closes
+  it again; Shift+Tab keeps working normally in other windows.
 
 * **The Downloads section lag** a tester reported (not reproduced here: 10–23 ms with 120 downloads) — the log now has
   a "Downloads page opened" / "couch Downloads tab opened" line per visit and a "UI stall" line naming the code if it

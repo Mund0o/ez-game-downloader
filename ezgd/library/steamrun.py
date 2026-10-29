@@ -113,6 +113,16 @@ def _confirm(title: str, exe: str) -> bool:
     return r == QMessageBox.Yes
 
 
+def started_shortcut() -> int | None:
+    """The Steam shortcut (app id) Steam started play mode from: Steam passes its 64-bit game id
+    (``SteamGameId`` = app id << 32 | 0x02000000; a real Steam app's id is just the id)."""
+    try:
+        gid = int(os.environ.get("SteamGameId") or 0)
+    except ValueError:
+        return None
+    return (gid >> 32) & 0xFFFFFFFF or None
+
+
 def play(paths, entry_id: int) -> int:
     """Play mode (run by Steam): start the game like the Play button, wait for it, record the session."""
     from ezgd.core.settings import SettingsStore
@@ -122,6 +132,7 @@ def play(paths, entry_id: int) -> int:
     from ezgd.library.models import LaunchMethod
     from ezgd.platform import launcher
 
+    shortcut = started_shortcut()                 # (before an OnlineFix game's ids replace Steam's below)
     db = Database(paths.database, backup_dir=paths.backups).open()
     try:
         settings = SettingsStore(db)
@@ -185,7 +196,8 @@ def play(paths, entry_id: int) -> int:
         running = paths.data / "running"
         running.mkdir(parents=True, exist_ok=True)
         mk = marker(running, e.id)
-        mk.write_text(json.dumps({"runner": os.getpid(), "game": proc.pid, "started": time.time()}))
+        mk.write_text(json.dumps({"runner": os.getpid(), "game": proc.pid, "started": time.time(),
+                                  "shortcut": shortcut}))
 
         def forward(signum, _frame):                 # Steam's Stop / logout: stop the game too
             launcher.terminate(proc)

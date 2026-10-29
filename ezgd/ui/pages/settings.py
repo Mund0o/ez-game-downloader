@@ -424,9 +424,11 @@ class SettingsPage(QWidget):
         self._check(f, "steam_input_layout", "Controllers act as a gamepad in games, not as Steam's desktop mouse",
                     "While Steam runs it drives the controller with its desktop layout (the stick moves the mouse) "
                     "until it knows a game is running — and it never knows about a game this app starts that does "
-                    "not talk to Steam (emulators like Bloodborne's, most repacks). The app asks Steam for a game "
-                    "layout while such a game runs (Spacewar's: change it in Steam → Spacewar → Controller layout) "
-                    "and hands the choice back when it ends.")
+                    "not talk to Steam (emulators like Bloodborne's, most repacks), while OnlineFix games get "
+                    "Spacewar's layout, which sends nothing to them. With a Steam Controller or Steam Deck the app "
+                    "asks Steam for the game's own layout in Steam (its gamepad template, or the one you chose for "
+                    "the game there) while it runs, and hands the choice back when it ends; other controllers are "
+                    "read by the game itself, and Steam's desktop layout is kept out of the game.")
         self._check(f, "keep_awake", "Keep the screen on while a game runs (and in couch mode)",
                     "A controller does not count as activity to the desktop, so a game played with one dimmed and "
                     "locked after a few minutes. The app holds the screen on while one of its games runs (not while "
@@ -450,11 +452,11 @@ class SettingsPage(QWidget):
         self.share_info = label("", "small", wrap=True)
         f.addRow("", self.share_info)
         self.bridge.call(self.bridge.core.crowd_status(), self._crowd_status, owner=self)
-        own = QCheckBox("Our overlay instead of Steam's: chat, invites and joining in the quick menu")
-        own.setToolTip("On: games start without Steam's overlay, and the PS / Xbox / Steam button (tap or hold) opens "
-                       "the app's quick menu over the game — your Steam chats, one-click invites to your game, "
-                       "joining theirs — through the Steam client itself, without Steam's windows. Off: Steam's "
-                       "overlay as usual.")
+        own = QCheckBox("Our overlay instead of Steam's: the quick menu over games, with chat, invites and joining")
+        own.setToolTip("On: games start without Steam's overlay, and the PS / Xbox / Steam button (tap or hold) or "
+                       "Shift+Tab opens the app's quick menu over the game — switch or suspend games, volume, quit, "
+                       "your Steam chats, one-click invites to your game, joining theirs — through the Steam client "
+                       "itself, without Steam's windows. Off: Steam's overlay as usual, and no quick menu at all.")
         own.toggled.connect(self._own_overlay_toggled)
         f.addRow("", own)
         self.widgets["own_overlay"] = own

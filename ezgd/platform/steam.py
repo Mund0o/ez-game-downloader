@@ -422,7 +422,7 @@ def same_game_shortcut(shortcuts: list[dict], *, title: str, game_exe: str | Non
     * one made outside the app (by the user, Steam or another tool) that starts the game's executable or anything
       in its folder, or has the game's name (``PEAK.exe`` for *PEAK*);
     * the app's shortcut for *another* Library entry of the same game that still exists (``live_ids``).
-    Returns ``{"name", "by_app"}`` or None."""
+    Returns ``{"name", "by_app", "appid"}`` (``appid`` unsigned) or None."""
     key = _norm_name(title)
     exe = Path(game_exe).resolve() if game_exe else None
     folder = Path(game_dir).resolve() if game_dir else None
@@ -433,7 +433,7 @@ def same_game_shortcut(shortcuts: list[dict], *, title: str, game_exe: str | Non
         if pid is not None:
             if pid != entry_id and live_ids is not None and pid in live_ids and len(key) >= 2 \
                     and _norm_name(v.get("AppName", "")) == key:
-                return {"name": str(v.get("AppName", "")), "by_app": True}
+                return {"name": str(v.get("AppName", "")), "by_app": True, "appid": _appid_of(v)}
             continue
         if _is_app_shortcut(v):
             continue
@@ -444,8 +444,47 @@ def same_game_shortcut(shortcuts: list[dict], *, title: str, game_exe: str | Non
             rp = p
         same = (exe is not None and rp == exe) or (folder is not None and rp is not None and folder in rp.parents)
         if same or (len(key) >= 3 and _norm_name(v.get("AppName", "")) == key):
-            return {"name": str(v.get("AppName", "")), "by_app": False}
+            return {"name": str(v.get("AppName", "")), "by_app": False, "appid": _appid_of(v)}
     return None
+
+
+def _appid_of(v: dict) -> int:
+    try:
+        return int(v.get("appid", 0)) & 0xFFFFFFFF            # (kept signed in the file)
+    except (TypeError, ValueError):
+        return 0
+
+
+def layout_shortcuts(steam_root: Path, *, entry_id: int, title: str, game_exe: str | None = None,
+                     game_dir: str | None = None) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
+    """Steam shortcuts whose controller layout can be the game's, as (app id, name): (the game's own — the app's
+    ``--play <entry_id>`` first, then one the player made for the same game —, the app's shortcuts for other
+    games). Steam's layout for a shortcut is its gamepad template unless the player chose another for it."""
+    own: list[tuple[int, str]] = []
+    theirs: list[tuple[int, str]] = []
+    others: list[tuple[int, str]] = []
+    for user in steam_users(steam_root):
+        items = shortcuts_of(steam_root, user)
+        for v in items:
+            appid, pid = _appid_of(v), play_id(v)
+            if appid and pid == entry_id:
+                own.append((appid, str(v.get("AppName", ""))))
+            elif appid and pid is not None:
+                others.append((appid, str(v.get("AppName", ""))))
+        hit = same_game_shortcut(items, title=title, game_exe=game_exe, game_dir=game_dir, entry_id=entry_id)
+        if hit is not None and hit["appid"]:
+            theirs.append((hit["appid"], hit["name"]))
+    seen: set[int] = set()
+
+    def unique(items: list[tuple[int, str]]) -> list[tuple[int, str]]:
+        out = []
+        for x in items:                                    # (the same shortcut for two Steam users: once)
+            if x[0] not in seen:
+                seen.add(x[0])
+                out.append(x)
+        return out
+    mine = unique(own + theirs)
+    return mine, unique(others)
 
 
 def steam_copy_of(steam_root: Path, **kw) -> dict | None:

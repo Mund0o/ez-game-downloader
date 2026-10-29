@@ -176,7 +176,7 @@ async def test_a_game_that_never_talks_to_steam_gets_a_game_layout(steam_here, t
         if "ezgd:steam-input" in log_path.read_text():
             break
         time.sleep(0.25)
-    assert "ezgd:steam-input Steam switched the controller to the game layout" in log_path.read_text()
+    assert "ezgd:steam-input Steam switched the controller to Spacewar's layout (480)" in log_path.read_text()
     ended(core, e.id)                                  # the last game: back through the desktop layout
     assert until(lambda: sent[-1] == "steam://forceinputappid/0")
     assert sent == ["steam://forceinputappid/480", "steam://forceinputappid/413080", "steam://forceinputappid/0"]
@@ -235,7 +235,14 @@ async def test_a_layout_left_forced_is_handed_back(core, tmp_path, monkeypatch):
     sent = []
     monkeypatch.setattr(steaminput, "enabled", lambda: True)
     monkeypatch.setattr(steam, "open_steam_url", sent.append)
+    monkeypatch.setattr(steam, "is_steam_running", lambda: True)
     LibraryManager(core.library.repo, core.library.games, core.library.settings, core.paths, lambda n, p: None)
     assert until(lambda: sent[-1:] == ["steam://forceinputappid/0"], 6)
     assert sent == ["steam://forceinputappid/413080", "steam://forceinputappid/0"]
     assert not (core.paths.data / "steam-input-forced").exists()
+    (core.paths.data / "steam-input-forced").write_text("480")      # Steam is not running: it forgot it already
+    sent.clear()
+    monkeypatch.setattr(steam, "is_steam_running", lambda: False)
+    LibraryManager(core.library.repo, core.library.games, core.library.settings, core.paths, lambda n, p: None)
+    time.sleep(0.3)
+    assert sent == [] and not (core.paths.data / "steam-input-forced").exists()   # (and Steam is not started)

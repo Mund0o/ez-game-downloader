@@ -617,12 +617,18 @@ def _game_drive(ctx, symptom, findings, deep) -> list[GeneratedFix]:
 def _controller(ctx, symptom, findings, deep) -> list[GeneratedFix]:
     if symptom != "controller":
         return []
-    return [GeneratedFix("input:sdl", "Controllers through SDL", "Proton's SDL path recognises most controllers and "
-                         "avoids doubled devices.", options=["prefer_sdl"]),
-            GeneratedFix("input:no-steaminput", "Without Steam Input", "Steam Input translates controllers; some "
-                         "games then see a keyboard or a wrong pad.", options=["no_steaminput"]),
-            GeneratedFix("input:no-hidraw", "Without raw HID access", "Raw HID access shows some controllers twice "
-                         "or with wrong buttons.", options=["no_hidraw"])]
+    from ezgd.platform import steam
+    out = [GeneratedFix("input:sdl", "Controllers through SDL", "Proton's SDL path recognises most controllers and "
+                        "avoids doubled devices.", options=["prefer_sdl"]),
+           GeneratedFix("input:no-steaminput", "Without Steam Input", "Steam Input translates controllers; some "
+                        "games then see a keyboard or a wrong pad.", options=["no_steaminput"]),
+           GeneratedFix("input:no-hidraw", "Without raw HID access", "Raw HID access shows some controllers twice "
+                        "or with wrong buttons.", options=["no_hidraw"])]
+    if steam.valve_controllers():
+        # a Steam Controller / Steam Deck reaches a game only as Steam's virtual pad, which GE-Proton and
+        # Proton-CachyOS ignore with these two (PROTON_NO_STEAMINPUT): the controller would do nothing at all
+        out = [f for f in out if not {"prefer_sdl", "no_steaminput"} & set(f.options)]
+    return out
 
 
 def _no_d3d11(ctx, symptom, findings, deep) -> list[GeneratedFix]:

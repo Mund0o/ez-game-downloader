@@ -26,7 +26,12 @@ from PySide6.QtCore import QObject, QSocketNotifier, QTimer, Signal
 
 log = logging.getLogger(__name__)
 
-EV_KEY, EV_ABS = 0x01, 0x03
+EV_SYN, EV_KEY, EV_ABS = 0x00, 0x01, 0x03
+EVIOCGRAB = 0x40044590                              # _IOW('E', 0x90, int): this reader alone gets the device's events
+EVIOCSCLOCKID = 0x400445A0                          # _IOW('E', 0xa0, int): the clock the event times are in
+CLOCK_MONOTONIC = 1
+KEY_BYTES = 96                                      # (KEY_MAX + 1) / 8
+EVIOCGKEY = (2 << 30) | (KEY_BYTES << 16) | (ord("E") << 8) | 0x18      # the buttons held now
 BTN_SOUTH, BTN_EAST, BTN_C, BTN_NORTH, BTN_WEST = 0x130, 0x131, 0x132, 0x133, 0x134
 BTN_TL, BTN_TR, BTN_TL2, BTN_TR2 = 0x136, 0x137, 0x138, 0x139
 BTN_SELECT, BTN_START, BTN_MODE = 0x13A, 0x13B, 0x13C
@@ -158,16 +163,35 @@ class _Device:
         self.trigger = {ABS_Z: False, ABS_RZ: False}
         self.ranges: dict[int, tuple[int, int]] = {}
         self.axes = {ABS_X: 0.0, ABS_Y: 0.0, ABS_RX: 0.0, ABS_RY: 0.0}   # -1 … 1 (the pointer in the browser)
+        self.level = {ABS_Z: 0.0, ABS_RZ: 0.0, ABS_HAT0X: 0, ABS_HAT0Y: 0}   # triggers 0 … 1, d-pad axes
         for code in (ABS_X, ABS_Y, ABS_Z, ABS_RZ, ABS_RX, ABS_RY, ABS_HAT0X, ABS_HAT0Y):
             try:
                 buf = fcntl.ioctl(fd, _eviocgabs(code), bytes(ABSINFO.size))
-                _v, lo, hi, _f, _flat, _r = ABSINFO.unpack(buf)
+                v, lo, hi, _f, _flat, _r = ABSINFO.unpack(buf)
                 if hi > lo:
                     self.ranges[code] = (lo, hi)
+                    if code in self.axes:                # where it is now (a stick held while it was opened)
+                        self.axes[code] = max(-1.0, min(1.0, (v - (lo + hi) / 2) / ((hi - lo) / 2)))
+                    elif code in (ABS_Z, ABS_RZ):
+                        self.level[code] = (v - lo) / (hi - lo)
+                    elif max(abs(lo), abs(hi)) <= 1:
+                        self.level[code] = v
             except (OSError, ValueError):               # not an input device (or no such axis)
                 pass
         self.stick = {ABS_X: 0, ABS_Y: 0}          # -1 / 0 / 1 per axis
         self.notifier: QSocketNotifier | None = None
+        self.down: set[int] = set()                # buttons held now (any code)
+        try:
+            bits = int.from_bytes(fcntl.ioctl(fd, EVIOCGKEY, bytes(KEY_BYTES)), "little")
+            self.down = {c for c in range(KEY_BYTES * 8) if bits >> c & 1}
+        except (OSError, ValueError):
+            pass
+        self.grabbed = 0.0                         # when the app took the pad for itself (0: it has not)
+        try:                                       # event times on the monotonic clock (see Gamepads.hold_virtual)
+            fcntl.ioctl(fd, EVIOCSCLOCKID, struct.pack("i", CLOCK_MONOTONIC))
+            self.mono = True
+        except (OSError, ValueError):
+            self.mono = False
 
 
 class Gamepads(QObject):
@@ -204,9 +228,8 @@ class Gamepads(QObject):
         self.guide.tapped.connect(lambda: self._steam_guide(False))
         self.guide.held.connect(lambda: self._steam_guide(True))
         self._home_seen = 0.0                            # the guide button read from a controller, last
-        self.home_from_steam = False                     # the last "home" was a Steam-button tap Steam logged (its
-        #                                                  controller: over a game with Steam's overlay, Steam's)
         self.pointer_mode = False                        # the left stick moves a pointer: no stick → directions
+        self._holding = False                            # Steam's virtual pads are the app's alone (hold_virtual)
         self._repeat = QTimer(self)
         self._repeat.setInterval(int(REPEAT_EVERY * 1000))
         self._repeat.timeout.connect(self._tick)
@@ -260,6 +283,49 @@ class Gamepads(QObject):
             self.family = family
             self.family_changed.emit(family)
 
+    # ------------------------------------------------------------- the game's pad, the app's alone for a moment
+    def hold_virtual(self, on: bool) -> None:
+        """While the quick menu is open over a game: Steam's virtual pads are read by the app alone (EVIOCGRAB).
+        The game reads the same pad (Steam's layout for it is kept while the menu is open, see steaminput), so every
+        press in the menu reached the game too. A pad is only taken at rest — the game has to have seen every
+        button, stick and trigger let go, or it keeps one held that it never sees released. Closing the device
+        (the app quitting, Steam taking the pad away) gives it back by itself."""
+        self._holding = on
+        for dev in list(self.devices.values()):
+            if dev.virtual:
+                self._take(dev, on and self._at_rest(dev))
+
+    @staticmethod
+    def _at_rest(dev) -> bool:
+        level = getattr(dev, "level", {})
+        return not getattr(dev, "down", None) and \
+            all(abs(v) < STICK_DEADZONE for v in getattr(dev, "axes", {}).values()) and \
+            level.get(ABS_Z, 0.0) < 0.1 and level.get(ABS_RZ, 0.0) < 0.1 and \
+            not level.get(ABS_HAT0X) and not level.get(ABS_HAT0Y)
+
+    def _take(self, dev, on: bool) -> None:
+        if bool(dev.grabbed) == on:
+            return
+        try:
+            fcntl.ioctl(dev.fd, EVIOCGRAB, 1 if on else 0)
+        except OSError as exc:                           # (EBUSY: something else has it — the game reads it as before)
+            log.debug("controller %s: %s it for the quick menu failed: %s", dev.name, "taking" if on else "giving back",
+                      exc)
+            if not on:
+                dev.grabbed = 0.0
+            return
+        dev.grabbed = (time.monotonic() if dev.mono else time.time()) if on else 0.0
+
+    def _held_while_taken(self, dev, sec: int, usec: int) -> None:
+        """After an input report of a virtual pad while the menu holds it. Not taken yet: taken once at rest.
+        Taken, but the report is from before that (it reached the game as well) and leaves something held: given
+        back, so the game also sees it let go — taken again at rest."""
+        if dev.grabbed:
+            if sec + usec / 1e6 <= dev.grabbed and not self._at_rest(dev):
+                self._take(dev, False)
+        elif self._at_rest(dev):
+            self._take(dev, True)
+
     # ------------------------------------------------------------- devices
     def _steam_direct(self) -> bool:
         """The Valve controller is read directly (Steam does not have it: no keys come from it)."""
@@ -298,11 +364,7 @@ class Gamepads(QObject):
         if held:
             self.home_held.emit()
         else:
-            self.home_from_steam = True
-            try:
-                self.action.emit("home")
-            finally:
-                self.home_from_steam = False
+            self.action.emit("home")
 
     def rescan(self) -> None:
         products = steam_products()
@@ -354,6 +416,8 @@ class Gamepads(QObject):
             dev.notifier.activated.connect(lambda *_args, p=path: self._read(p))
             self.devices[path] = dev
             _log_pad("controller connected: %s (%s)", name, path)
+            if self._holding and dev.virtual:
+                self._take(dev, self._at_rest(dev))      # (Steam made a new pad while the quick menu is open)
             changed = True
         if changed:
             if self.devices and (not self.family or not any(self._family_for(d) == self.family
@@ -418,10 +482,20 @@ class Gamepads(QObject):
             if not data:
                 return
             for off in range(0, len(data) - EVENT.size + 1, EVENT.size):
-                _s, _us, typ, code, value = EVENT.unpack_from(data, off)
+                sec, usec, typ, code, value = EVENT.unpack_from(data, off)
                 self._event(dev, typ, code, value)
+                if typ == EV_SYN and code == 0 and self._holding and dev.virtual and path in self.devices:
+                    self._held_while_taken(dev, sec, usec)         # (a whole report read: its state is complete)
 
     def _event(self, dev: _Device, typ: int, code: int, value: int) -> None:
+        if typ == EV_KEY and value in (0, 1) and hasattr(dev, "down"):
+            (dev.down.add if value else dev.down.discard)(code)
+        elif typ == EV_ABS and code in (ABS_Z, ABS_RZ, ABS_HAT0X, ABS_HAT0Y) and hasattr(dev, "level"):
+            lo, hi = dev.ranges.get(code, (-1, 1))
+            if code in (ABS_Z, ABS_RZ):
+                dev.level[code] = (value - lo) / max(1, hi - lo)
+            elif max(abs(lo), abs(hi)) <= 1:                   # (not a trackpad's touch position)
+                dev.level[code] = value
         if typ == EV_KEY:
             name = BUTTONS.get(code) or BTN_DPAD.get(code)
             if name is None:

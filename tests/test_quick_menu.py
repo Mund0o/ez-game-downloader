@@ -120,6 +120,9 @@ async def test_game_volume_changes_only_the_games_own_sound(core, tmp_path, monk
 
 # ---------------------------------------------------------------------------------------- the menu
 def _running(win, core, tmp_path, qtbot, name):
+    """A game of the app running — with our overlay on: the quick menu shows only then (the user's rule,
+    2026-10-28; with it off, Steam's overlay is the one over the game)."""
+    win.settings["own_overlay"] = True
     e = _install(core.library, tmp_path, name)
     win.bridge.run_sync(core.library_call("launch", e.id, True))
     win._reload_library()
@@ -534,51 +537,77 @@ def test_the_wheel_moves_through_the_quick_menu(ui, qtbot, tmp_path):
     couch.force_close()
 
 
-def test_a_steam_controller_tap_over_a_game_with_steams_overlay_is_steams(ui, qtbot, tmp_path, monkeypatch):
-    """A Steam Controller (Steam has it; its Steam button comes from Steam's log): over a game with Steam's overlay a
-    tap is Steam's (overlay, friends, invites) and only a hold opens the quick menu; without the overlay a tap opens
-    the menu as before. The menu says so once."""
+def test_with_our_overlay_off_the_quick_menu_never_shows(ui, qtbot, tmp_path, monkeypatch):
+    """The user's rule (2026-10-28): with "Our overlay instead of Steam's" off, Steam's overlay is the one over the
+    game and the quick menu does not show at all — not for a tap or a hold of the Steam / PS button (read from the
+    controller or from Steam's log), not for suspended games, and Steam's own windows are left to Steam over a game.
+    (It used to: a hold, or any press of a pad the app reads itself.)"""
+    from ezgd.ui import window_control
     win, core, _ = ui
-    a = _running(win, core, tmp_path, qtbot, "Steam Pad Game")
+    assert not win.settings.get("own_overlay", False)                # (the default)
+    a = _running(win, core, tmp_path, qtbot, "Steam Overlay Game")
+    win.settings["own_overlay"] = False
     couch = _open_couch(win, qtbot)
     qtbot.waitUntil(lambda: a.id in couch.running, timeout=5000)
     monkeypatch.setattr(couch, "isActiveWindow", lambda: False)      # the game has the screen
-    monkeypatch.setattr(couch.pads, "steam_as_keys", lambda: True)
+    guarded = []
+    monkeypatch.setattr(window_control, "guard_steam", lambda ms=3000: guarded.append(ms) or True)
+
+    def no_menu():
+        qtbot.wait(300)
+        return couch.quick is None or not couch.quick.isVisible()
+    monkeypatch.setattr(couch.pads, "steam_as_keys", lambda: True)  # a Steam Controller: its button from Steam's log
     monkeypatch.setattr(couch.pads, "_steam_direct", lambda: False)
-    overlay = {"on": True}
-    monkeypatch.setattr(core.library, "has_steam_overlay", lambda gid: overlay["on"])
-    seen = []
-    couch.pads.action.connect(lambda n: seen.append((n, couch.pads.home_from_steam)))
-    couch.pads._steam_guide(False)                                   # a tap Steam logged
-    assert seen == [("home", True)] and couch.pads.home_from_steam is False
-    qtbot.wait(300)
-    assert couch.quick is None or not couch.quick.isVisible()         # Steam's overlay has it
-    couch.actions.settings["steam_button_tip_seen"] = False
-    couch.pads._steam_guide(True)                                    # held: the quick menu
-    qtbot.waitUntil(lambda: couch.quick is not None and couch.quick._shown >= 1.0, timeout=5000)
-    q = couch.quick
-    assert q.rows[0].key == "h-tip" and "Steam's overlay" in q.rows[0].label and q.rows[q.focus].key == "resume"
-    q.grab()
-    assert couch.actions.settings["steam_button_tip_seen"] is True
-    q.command("b")
-    qtbot.waitUntil(lambda: not q.isVisible(), timeout=3000)
-    couch._home_held()                                               # the tip only once
-    qtbot.waitUntil(lambda: q.isVisible() and q._shown >= 1.0, timeout=5000)
-    assert q.rows[0].key == "resume"
-    q.command("b")
-    qtbot.waitUntil(lambda: not q.isVisible(), timeout=3000)
-    overlay["on"] = False                                            # no overlay in the game: a tap is the menu
-    couch.pads._steam_guide(False)
-    qtbot.waitUntil(lambda: q.isVisible(), timeout=5000)
-    assert "tap opens Steam's overlay" in couch._starting_text()
+    couch.pads._steam_guide(False)                                   # a tap
+    assert no_menu()
+    couch.pads._steam_guide(True)                                    # a hold
+    assert no_menu()
+    couch._pad("home")                                               # a DualSense's PS button, read directly
+    couch.pads.home_held.emit()                                      # … and held
+    assert no_menu() and guarded == []                               # (Steam's windows: Steam's)
+    couch.suspended.add(a.id)                                        # only a suspended game
+    couch._home_held()
+    assert no_menu()
+    couch.suspended.discard(a.id)
+    assert "quick menu" not in couch._starting_text()
+    couch._bpm_tick()                                                # Steam's Big Picture over the game: Steam's
+    assert not couch._bpm_timer.isActive()
     monkeypatch.undo()
     win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
     couch.force_close()
 
 
+@linux_only
+def test_over_a_desktop_start_the_guide_button_listens_only_with_our_overlay(ui, qtbot, tmp_path, monkeypatch):
+    """From the desktop window (couch mode closed) the guide button, Shift+Tab and Steam's Big Picture are only
+    watched with our overlay on; switching it on or off while a game runs takes effect at once."""
+    win, core, _ = ui
+    a = _running(win, core, tmp_path, qtbot, "Desktop Steam Overlay Game")
+    keys = []
+    monkeypatch.setattr(win, "_watch_quick_key", lambda playing: keys.append(playing))
+    win.settings["own_overlay"] = False
+    win._watch_quick_button()
+    assert win._quick_pads is None and keys[-1] is False and not win._bpm_timer.isActive()
+    win._quick_menu_from_desktop()
+    win._quick_menu_by_key()
+    qtbot.wait(300)
+    assert win.couch is None                                         # no quick menu (nor its hidden couch mode)
+    win._settings_loaded({**win.settings, "own_overlay": True}, "own_overlay")     # switched on
+    assert win._quick_pads is not None and keys[-1] is True
+    win._quick_menu_from_desktop()
+    qtbot.waitUntil(lambda: win.couch is not None and win.couch.quick is not None and win.couch.quick.isVisible(),
+                    timeout=5000)
+    win.couch.quick.command("b")
+    qtbot.waitUntil(lambda: win.couch is None, timeout=5000)
+    win._settings_loaded({**win.settings, "own_overlay": False}, "own_overlay")    # and off again
+    assert win._quick_pads is None and keys[-1] is False
+    monkeypatch.undo()
+    win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
+
+
 def test_with_our_overlay_a_steam_tap_is_the_quick_menu(ui, qtbot, tmp_path, monkeypatch):
     """Settings → "Our overlay instead of Steam's": a tap of the Steam button opens the quick menu even over a game
-    that has Steam's overlay, and no tip about Steam's overlay is shown; the desktop's switch greys out Steam's."""
+    that has Steam's overlay; the desktop's switch greys out Steam's."""
     win, core, _ = ui
     a = _running(win, core, tmp_path, qtbot, "Own Overlay Game")
     couch = _open_couch(win, qtbot)
@@ -588,7 +617,6 @@ def test_with_our_overlay_a_steam_tap_is_the_quick_menu(ui, qtbot, tmp_path, mon
     monkeypatch.setattr(couch.pads, "_steam_direct", lambda: False)
     monkeypatch.setattr(core.library, "has_steam_overlay", lambda gid: True)
     monkeypatch.setitem(couch.actions.settings, "own_overlay", True)
-    monkeypatch.setitem(couch.actions.settings, "steam_button_tip_seen", False)
     from PySide6.QtGui import QColor, QImage
     from ezgd.platform import hidden
     shot = QImage(1600, 1600, QImage.Format_RGB32)
@@ -599,7 +627,7 @@ def test_with_our_overlay_a_steam_tap_is_the_quick_menu(ui, qtbot, tmp_path, mon
     couch.pads._steam_guide(False)                                   # a tap Steam logged
     qtbot.waitUntil(lambda: couch.quick is not None and couch.quick._shown >= 1.0, timeout=5000)
     q = couch.quick
-    assert q.rows[0].key == "resume" and couch.actions.settings["steam_button_tip_seen"] is False
+    assert q.rows[0].key == "resume"
     assert "friends, chat and invites" in couch._starting_text()
     assert q._still is not None                    # a game that minimizes itself: its picture stays behind the menu
     img = q.grab().toImage()

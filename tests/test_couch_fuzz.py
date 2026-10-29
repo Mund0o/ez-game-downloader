@@ -57,6 +57,7 @@ def test_couch_mode_survives_random_presses(ui, qtbot, tmp_path, monkeypatch, se
         win.actions.settings["couch_ui_scale"] = int(os.environ["FUZZ_SCALE"])
     couch = _open_couch(win, qtbot)
     couch.actions.settings["couch_controller_only"] = False
+    couch.actions.settings["own_overlay"] = True                     # (the quick menu shows only with our overlay)
     rnd = random.Random(seed)
     steps = int(os.environ.get("FUZZ_STEPS", "1200"))
     errors = _Errors()

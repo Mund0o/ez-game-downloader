@@ -891,7 +891,7 @@ class _Couch:
             self._launch_at.pop(gid, None)                # it has started: no longer "on its way" (the ✕ must not
             #                                               note a game that ran and ended as one to close later)
             from ezgd.ui import steam_bpm
-            if not self._bpm_timer.isActive() and steam_bpm.steam_running():
+            if not self._bpm_timer.isActive() and self.own_overlay() and steam_bpm.steam_running():
                 self._bpm_timer.start()                   # Steam may take the guide button (Steam Input)
             self.running.add(gid)
             if gid in self.launched:
@@ -1564,34 +1564,15 @@ class _Couch:
             if game is not None and self._last_game not in self.suspended:
                 self.give_game_screen(game.id, f"Steam's window put away: back to {game.title}")
 
-    def _steam_tap_over_game(self) -> None:
-        """A Steam Controller's Steam button tapped (Steam logged it) over one of our games: with Steam's overlay in
-        the game the tap is Steam's — its overlay opens (friends, invites); a hold is the quick menu (Steam skips long
-        holds). Without the overlay it is the quick menu, as for other controllers."""
-        playing = [i for i in self.running if i not in self.suspended]
-        gid = self._game_played(playing)
-
-        def got(has: bool) -> None:
-            if self._exiting:
-                return
-            if has:
-                log.info("Steam button tapped over a game with Steam's overlay: Steam's (hold it for the quick menu)")
-                return
-            self.guide_pressed()
-            if self._game_in_front():
-                self._home_held()
-        if gid is None:
-            got(False)
-            return
-        self.bridge.call(self.bridge.core.library_call("has_steam_overlay", gid), got, lambda _e: got(False),
-                         owner=self)
+    def own_overlay(self) -> bool:
+        """"Our overlay instead of Steam's" (Settings): the quick menu is ours over the game. Off, Steam's overlay is
+        the one there, and the quick menu does not show at all (the user's rule, 2026-10-28)."""
+        return bool(self.actions.settings.get("own_overlay", False))
 
     def _pad(self, name: str) -> None:
-        if name == "home" and self.pads.home_from_steam and self._game_in_front() and \
-                not self.actions.settings.get("own_overlay", False) and \
+        if name == "home" and self._game_in_front() and not self.own_overlay() and \
                 not (self.quick is not None and self.quick.isVisible()):
-            self._steam_tap_over_game()
-            return
+            return                                        # Steam's overlay is the one over the game: its button
         if name == "home":
             self.guide_pressed()
         if self.quick is not None and self.quick.isVisible():
@@ -1706,10 +1687,11 @@ class _Couch:
 
     def _bpm_tick(self) -> None:
         """While a game of ours runs: Steam owns a Steam controller, so its Steam button opens Steam's Big Picture —
-        close it and show the quick menu instead (what the guide button does on other controllers)."""
+        close it and show the quick menu instead (what the guide button does on other controllers). Only with our
+        overlay: without it, the Steam button is Steam's over the game."""
         from ezgd.ui import steam_bpm
         playing = [i for i in self.running if i not in self.suspended]
-        if self._exiting or not playing or not steam_bpm.steam_running():
+        if self._exiting or not playing or not steam_bpm.steam_running() or not self.own_overlay():
             self._bpm_timer.stop()
             return
         if self.quick is not None and self.quick.isVisible():
@@ -2052,6 +2034,13 @@ class _Couch:
         elif key in ("couch_screen", "couch_window", "couch_resolution") and self.isVisible() and \
                 not self.isActiveWindow():
             self.apply_display(None)                  # (changed on the desktop; couch mode's own change asks)
+        elif key == "own_overlay":
+            from ezgd.ui import steam_bpm             # the Steam button over a game: the quick menu's, or Steam's
+            if self.own_overlay() and [i for i in self.running if i not in self.suspended] and \
+                    steam_bpm.steam_running():
+                self._bpm_timer.start()
+            elif not self.own_overlay():
+                self._bpm_timer.stop()
         page = self.pages.get(T_SETTINGS)
         if page is not None and self.tab == T_SETTINGS and not self.stack:
             page._build()
@@ -2486,14 +2475,10 @@ class _Couch:
 
     def _starting_text(self) -> str:
         guide = self._pad_labels(self.pad_family or "generic")["home"]
-        if self.actions.settings.get("own_overlay", False) and (self.pads.names() or self.pads.steam_as_keys()):
+        if self.own_overlay() and (self.pads.names() or self.pads.steam_as_keys()):
             return (f"The game opens in a moment. Press {guide} for the quick menu — friends, chat and invites are "
                     "there.")
-        if self.pads.steam_as_keys():                   # (Steam has the controller: a tap of its button is Steam's)
-            return (f"The game opens in a moment. Hold {guide} for the quick menu — a tap opens Steam's overlay "
-                    "(friends, invites).")
-        hold = f" Hold {guide} on the controller for the quick menu." if self.pads.names() else ""
-        return "The game opens in a moment." + hold
+        return "The game opens in a moment."            # (Steam's overlay is the one over the game: no quick menu)
 
     def play(self, e) -> None:
         if e.id in self.running:
@@ -3260,12 +3245,15 @@ class _Couch:
     def _home_held(self) -> None:
         """The PS / Xbox / Steam button held: the quick menu over the game (back to it, switch games with the
         current one suspended, couch mode, volume, settings, quit). Only for games this app runs — directly or
-        through Steam for its overlay; a game started in Steam itself is not in ``running`` and gets nothing."""
+        through Steam for its overlay; a game started in Steam itself is not in ``running`` and gets nothing. Only
+        with our overlay (Settings): without it Steam's overlay is the one over the game."""
         if self._exiting or (self.overlay is not None and self.overlay.tag in ("closing", "quit-game")):
             return
         if self.quick is not None and self.quick.isVisible():
             if time.monotonic() - self.quick.opened_at > 1.2:   # (not the hold of the tap that just opened it)
                 self.quick.command("b")               # held again: back to the game
+            return
+        if not self.own_overlay():
             return
         playing = [i for i in self.running if i not in self.suspended]
         if not playing and not self.suspended:
@@ -3289,7 +3277,7 @@ class _Couch:
         return max(playing, key=lambda i: (when.get(i, float("inf")), i), default=None)   # (not listed yet: newest)
 
     def open_quick(self, game) -> None:
-        if self._exiting:
+        if self._exiting or not self.own_overlay():
             return
         log.info("couch mode: guide button held — quick menu for %s", game.title if game else "suspended games")
         from ezgd.ui.couch_quick import QuickMenu

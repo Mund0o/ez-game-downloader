@@ -435,6 +435,7 @@ class LibraryManager:
         self.closing = False                        # the app is shutting down: nothing new is started
         self._no_meter: set[int] = set()            # games MangoHud crashed in a test: their tests run without it
         self._suspended: dict[int, dict] = {}        # frozen games: {"at": monotonic, "pids": [...]}
+        self._layout_later: dict[int, tuple] = {}    # started before Steam ran: (log, plan) for their layout
         self._frozen_seconds: dict[int, float] = {}  # time a running game spent frozen (not playtime)
         if recover:
             self.thaw_leftovers()
@@ -998,7 +999,7 @@ class LibraryManager:
         self._processes[e.id] = (proc, time.monotonic(), plan, log_path)
         if diagnostic:
             self._watch_error_box(e.id, proc, log_path, start)
-        self._game_input_layout(e, log_path)
+        self._game_input_layout(e, log_path, plan)
         e.executable_trusted = True
         e.last_played_at = time.time()
         e.play_count += 1
@@ -1007,39 +1008,152 @@ class LibraryManager:
         self.emit("library_changed", e.id)
         return plan
 
-    def _game_input_layout(self, e: LibraryEntry, log_path: Path) -> None:
-        """A game started here that never talks to Steam keeps Steam's desktop layout on the controller (the stick
-        moves the mouse, the game gets no gamepad): Steam is told to use a game layout until it ends. Whether
-        Steam switched is read back from its controller log and written to the game's log. Games Steam knows (they
-        sign in to it) only have Steam's choices logged — see steaminput."""
-        if not (IS_LINUX and steaminput.enabled() and steam.is_steam_running()):
+    # Proton settings with which GE-Proton / Proton-CachyOS ignore Steam's virtual controller (their winebus:
+    # "ignoring steam input virtual controller" with PROTON_NO_STEAMINPUT, which their script also sets for SDL
+    # input and for Wine's Wayland driver) — the only way a Steam Controller reaches a game
+    HIDES_STEAM_INPUT = (("PROTON_NO_STEAMINPUT", "Without Steam Input"),
+                         ("PROTON_PREFER_SDL", "Controllers through SDL"), ("PROTON_USE_SDL", "Controllers through SDL"),
+                         ("PROTON_ENABLE_WAYLAND", "Native Wayland"), ("PROTON_USE_WAYLAND", "Native Wayland"))
+    LAYOUT_ACK = 3.0           # how long Steam may take to switch to a layout asked for (it took ~50-100 ms)
+    PAD_WAIT = 0.6             # … and to make its virtual pad for it (~50 ms; a pad of the layout before goes in ~30)
+
+    def controller_layouts(self, e: LibraryEntry, env: dict, windows: bool, proton_dir=None) -> dict:
+        """Which controller layout the app asks Steam for while ``e`` runs (see steaminput): ``layouts`` — Steam
+        app ids to try, best first, each as (id, what it is); empty: none, Steam chooses by the focused window —,
+        ``valve`` (a Valve controller is connected: games cannot read it themselves, they need Steam's virtual pad),
+        ``why`` and ``warn`` (why a Steam Controller will do nothing in this game; "" if nothing is known).
+        ``env``: the game's launch environment; ``windows``: it runs through Proton (``proton_dir``)."""
+        valve = bool(steam.valve_controllers())
+        out: dict = {"layouts": [], "valve": valve, "why": "", "warn": ""}
+        app = str(env.get("SteamAppId") or "")
+        if app not in ("", "0"):
+            out["why"] = f"it runs as Steam app {app}: Steam gives it that app's own layout"
+            return out
+        spacewar = (steaminput.GAME_LAYOUT, "Spacewar's layout (480)")
+        hidden = ""
+        if windows and proton_dir:
+            from ezgd.platform import proton
+            hidden = next((label for var, label in self.HIDES_STEAM_INPUT
+                           if str(env.get(var, "")).strip() not in ("", "0")
+                           and proton.proton_supports(proton_dir, "PROTON_NO_STEAMINPUT")), "")
+        if not valve:
+            if self.talks_to_steam_itself(e):
+                out["why"] = "Steam gives it Spacewar's layout by itself (it signs in as Spacewar); the game reads " \
+                             "its controller itself"
+                return out
+            out["layouts"] = [spacewar]
+            out["why"] = "it keeps Steam's desktop layout (stick = mouse) out of the game, which reads its " \
+                         "controller itself"
+            return out
+        if hidden:
+            out["layouts"] = [spacewar]
+            out["warn"] = (f"“{hidden}” is on for {e.title}, and with it {Path(proton_dir).name} ignores Steam's "
+                           "controller — a Steam Controller does nothing in the game. Turn it off on the game's Fixes "
+                           "screen.")
+            return out
+        root = self.steam_root()
+        mine, others = steam.layout_shortcuts(root, entry_id=e.id, title=e.title, game_exe=e.executable,
+                                              game_dir=e.install_path) if root is not None else ([], [])
+        out["layouts"] = [(a, f"the game's own layout in Steam ({a})") for a, _n in mine] + \
+            [(a, f"the layout of {n or 'another game'}'s Steam shortcut ({a})") for a, n in others] + [spacewar]
+        out["own"] = bool(mine)
+        out["why"] = "a Valve controller: the game needs Steam's virtual pad"
+        return out
+
+    def _game_input_layout(self, e: LibraryEntry, log_path: Path, plan: launcher.LaunchPlan | None = None) -> None:
+        """A game started here that Steam does not know keeps Steam's desktop layout on the controller (the stick
+        moves the mouse, the game gets no gamepad), and one that signs in as Spacewar gets Valve's layout for
+        Spacewar (nothing at all): Steam is told which layout to use until it ends (see controller_layouts). Whether
+        Steam switched — and, for a Valve controller, made its virtual pad — is read back from Steam and written to
+        the game's log; a layout without a gamepad is not kept for a Valve controller."""
+        if not (IS_LINUX and steaminput.enabled()):
             return
-        if not self.settings.settings.steam_input_layout or "no_steaminput" in e.compat_config.fixes or \
-                self.talks_to_steam_itself(e):
-            self.input_layout.watch(e.id)         # (OnlineFix games sign in to Steam: Steam switches by itself)
+        if not steam.is_steam_running():
+            self._layout_later[e.id] = (log_path, plan)       # asked for once Steam runs (see reap)
+            return
+        if not self.settings.settings.steam_input_layout:
+            self.input_layout.watch(e.id)
+            return
+        windows = bool(e.executable) and launcher.is_windows_binary(Path(e.executable))
+        proton = self._proton_for(e) if windows else None
+        choice = self.controller_layouts(e, dict(plan.env) if plan is not None else {}, windows,
+                                         proton.path if proton is not None else None)
+        if choice["warn"]:
+            self.emit("notify", (f"The Steam Controller cannot reach {e.title}", choice["warn"]))
+        if not choice["layouts"]:
+            self.input_layout.watch(e.id)
+            self._note_layout(e, log_path, f"nothing asked of Steam: {choice['why']}")
             return
         root = self.steam_root()
         since = steaminput.log_size(root)
         try:
-            self.input_layout.start(e.id)
+            self.input_layout.start(e.id, choice["layouts"][0][0])
         except Exception:
             log.exception("could not switch Steam's controller layout")
             return
+        threading.Thread(target=self._check_layout, args=(e, log_path, choice, root, since), daemon=True,
+                         name=f"steam-input-{e.id}").start()
 
-        def check() -> None:
-            took = steaminput.took(root, since, steaminput.GAME_LAYOUT)
-            got = {a for _c, a in steaminput.activations(root, since)}
-            note = ("Steam switched the controller to the game layout (Spacewar 480)" if took else
-                    "Steam logged no switch (no controller connected, Steam Input off for it, or the game layout "
-                    "was already in use)" if took is None else
-                    f"Steam did not take the game layout (switched to {sorted(got)})")
-            log.info("game %s: %s", e.id, note)
-            try:
-                with open(log_path, "a", encoding="utf-8") as fh:
-                    fh.write(f"ezgd:steam-input {note}\n")
-            except OSError:
-                pass
-        threading.Thread(target=check, daemon=True, name=f"steam-input-{e.id}").start()
+    def _check_layout(self, e: LibraryEntry, log_path: Path, choice: dict, root, since: int) -> None:
+        """Steam's answer to the layouts asked for ``e``, one after the other until one does: Steam switched (else
+        it knows no controller to switch — nothing to judge, the first stays asked for) and, for a Valve
+        controller, made its virtual pad. None making one: the first is kept and the player told what helps."""
+        layouts, notes = choice["layouts"], []
+        for k, (appid, label) in enumerate(layouts):
+            if k:
+                since = steaminput.log_size(root)
+                if not self.input_layout.retarget(e.id, appid):
+                    return                         # (the game ended, or another game's layout is Steam's now)
+            took = steaminput.took(root, since, appid, wait=self.LAYOUT_ACK)
+            if took is None:
+                notes.append(f"Steam logged no switch to {label} (no controller of Steam's is on, or Steam Input "
+                             "is off for it)")
+                if k:
+                    self.input_layout.retarget(e.id, layouts[0][0])
+                break
+            if not took:
+                got = sorted({a for _c, a in steaminput.activations(root, since)})
+                notes.append(f"Steam did not take {label} (switched to {got})")
+                continue
+            if not choice["valve"]:
+                notes.append(f"Steam switched the controller to {label}: {choice['why']}")
+                break
+            if self._steam_made_pad():
+                notes.append(f"Steam Controller: {label} — Steam made a gamepad for it")
+                break
+            notes.append(f"{label} makes no gamepad")
+        else:
+            if choice["valve"] and self.input_layout.retarget(e.id, layouts[0][0]):
+                notes.append(f"kept {layouts[0][1]}")
+            if choice["valve"]:
+                self.emit("notify", (f"No gamepad from Steam in {e.title}", (
+                    f"In Steam, choose a gamepad layout for “{e.title}” (its controller settings) and start it "
+                    "again — Steam's layout for it sends no gamepad, so a Steam Controller does nothing in the "
+                    "game." if choice.get("own") else
+                    "Add the game to Steam (its ⋯ menu → Add to Steam) and start it again — Steam then gives it a "
+                    "gamepad layout of its own. Until then a Steam Controller does nothing in the game.")))
+        self._note_layout(e, log_path, "; ".join(notes))
+
+    def _steam_made_pad(self) -> bool:
+        """Does Steam's virtual pad exist a moment after the switch? (The pad of the layout before goes within
+        ~30 ms of a switch to one without, a new one comes within ~50 ms.)"""
+        time.sleep(0.25)
+        end = time.monotonic() + self.PAD_WAIT - 0.25
+        while True:
+            if steaminput.virtual_pads():
+                return True
+            if time.monotonic() >= end:
+                return False
+            time.sleep(0.05)
+
+    @staticmethod
+    def _note_layout(e: LibraryEntry, log_path: Path, note: str) -> None:
+        log.info("game %s: %s", e.id, note)
+        try:
+            with open(log_path, "a", encoding="utf-8") as fh:
+                fh.write(f"ezgd:steam-input {note}\n")
+        except OSError:
+            pass
 
     def hold_input_layout(self, entry_id: int) -> int:
         """The quick menu is about to take the focus over this game: Steam keeps the game's own controller layout
@@ -1135,12 +1249,38 @@ class LibraryManager:
     def running_dir(self) -> Path:
         return self.paths.data / "running"
 
-    def _steam_input_layout(self, entry_id: int) -> None:
+    def _steam_input_layout(self, entry_id: int, info: dict | None = None) -> None:
         """A game Steam started for play mode: Steam knows it (its shortcut) and gives it the shortcut's layout —
-        Steam's gamepad template, or the one the player chose in Steam — by focus, its overlay included. Nothing is
-        forced; Steam's choices are logged while it runs."""
-        if IS_LINUX and steaminput.enabled() and self.steam_root() is not None:
-            self.input_layout.watch(entry_id)
+        Steam's gamepad template, or the one the player chose in Steam — by focus, its overlay included; Steam's
+        choices are logged while it runs. Except an OnlineFix game: its window is Spacewar to Steam (it signs in as
+        480), and Steam switched from the shortcut's layout it had readied to Valve's layout for Spacewar — no
+        gamepad for any controller Steam drives in it (Steam hides the real one from games it starts). Measured in
+        Steam's logs (Slay the Spire 2, 2026-10-13). Its shortcut's layout is kept while it runs: for a Valve
+        controller, and for others when Steam Input is on for them in that game (Steam's opt-in mask); otherwise the
+        game reads its controller itself and Steam's choice is left alone."""
+        if not (IS_LINUX and steaminput.enabled() and self.steam_root() is not None):
+            return
+        shortcut = int((info or {}).get("shortcut") or 0)
+        try:
+            e = self.get(entry_id)
+        except LibraryError:
+            e = None
+        if e is not None and self.settings.settings.steam_input_layout and self.talks_to_steam_itself(e):
+            if not shortcut:                                       # (play mode of an older version)
+                mine, _others = steam.layout_shortcuts(self.steam_root(), entry_id=e.id, title=e.title)
+                shortcut = mine[0][0] if mine else 0
+            mask = steaminput.opted_in(self.steam_root(), shortcut) if shortcut else None
+            valve = bool(steam.valve_controllers())
+            if shortcut and (valve or (mask or 0) & steaminput.OTHERS):
+                log.info("game %s (OnlineFix, started by Steam): keeping its shortcut's controller layout (%s), not "
+                         "Spacewar's (%s)", entry_id, shortcut, "a Valve controller" if valve else
+                         f"Steam Input on for other controllers in it: {mask:x}")
+                self.input_layout.start(entry_id, shortcut)
+                return
+            log.info("game %s (OnlineFix, started by Steam): Steam's choice left alone (%s)", entry_id,
+                     "no shortcut found" if not shortcut else f"no Valve controller, Steam Input off for the others "
+                     f"in it: {mask:x}" if mask is not None else "no Valve controller, no opt-in logged by Steam")
+        self.input_layout.watch(entry_id)
 
     def _reap_steam(self) -> list[int]:
         """Games started through Steam: notice when they start and stop (play mode records the playtime)."""
@@ -1148,7 +1288,7 @@ class LibraryManager:
         for eid, info in now.items():
             if eid not in self._steam_seen:
                 self._steam_seen[eid] = info
-                self._steam_input_layout(eid)
+                self._steam_input_layout(eid, info)
                 self.emit("game_state", {"id": eid, "running": True, "steam": True})
         ended = [eid for eid in self._steam_seen if eid not in now]
         for eid in ended:
@@ -1254,7 +1394,23 @@ class LibraryManager:
                                      f"Press Diagnose on its Library page to find out why."))
             self.emit("library_changed", entry_id)
             finished.append(entry_id)
+        if self._layout_later:
+            self._layout_once_steam_runs()
         return finished
+
+    def _layout_once_steam_runs(self) -> None:
+        """Games started while Steam was not running: their controller layout once it runs. (Without Steam a Steam
+        Controller is read directly; Steam started during the game takes it over with its desktop layout.)"""
+        for eid in [i for i in self._layout_later if not self.is_running(i)]:
+            del self._layout_later[eid]
+        if not self._layout_later or not steam.is_steam_running():
+            return
+        for eid, (log_path, plan) in list(self._layout_later.items()):
+            del self._layout_later[eid]
+            try:
+                self._game_input_layout(self.get(eid), log_path, plan)
+            except Exception:
+                log.exception("could not ask Steam for game %s's controller layout", eid)
 
     def stop(self, entry_id: int) -> None:
         if entry_id in self._suspended:
@@ -1484,6 +1640,7 @@ class LibraryManager:
         if self.is_running(entry_id):
             pids |= set(self.game_processes(entry_id))
         self._thaw(pids)
+        self.input_layout.prefer(entry_id)          # (switched back from another game: its controller layout)
         if info:
             self._frozen_seconds[entry_id] = self._frozen_seconds.get(entry_id, 0.0) + \
                 time.monotonic() - info["at"]
