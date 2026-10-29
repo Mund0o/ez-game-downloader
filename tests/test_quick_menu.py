@@ -607,7 +607,7 @@ def test_over_a_desktop_start_the_guide_button_listens_only_with_our_overlay(ui,
 
 def test_with_our_overlay_a_steam_tap_is_the_quick_menu(ui, qtbot, tmp_path, monkeypatch):
     """Settings → "Our overlay instead of Steam's": a tap of the Steam button opens the quick menu even over a game
-    that has Steam's overlay; the desktop's switch greys out Steam's."""
+    that has Steam's overlay (kept in the game for its FPS counter, so Steam's own switch stays usable)."""
     win, core, _ = ui
     a = _running(win, core, tmp_path, qtbot, "Own Overlay Game")
     couch = _open_couch(win, qtbot)
@@ -639,7 +639,7 @@ def test_with_our_overlay_a_steam_tap_is_the_quick_menu(ui, qtbot, tmp_path, mon
     own, steam_ov = page.widgets["own_overlay"], page.widgets["steam_overlay"]
     page._loading = True                                             # (shown, not saved)
     own.setChecked(True)
-    assert not steam_ov.isEnabled()
+    assert steam_ov.isEnabled()                                      # (Steam's overlay still loads with ours)
     assert page.widgets["launch_through_steam"].isEnabled()          # (the games are still added to Steam)
     own.setChecked(False)
     assert steam_ov.isEnabled()

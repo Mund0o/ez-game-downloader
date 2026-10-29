@@ -1,5 +1,7 @@
-"""Shift+Tab over one of the app's games opens the quick menu — the key is taken only while that game has the focus
-and has no Steam overlay (Shift+Tab is everyone's otherwise: reverse Tab, Steam's overlay). KWin is faked."""
+"""Shift+Tab over one of the app's games opens the quick menu — the key is taken only while that game has the focus,
+with our overlay on (Shift+Tab is everyone's otherwise: reverse Tab, Steam's overlay). KWin is faked."""
+import os
+import subprocess
 import sys
 
 import pytest
@@ -71,17 +73,49 @@ def test_an_answer_for_a_window_that_lost_the_focus_is_ignored(qtbot):
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="game processes from /proc")
-def test_only_our_running_games_without_steams_overlay(core, tmp_path, monkeypatch):  # noqa: F811
+def test_our_running_games_with_our_overlay_steams_overlay_or_not(core, tmp_path, monkeypatch):  # noqa: F811
+    """With Steam's overlay in the game too (kept for its FPS counter, 2026-10-28) Shift+Tab is still the menu's: KWin
+    takes the key before the game, so Steam's overlay — which looks for it in the game's own key events — never
+    opens on it. Off, Shift+Tab is Steam's."""
     lib = core.library
     monkeypatch.setattr(lib, "running_ids", lambda: [7, 8])
     monkeypatch.setattr(lib, "game_processes", lambda eid: {7: [700, 701], 8: [800]}[eid])
     monkeypatch.setattr(lib, "has_steam_overlay", lambda eid: eid == 8)
+    lib.settings.set("own_overlay", True)
     assert lib.quick_menu_key(701)                             # our game, no Steam overlay
-    assert not lib.quick_menu_key(800)                         # Steam's overlay: Shift+Tab is Steam's
+    assert lib.quick_menu_key(800)                             # Steam's overlay in it: still the menu's
     assert not lib.quick_menu_key(999) and not lib.quick_menu_key(0)
     lib._suspended[7] = {"at": 0, "pids": [700]}
     assert not lib.quick_menu_key(701)                         # suspended: frozen, no menu over it
     lib._suspended.pop(7)
+    lib.settings.set("own_overlay", False)
+    assert not lib.quick_menu_key(701) and not lib.quick_menu_key(800)    # off: Steam's
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="game processes from /proc")
+def test_the_game_ids_steams_overlay_runs_under_in_our_games(core, monkeypatch):  # noqa: F811
+    """What the Steam-button guard is told: the ids Steam's overlay windows go by — from each game process that has
+    Steam's overlay library preloaded."""
+    lib = core.library
+    base = {k: v for k, v in os.environ.items() if not k.startswith("Steam") and k != "LD_PRELOAD"}
+    gid = "12710882028086624256"
+    procs = [subprocess.Popen(["sleep", "30"], env={**base, **extra}, stderr=subprocess.DEVNULL) for extra in (
+        {"LD_PRELOAD": "/x/ubuntu12_64/gameoverlayrenderer.so", "SteamGameId": gid, "SteamOverlayGameId": gid},
+        {"LD_PRELOAD": "/x/ubuntu12_64/gameoverlayrenderer.so", "SteamGameId": "480"},     # OnlineFix as Spacewar
+        {"LD_PRELOAD": "/x/ubuntu12_64/gameoverlayrenderer.so"},       # no id: the friends-list overlay ("0")
+        {"SteamGameId": "999", "NOTE": "gameoverlayrenderer"},         # Steam's overlay not preloaded
+    )]
+    try:
+        monkeypatch.setattr(lib, "running_ids", lambda: [1, 2])
+        monkeypatch.setattr(lib, "game_processes", lambda eid: [p.pid for p in procs[:2]] if eid == 1 else
+                            [p.pid for p in procs[2:]] + [999999999])
+        assert lib.steam_overlay_game_ids() == {gid, "480", "0"}
+        monkeypatch.setattr(lib, "running_ids", lambda: [])
+        assert lib.steam_overlay_game_ids() == set()
+    finally:
+        for p in procs:
+            p.kill()
+            p.wait()
 
 
 from test_release_fixes import core  # noqa: E402,F401
@@ -111,6 +145,45 @@ def test_shift_tab_in_the_menu_closes_it_and_the_watch_follows_running_games(ui,
     win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
     couch.force_close()
     qtbot.waitUntil(lambda: states[-1] == "off", timeout=8000)         # no game: Shift+Tab is everyone's again
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="game processes from /proc")
+def test_the_key_stays_taken_while_the_menu_is_open(ui, qtbot, tmp_path, monkeypatch):  # noqa: F811
+    """The Shift+Tab that closes the menu is KWin's too. Given up while the menu had the focus (0.6.10), that press
+    went to the menu, which hid at once — the game got the focus back with the key still down, and its Steam overlay
+    opened on it. Our own window keeps the key only while it is the quick menu; KWin's Shift+Tab then reaches the
+    menu as the key it would have got."""
+    import time
+    from test_couch_ui import _open_couch
+    from test_quick_menu import _running
+    win, core, _ = ui
+    monkeypatch.setattr(hotkey.QuickMenuKey, "start", lambda self: None)
+    monkeypatch.setattr(hotkey.QuickMenuKey, "stop", lambda self: None)
+    a = _running(win, core, tmp_path, qtbot, "Keyboard Game")
+    couch = _open_couch(win, qtbot)
+    qtbot.waitUntil(lambda: a.id in couch.running, timeout=5000)
+    answers = []
+    win._quick_key_wanted(os.getpid(), answers.append)
+    assert answers == [False]                                          # couch mode itself: Shift+Tab is its own
+    win._quick_menu_by_key()                                           # Shift+Tab over the game: the menu
+    qtbot.waitUntil(lambda: couch.quick is not None and couch.quick._shown >= 1.0, timeout=5000)
+    q = couch.quick
+    win._quick_key_wanted(os.getpid(), answers.append)
+    assert answers[-1] is True                                         # the menu has the focus: still KWin's
+    q.opened_at = time.monotonic() - 1                                 # (not the press that opened it)
+    win._quick_menu_by_key()                                           # KWin's Shift+Tab with the menu open
+    qtbot.waitUntil(lambda: not q.isVisible(), timeout=3000)           # back to the game
+    win._quick_key_wanted(os.getpid(), answers.append)
+    assert answers[-1] is False
+    win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
+    couch.force_close()
+
+
+def test_a_held_shift_tab_opens_the_menu_once():
+    """KDE repeats a held shortcut; the menu flipped open and shut while Shift+Tab was held (measured with a held key,
+    2026-10-29). The action turns its own repeat off the first time it runs."""
+    assert "action.autoRepeat = false" in hotkey.KEY_SCRIPT
+    assert "function(action)" in hotkey.KEY_SCRIPT
 
 
 from test_ui import ui  # noqa: E402,F401

@@ -1943,7 +1943,7 @@ def open_browser(w, game, method, target: str) -> None:
         w.toasts.show("Opened in your browser", "Download it there; then import the file in the Library.", "info")
         w.step_away("browser")
         return
-    dlg = browser.open_browser_download(w.actions, game, target, label, w)
+    dlg = browser.open_browser_download(w.actions, game, target, label, w, app_id_role="couch-browser")
     if dlg is None:
         return
     from ezgd.ui.couch_browser import CouchBrowser
@@ -2763,8 +2763,8 @@ class GameSettingsPage(Page):
                               left=lambda: self._cycle_proton(names, -1), right=lambda: self._cycle_proton(names, 1)))
         if "no_steam_overlay" in self.fixes:
             on = not self.fixes["no_steam_overlay"].get("enabled")
-            items.append(Item("Steam overlay (Shift+Tab)", lambda: self._toggle_fix("no_steam_overlay"),
-                              "Friends, chat and the web browser in the game while Steam runs", "toggle",
+            items.append(Item("Steam overlay", lambda: self._toggle_fix("no_steam_overlay"),
+                              "Steam's FPS counter, pop-ups, friends and chat in the game while Steam runs", "toggle",
                               "on" if on else "off"))
         method = str(e.launch_method)
         items.append(Item("Run with", lambda: self._cycle_method(1), "Automatic: Proton for Windows games",

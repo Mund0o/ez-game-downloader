@@ -17,6 +17,8 @@ Protocol). Everything below calls what Steam's own friends list and chat window 
   remoteplay]``; joining opens the link Steam's own chat builds for them (``steam://joinlobby/…``,
   ``steam://remoteplay/connect/…``, ``steam://rungame/…/<connect>``) inside Steam (``SteamClient.URL.ExecuteSteamURL``);
   an invite with none of those has no Join in Steam's chat either
+* the Steam button over the app's games: Steam's overlay stays in them (its FPS counter, pop-ups, in-game Invite
+  buttons), but the button opens the quick menu only — Steam's overlay is kept from opening on it (``guard_guide``)
 
 Only 127.0.0.1 is ever contacted. The debugging interface is only switched on after the player agreed (Settings →
 Our overlay), and the marker is removed when the setting is switched off.
@@ -237,6 +239,32 @@ if(cs){fs.InviteToGame(f,app,cs);return 'connect'}return 'nothing'})(%s)"""
 
 _JS_URL = "(()=>{SteamClient.URL.ExecuteSteamURL(%s);return 'ok'})()"
 
+# The Steam button over one of the app's games is the quick menu's, never Steam's overlay too. Read in Steam's sp.js and
+# measured 2026-10-28 (a test window with Steam's overlay): every game's overlay is a desktop-overlay window in
+# SteamUIStore.WindowStore.SteamUIWindows (params.appid / params.gameid = the game's ids, its gameoverlayui's pid);
+# at Init its DesktopOverlay registers HandleGamepadGuideButtonEvents with SteamClient.System.UI.
+# RegisterForSystemKeyEvents, and that handler alone opens / closes the overlay (SetOverlayState(gameid, Overlay /
+# Hidden)) for events whose nAppID is its appid — calling it opened and closed the test window's overlay. So the
+# registration is wrapped: events for an overlay whose game id is the app's are dropped; overlays that registered
+# before go through the wrapper once (marked __ezgd). Only until the app stops renewing it (``until``); [] puts
+# Steam's own registration back. Nothing is written anywhere — it lives in Steam's page until Steam restarts.
+_JS_GUIDE_GUARD = """((ids,ttl)=>{const ui=SteamClient.System&&SteamClient.System.UI,ws=window.SteamUIStore&&SteamUIStore.WindowStore;
+if(!ui||typeof ui.RegisterForSystemKeyEvents!=='function'||!ws)return 'unsupported';
+const ovs=()=>(ws.SteamUIWindows||[]).filter(w=>w.IsDesktopOverlayWindow&&w.IsDesktopOverlayWindow()&&w.params&&w.DesktopOverlay&&w.DesktopOverlay.m_eState!==2);
+const again=(d,reg)=>{const h=d.m_systemKeyEventsCallbackHandle;if(!h||typeof h.unregister!=='function'||!d.HandleGamepadGuideButtonEvents)return;
+h.unregister();d.m_systemKeyEventsCallbackHandle=reg(d.HandleGamepadGuideButtonEvents)};
+let g=window.__ezgdGuide;
+if(!ids.length){if(g){ui.RegisterForSystemKeyEvents=g.orig;for(const w of ovs()){const h=w.DesktopOverlay.m_systemKeyEventsCallbackHandle;
+if(h&&h.__ezgd)again(w.DesktopOverlay,cb=>g.orig.call(ui,cb))}delete window.__ezgdGuide}return 'off'}
+if(!g){g=window.__ezgdGuide={orig:ui.RegisterForSystemKeyEvents,ids:new Set(),until:0,held:0,at:0};
+ui.RegisterForSystemKeyEvents=function(cb){const h=g.orig.call(ui,e=>{if(e&&Date.now()<g.until&&ovs().some(w=>
+g.ids.has(String(w.params.gameid))&&w.params.appid==e.nAppID)){const t=Date.now();if(t-g.at>100)g.held++;g.at=t;return}
+return cb(e)});if(h)h.__ezgd=1;return h}}
+g.ids=new Set(ids.map(String));g.until=Date.now()+ttl*1000;
+for(const w of ovs()){const h=w.DesktopOverlay.m_systemKeyEventsCallbackHandle;if(h&&!h.__ezgd)again(w.DesktopOverlay,cb=>ui.RegisterForSystemKeyEvents(cb))}
+return 'on:'+g.held})(%s,%d)"""
+GUARD_SECONDS = 30                 # the guard lapses this long after the app last renewed it (a crashed app: gone)
+
 
 # ------------------------------------------------------------------ the connection
 class Bridge:
@@ -315,6 +343,13 @@ class Bridge:
         if not allowed_url(url):
             raise BridgeError("Only Steam's join, chat and profile links.")
         await self.eval(_JS_URL % json.dumps(url))
+
+    async def guard_guide(self, gameids: list[str], seconds: int = GUARD_SECONDS) -> str:
+        """Keep Steam's overlay from opening on the Steam / PS / Xbox button over these games (Steam's game ids, as
+        their processes have them) for ``seconds`` — renew it to keep it; [] gives the button back to Steam at once.
+        "on:<presses held back so far>" | "off" | "unsupported" (this Steam has no such handler)."""
+        out = await self.eval(_JS_GUIDE_GUARD % (json.dumps([str(g) for g in gameids]), int(seconds)))
+        return str(out)
 
     async def close(self) -> None:
         w, self._writer, self._reader = self._writer, None, None

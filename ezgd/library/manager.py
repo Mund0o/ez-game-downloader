@@ -741,8 +741,6 @@ class LibraryManager:
         """Why the Steam overlay will not be in the next game (``None``: it will be)."""
         if not self.settings.settings.steam_overlay:
             return "switched off"
-        if self.settings.settings.own_overlay:
-            return "the app's own overlay is used instead (Settings)"
         if not IS_LINUX:
             return "only on Linux"
         if steam.overlay_env(self.steam_root()) is None:
@@ -1526,9 +1524,8 @@ class LibraryManager:
         return {"stopped": stopped, "left": left}
 
     def has_steam_overlay(self, entry_id: int) -> bool:
-        """Is Steam's overlay in this running game? (A Steam Controller's Steam button then belongs to Steam over the
-        game: a tap opens the overlay — friends, invites — and a hold the quick menu.) The app loaded it, or Steam
-        started the game and added it: one of the game's processes has Steam's overlay library preloaded."""
+        """Is Steam's overlay in this running game? The app loaded it, or Steam started the game and added it: one of
+        the game's processes has Steam's overlay library preloaded."""
         if self._launch_info.get(entry_id, {}).get("overlay"):
             return True
         for pid in self.game_processes(entry_id):
@@ -1541,15 +1538,38 @@ class LibraryManager:
         return False
 
     def quick_menu_key(self, pid: int) -> bool:
-        """Does Shift+Tab open the quick menu in the window of process ``pid``? Only in a running, not suspended game
-        of the app without Steam's overlay — with it Shift+Tab is Steam's (as a tap of the Steam button is)."""
-        if pid <= 1:
+        """Does Shift+Tab open the quick menu in the window of process ``pid``? In a running, not suspended game of the
+        app, with our overlay on (Settings) — Steam's overlay in the game too: KWin takes the key for the menu before
+        the game sees it, so Steam's overlay (which looks for its key inside the game) never opens on it. Off, Shift+Tab
+        is Steam's."""
+        if pid <= 1 or not self.settings.settings.own_overlay:
             return False
         for eid in self.running_ids():
             if eid in self._suspended or pid not in self.game_processes(eid):
                 continue
-            return not self.has_steam_overlay(eid)
+            return True
         return False
+
+    def steam_overlay_game_ids(self) -> set[str]:
+        """The game ids Steam's overlay runs under in the app's running games — what Steam's overlay windows are
+        known by (steambridge.Bridge.guard_guide): ``SteamOverlayGameId`` / ``SteamGameId`` of each game process that
+        has Steam's overlay library preloaded ("0": the overlay without a game id)."""
+        out: set[str] = set()
+        for eid in self.running_ids():
+            for pid in self.game_processes(eid):
+                try:
+                    raw = Path(f"/proc/{pid}/environ").read_bytes()
+                except OSError:
+                    continue
+                if b"gameoverlayrenderer" not in raw:
+                    continue
+                env = dict(x.split(b"=", 1) for x in raw.split(b"\0") if b"=" in x)
+                if b"gameoverlayrenderer" not in env.get(b"LD_PRELOAD", b""):
+                    continue
+                ids = {env.get(k, b"").decode("ascii", "replace").strip()
+                       for k in (b"SteamOverlayGameId", b"SteamGameId")}
+                out |= {i for i in ids if i.isdigit()} or {"0"}
+        return out
 
     # ------------------------------------------------- suspend / resume (quick menu)
     def game_processes(self, entry_id: int) -> list[int]:
@@ -3082,8 +3102,8 @@ class LibraryManager:
             out["reason"] = "switched off in Settings"
             return out
         if self.settings.settings.own_overlay:
-            # our overlay: the game is still added to Steam (it is in the Steam library), but Play starts it here —
-            # started by Steam, Steam would load its own overlay and take the Steam button from the quick menu
+            # our overlay: the game is still added to Steam (it is in the Steam library), but Play starts it here,
+            # with Steam's overlay loaded by the app (_add_overlay) and the Steam button kept for the quick menu
             out["add_only"] = True
         elif "no_steam_overlay" in e.compat_config.fixes:
             out["reason"] = "the Steam overlay is off for this game"

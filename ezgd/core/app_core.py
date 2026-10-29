@@ -637,6 +637,10 @@ class AppCore:
                 self._keep_awake()
             except Exception:
                 log.exception("keeping the screen awake failed")
+            try:
+                await self._guard_steam_button()
+            except Exception:
+                log.exception("keeping Steam's overlay off the Steam button failed")
             n += 1
             if n % 5 == 0 and self.settings.settings.crash_reports:
                 try:                                     # every 10 s: has a running game frozen?
@@ -648,6 +652,46 @@ class AppCore:
                     await self._apply_ready_fixes()
                 except Exception:
                     log.exception("applying waiting fixes failed")
+
+    GUIDE_RENEW = 10.0          # s: the Steam-button guard is renewed this often (it lapses 30 s after the last time)
+
+    async def _guard_steam_button(self) -> None:
+        """Our overlay: Steam's overlay stays in the app's games (its FPS counter, pop-ups, in-game Invite buttons),
+        but the Steam / PS / Xbox button over them opens the quick menu only — Steam's overlay is kept from opening
+        on it (steambridge.Bridge.guard_guide), renewed while such a game runs and given back to Steam when none does
+        or our overlay is switched off (a crashed app: Steam takes it back by itself 30 s later). Shift+Tab never
+        reaches Steam's overlay anyway (LibraryManager.quick_menu_key)."""
+        want: frozenset[str] = frozenset()
+        if self.settings.settings.own_overlay and self.library.running_ids():
+            want = frozenset(await asyncio.to_thread(self.library.steam_overlay_game_ids))
+        have, at = getattr(self, "_guide_guard", (frozenset(), 0.0))
+        now = time.monotonic()
+        if want == have and (not want or now - at < self.GUIDE_RENEW):
+            return
+        if now < getattr(self, "_guide_retry", 0.0):
+            return
+        from ezgd.platform.steambridge import BridgeError
+        try:
+            r = await self._bridge().guard_guide(sorted(want))
+        except BridgeError as exc:
+            self._guide_retry = now + self.GUIDE_RENEW
+            if want != getattr(self, "_guide_failed", None):
+                self._guide_failed = want
+                log.info("our overlay: Steam's overlay could not be kept off the Steam button (%s)", exc)
+            return
+        self._guide_guard, self._guide_failed = (want, now), None
+        if want != have:
+            self._guide_held = "on:0"
+            if r == "unsupported":
+                log.info("our overlay: this Steam has no Steam-button handler the app knows — its overlay may open too")
+            elif want:
+                log.info("our overlay: the Steam button over game ids %s opens the quick menu only (Steam's overlay "
+                         "stays in the game, closed)", ", ".join(sorted(want)))
+            else:
+                log.info("our overlay: the Steam button is Steam's again")
+        elif r.startswith("on:") and r != getattr(self, "_guide_held", "on:0"):
+            self._guide_held = r
+            log.info("our overlay: Steam's overlay held back from %s Steam-button press(es) so far", r[3:])
 
     def _keep_awake(self) -> None:
         """The screen stays on while a game runs (a controller is not activity to the desktop): one idle hold per

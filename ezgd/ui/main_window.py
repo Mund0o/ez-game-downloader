@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 
 from PySide6.QtCore import QEvent, QSettings, QSize, Qt, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut
@@ -603,11 +604,26 @@ class MainWindow(QMainWindow):
             self._quick_key.stop()
 
     def _quick_key_wanted(self, pid: int, answer) -> None:
+        if pid == os.getpid():
+            # one of our own windows: the key stays taken while it is the quick menu over a game — the Shift+Tab
+            # that closes it must not go to the menu window: the menu then hides while the key is still down, and
+            # the game it hands the focus back to gets that held key (Steam's overlay opened on it, 2026-10-28)
+            answer(self._quick_menu_open())
+            return
         self.bridge.call(self.bridge.core.library_call("quick_menu_key", pid), answer, lambda _e: answer(False),
                          owner=self)
 
+    def _quick_menu_open(self) -> bool:
+        quick = self.couch.quick if self.couch is not None else None
+        return quick is not None and quick.isVisible()
+
     def _quick_menu_by_key(self) -> None:
-        if self.couch is not None:
+        if self._quick_menu_open():
+            # (KWin kept the key while the menu has the focus: the key the menu would have got — it closes the
+            # menu, or moves in its on-screen keyboard, as before)
+            from PySide6.QtGui import QKeyEvent
+            QApplication.sendEvent(self.couch.quick, QKeyEvent(QEvent.KeyPress, Qt.Key_Backtab, Qt.ShiftModifier))
+        elif self.couch is not None:
             self.couch._home_held()                      # (couch mode, or the menu's own background one)
         elif self.pages["library"].running:
             self._quick_menu_from_desktop()

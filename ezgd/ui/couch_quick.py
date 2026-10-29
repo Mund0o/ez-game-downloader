@@ -1,6 +1,7 @@
 """The quick menu: hold the guide button (PS / Xbox / Steam) while playing a game the app started — with "Our overlay
-instead of Steam's" on (Settings). Off, Steam's overlay is the one over the game and the quick menu does not show at
-all (the user's rule, 2026-10-28).
+instead of Steam's" on (Settings); Steam's overlay stays in the game (its FPS counter) but never opens on that button
+or Shift+Tab. Off, Steam's overlay is the one over the game and the quick menu does not show at all (the user's rule,
+2026-10-28).
 
 It slides in over the game — the game stays visible behind it — and offers: back to the game, switch to another
 game (the one being played is suspended: frozen, using no processor or graphics time, and continues exactly where
@@ -26,7 +27,7 @@ from PySide6.QtGui import QColor, QFontMetrics, QLinearGradient, QPainter, QPain
 from PySide6.QtWidgets import QApplication, QWidget
 
 from ezgd.ui import theme
-from ezgd.ui.window_control import WindowControl
+from ezgd.ui.window_control import OwnAppId, WindowControl
 
 log = logging.getLogger(__name__)
 
@@ -138,8 +139,9 @@ def _let_go(bridge, token: int, ms: int = 1000) -> None:
                                                   lambda _e: None))
 
 
-class QuickMenu(QWidget):
+class QuickMenu(OwnAppId, QWidget):
     GRID_COLS = 4
+    app_id_role = "quick-menu"             # its own app to the desktop (see OwnAppId)
 
     def __init__(self, couch):
         super().__init__(None, Qt.Window | Qt.FramelessWindowHint)

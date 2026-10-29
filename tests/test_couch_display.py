@@ -81,48 +81,117 @@ def test_a_borderless_window_kwin_left_small_is_sized_once_it_is_mapped(ui, qtbo
     couch.force_close()
 
 
-def test_full_screen_shrunk_back_by_kwin_fills_the_screen_again(ui, qtbot, monkeypatch):
-    """A friend's KWin (2026-10-20): full screen filled the monitor, then a second later KWin handed couch mode the
-    desktop window's size again (1711×989 of 2560×1440) and it stayed small until a game had been played. A window
-    that filled the screen and is shrunk back is filled again — a few times per showing, never in a loop."""
-    from PySide6.QtCore import QSize
+def test_a_shrunk_full_screen_is_left_alone_and_said_in_the_log(ui, qtbot, monkeypatch, caplog):
+    """A friend's couch mode came up full screen, then the desktop window's size, twice (2026-10-29: a window-memory
+    KWin script handing it the desktop window's place). The app used to fill it again each time — choppy, and a
+    fight. Now couch mode has an app id of its own (test below), and a full screen the compositor made smaller is
+    left as it is — only logged."""
     win, core, _ = ui
     couch = _open_couch(win, qtbot)
+    monkeypatch.setattr(C, "on_wayland", lambda: True)
     monkeypatch.setattr(couch.wc, "kwin", True)
     monkeypatch.setattr(couch, "isFullScreen", lambda: True)
     asked = []
     monkeypatch.setattr(couch.wc, "force_fullscreen", lambda name="": asked.append(name))
+    got = _calls(couch, monkeypatch, "showNormal", "setGeometry", "showFullScreen", "hide", "place_window")
     g = couch.screen().geometry()
-    size = [g.width(), g.height()]
-    monkeypatch.setattr(couch, "width", lambda: size[0])
-    monkeypatch.setattr(couch, "height", lambda: size[1])
-    couch._size_tries = 2                                           # the checks after showing are over
-    couch._refits = 0
-    size[:] = [int(g.width() * 0.66), int(g.height() * 0.68)]       # KWin shrinks it back
-    couch._shrunk(QSize(g.width(), g.height()))
-    assert couch._refit.isActive()
-    qtbot.waitUntil(lambda: bool(asked), timeout=3000)
-    assert couch._refits == 1 and len(asked) == 1                   # filled again
-    size[:] = [g.width(), g.height()]
-    qtbot.wait(700)                                                 # (the check after it: right size, nothing more)
-    assert len(asked) == 1
-    for _ in range(5):                                              # KWin keeps shrinking it: three tries, no loop
-        size[:] = [int(g.width() * 0.66), int(g.height() * 0.68)]
-        couch._shrunk(QSize(g.width(), g.height()))
-        if couch._refit.isActive():
-            couch._refit.stop()
-            couch._refill()
-        couch._size_tries = 2
-    assert couch._refits == 3
-    couch._shrunk(QSize(g.width(), g.height()))
-    assert not couch._refit.isActive()
-    asked.clear()                                                   # a window that was never full: _fit_screen's job
-    couch._refits = 0
-    couch._shrunk(QSize(200, 200))
-    assert not couch._refit.isActive()
+    monkeypatch.setattr(couch, "width", lambda: int(g.width() * 0.72))
+    monkeypatch.setattr(couch, "height", lambda: int(g.height() * 0.81))
+    couch._size_tries = 0
+    with caplog.at_level(logging.WARNING):
+        couch._fit_screen()
+        couch._fit_screen()
+    assert asked == [] and got == []                                # nothing fights the compositor
+    assert sum("resized it (left as it is)" in r.message for r in caplog.records) == 1
+    assert not hasattr(couch, "_shrunk") and not hasattr(couch, "_refill")
     monkeypatch.undo()
     couch.force_close()
 
+
+def test_couch_windows_are_their_own_app_to_the_desktop(ui, qtbot, monkeypatch):
+    """Window-memory tools hand an app's last window place to the app's next window: couch mode, its quick menu and
+    its browser each have an app id of their own (with the monitor in it), the desktop window keeps "ezgd"."""
+    from PySide6.QtCore import QEvent, QObject
+    from PySide6.QtGui import QGuiApplication
+    from ezgd.ui import window_control
+    from ezgd.ui.couch_quick import QuickMenu
+    win, core, _ = ui
+    couch = _open_couch(win, qtbot)
+    monkeypatch.setattr(window_control, "_wayland", lambda: True)
+
+    class Seen(QObject):
+        def __init__(self):
+            super().__init__()
+            self.ids = []
+
+        def eventFilter(self, obj, ev):                              # noqa: N802
+            if ev.type() == QEvent.Show:
+                self.ids.append(QGuiApplication.desktopFileName())  # (what Qt reads as the window is made)
+            return False
+    before = QGuiApplication.desktopFileName()
+    seen = Seen()
+    couch.installEventFilter(seen)
+    couch.hide()
+    couch.showFullScreen()
+    def app_id(role, screen):                                       # (a test screen may have no name)
+        return f"ezgd-{role}" + (f"-{screen.name()}" if screen.name() else "")
+    assert seen.ids == [app_id("couch", couch.screen())]
+    assert QGuiApplication.desktopFileName() == before              # only for that moment
+    q = QuickMenu(couch)
+    q.installEventFilter(seen)
+    q.resize(400, 300)
+    q.show()
+    assert seen.ids[-1] == app_id("quick-menu", q.screen())
+    q.hide()
+    main = Seen()
+    win.installEventFilter(main)
+    win.hide()
+    win.show()
+    assert main.ids == [before]                                     # the desktop window: the app's own id
+    win.hide()
+    from ezgd.ui import couch_pages
+    from ezgd.ui.dialogs import browser
+    got = {}
+    monkeypatch.setattr(browser, "AVAILABLE", True)
+    monkeypatch.setattr(browser, "open_browser_download", lambda *a, **k: got.update(k))
+    game = next(iter(couch.entries), None) or type("G", (), {"source": "steamrip", "title": "X", "url": ""})()
+    couch_pages.open_browser(couch, game, type("M", (), {"label": "Site", "url": "https://x.test"})(), "https://x.test")
+    assert got.get("app_id_role") == "couch-browser"
+    q.deleteLater()
+    monkeypatch.undo()
+    couch.force_close()
+
+
+def test_closing_couch_mode_minimized_un_minimizes_it_unseen_first(ui, qtbot, monkeypatch):
+    """A window-memory tool saves a window's state as it closes: couch mode closed while minimized (the app quitting
+    during a game) would come back minimized next time. KWin un-minimizes it first, transparent."""
+    win, core, _ = ui
+    couch = _open_couch(win, qtbot)
+    asked = []
+    monkeypatch.setattr(couch.wc, "unminimize_unseen", lambda: asked.append(1))
+    monkeypatch.setattr(couch, "isMinimized", lambda: True)
+    couch.force_close()
+    assert asked == [1]
+    couch2 = _open_couch(win, qtbot)
+    asked.clear()
+    monkeypatch.setattr(couch2.wc, "unminimize_unseen", lambda: asked.append(1))
+    couch2.force_close()
+    assert asked == []                                              # not minimized: nothing to do
+
+
+def test_the_kwin_scripts_switched_on_are_listed(tmp_path, monkeypatch):
+    from ezgd.ui.display_trace import kwin_scripts
+    (tmp_path / "cfg").mkdir()
+    (tmp_path / "cfg" / "kwinrc").write_text("[Plugins]\nblurEnabled=true\nrememberwindowpositionsEnabled=true\n"
+                                             "krohnkiteEnabled=false\n\n[Other]\nfooEnabled=true\n")
+    (tmp_path / "data" / "kwin-wayland" / "scripts" / "rememberwindowpositions").mkdir(parents=True)
+    (tmp_path / "data" / "kwin-wayland" / "scripts" / "krohnkite").mkdir(parents=True)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_DATA_DIRS", str(tmp_path / "none"))
+    assert kwin_scripts() == ["rememberwindowpositions"]           # (blur is an effect; krohnkite is off)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "missing"))
+    assert kwin_scripts() == []
 
 def test_moving_to_another_screen_on_wayland_reopens_instead_of_leaving_full_screen(ui, qtbot, monkeypatch):
     win, core, _ = ui
@@ -237,3 +306,32 @@ def test_the_frame_pump_runs_faster_when_the_gpu_draws():
     assert pace(240, False) == 17 and pace(240, True) == 8              # 60 / 120 Hz
     assert pace(144, True) == 7 and pace(144, False) == 14              # 144 / 72 Hz
     assert pace(160, True) == 12 and pace(60, True) == 17 and pace(0, True) == 17
+
+
+def test_the_app_id_names_the_monitor_and_only_when_shown(monkeypatch):
+    """On another monitor it is another app: a window-memory tool never moves couch mode to the monitor it was on."""
+    from PySide6.QtGui import QGuiApplication
+    from ezgd.ui import window_control
+    monkeypatch.setattr(window_control, "_wayland", lambda: True)
+    seen = []
+
+    class Base:
+        def setVisible(self, visible):                              # noqa: N802 (what Qt reads as it is made)
+            seen.append((visible, QGuiApplication.desktopFileName()))
+
+    class Win(window_control.OwnAppId, Base):
+        app_id_role = "couch"
+        name = "HDMI-A-1"
+
+        def screen(self):
+            return type("S", (), {"name": lambda _s, n=self.name: n})()
+    before = QGuiApplication.desktopFileName()
+    w = Win()
+    w.setVisible(True)
+    w.name = "DP 2/x"
+    w.setVisible(True)
+    w.setVisible(False)
+    assert seen == [(True, "ezgd-couch-HDMI-A-1"), (True, "ezgd-couch-DP-2-x"), (False, before)]
+    monkeypatch.setattr(window_control, "_wayland", lambda: False)  # X11: one WM_CLASS for the app, nothing to do
+    w.setVisible(True)
+    assert seen[-1] == (True, before) and QGuiApplication.desktopFileName() == before

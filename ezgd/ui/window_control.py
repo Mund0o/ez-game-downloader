@@ -266,6 +266,44 @@ def release_all() -> None:
         _run_kwin(RELEASE_SCRIPT % {"pid": os.getpid()}, "release keep-above")
 
 
+def _wayland() -> bool:
+    return QGuiApplication.platformName().startswith("wayland")
+
+
+class OwnAppId:
+    """Couch mode's windows — couch mode itself, its quick menu, its browser — are their own apps to the desktop:
+    Wayland app id ``ezgd-<role>-<monitor>``, not the desktop window's "ezgd".
+
+    Window-memory tools for KDE save an app's windows when the app's last window closes, and hand that size and place
+    to the app's next window — the KWin script "Remember Window Positions" (rxappdev; read in its code) does it at
+    once and again a second later, exactly what a friend's log showed (2026-10-29): the desktop window was hidden as
+    couch mode opened, so couch mode came up the desktop window's size, twice (the app filled it again each time:
+    choppy), and closing couch mode handed the desktop window couch mode's full-screen size. KWin itself does
+    nothing like it (its source: only window rules, applied as a window appears, and session restore, which needs
+    an id the app never sets). With an app id of its own, such a tool only ever gives one of these windows its own
+    last place — on the same monitor, the monitor being part of the id.
+
+    The id is read by Qt once, as the window is made (QWaylandWindow::initWindow, on every show): it is switched for
+    exactly that moment. Checked on KWin 6.8.1 with the app's Qt 6.12, also after hiding and showing the window again.
+    (X11 has one WM_CLASS for the whole app.)"""
+    app_id_role: str | None = None
+
+    def setVisible(self, visible: bool) -> None:              # noqa: N802 (Qt API)
+        role = self.app_id_role if visible else None
+        if not role or not _wayland():
+            super().setVisible(visible)
+            return
+        from ezgd.platform.appentry import APP_ID
+        screen = self.screen()
+        monitor = "".join(c if c.isalnum() or c in "-." else "-" for c in screen.name()) if screen is not None else ""
+        old = QGuiApplication.desktopFileName()
+        QGuiApplication.setDesktopFileName(f"{APP_ID}-{role}" + (f"-{monitor}" if monitor else ""))
+        try:
+            super().setVisible(visible)
+        finally:
+            QGuiApplication.setDesktopFileName(old)
+
+
 class WindowControl:
     def __init__(self, widget, marker: str):
         self.widget = widget
@@ -345,6 +383,13 @@ class WindowControl:
         import json
         return ("var o = w.output; var outs = workspace.screens || []; "
                 f"for (var j = 0; j < outs.length; j++) if (outs[j].name === {json.dumps(screen)}) o = outs[j]; ")
+
+    def unminimize_unseen(self) -> None:
+        """Closing while minimized (the app quits during a game started from couch mode): KWin un-minimizes it first,
+        transparent, so it is not seen — a window-memory tool saves a window's state as it closes and would bring
+        couch mode back minimized next time (see OwnAppId)."""
+        if self.kwin:
+            self._kwin("w.opacity = 0; w.minimized = false;")
 
     def forget(self) -> None:
         """The window closes: nothing to undo (KWin forgets a closed window's state)."""

@@ -234,27 +234,33 @@ def test_a_steam_controller_keeps_steams_overlay_and_the_app_sees_it(library, tm
         library.stop_completely(e2.id, 3)
 
 
-def test_our_overlay_instead_of_steams(library, tmp_path, monkeypatch):
-    """Settings → "Our overlay instead of Steam's": games start without Steam's overlay and not through Steam — the
-    quick menu is the overlay (friends, chat, invites, carried out by Steam). They are still added to Steam (its
-    library), but Play starts them here."""
+def test_our_overlay_keeps_steams_overlay_in_the_game(library, tmp_path, monkeypatch):
+    """Settings → "Our overlay instead of Steam's": the quick menu is the overlay (friends, chat, invites, carried out
+    by Steam), but Steam's overlay is still loaded into the game — a player missed its FPS counter (2026-10-28). The
+    Steam button and Shift+Tab are kept for the quick menu (test_quick_key, test_steam_bridge). Games are still added
+    to Steam (its library), but Play starts them here."""
     root = fake_steam(tmp_path, monkeypatch, running=True)
     library.settings.set("steam_root", str(root))
     library.settings.set("launch_through_steam", True)
     monkeypatch.delenv("LD_PRELOAD", raising=False)
-    e = script_game(library, tmp_path, "true")
-    assert library.overlay_available() is None
+    e = script_game(library, tmp_path, 'echo "preload=$LD_PRELOAD"; sleep 20')
     library.settings.set("own_overlay", True)
-    assert "own overlay" in library.overlay_available()
+    assert library.overlay_available() is None
     st = library.steam_overlay_status(e.id)
     assert st.get("add_only") is True                     # into Steam's library, started here
     plan = library.launch(e.id, confirmed=True)
-    assert "Steam overlay" not in plan.description and "LD_PRELOAD" not in plan.env
-    assert "own overlay" in library.preview(e.id)["description"]
-    deadline = time.time() + 10
-    while library.is_running(e.id) and time.time() < deadline:
-        time.sleep(0.05)
+    assert "Steam overlay" in plan.description and "gameoverlayrenderer" in plan.env["LD_PRELOAD"]
+    try:
+        deadline = time.time() + 5
+        while not library.steam_overlay_game_ids() and time.time() < deadline:
+            time.sleep(0.05)
+        assert library.steam_overlay_game_ids() == {"0"}     # (friends list only: Steam knows no id for it)
+    finally:
+        library.stop_completely(e.id, 3)
     library.reap()
+    assert library.steam_overlay_game_ids() == set()
+    library.settings.set("steam_overlay", False)          # the player's own switch still keeps it out
+    assert library.overlay_available() == "switched off"
 
 
 def test_overlay_env_keeps_other_preloads(tmp_path):

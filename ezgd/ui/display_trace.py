@@ -55,6 +55,27 @@ def compositor_name() -> str:
     return ""
 
 
+def kwin_scripts() -> list[str]:
+    """The KWin scripts the player switched on (kwinrc's [Plugins] ``<id>Enabled=true``, for ids installed as KWin
+    scripts) — a window-placement script can resize couch mode (a friend's did: see window_control.OwnAppId)."""
+    from pathlib import Path
+    home = Path.home()
+    try:
+        text = (Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config") / "kwinrc").read_text("utf-8", "replace")
+    except OSError:
+        return []
+    on, group = [], ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            group = line
+        elif group == "[Plugins]" and line.replace(" ", "").lower().endswith("enabled=true"):
+            on.append(line.split("=", 1)[0].strip()[:-len("Enabled")])
+    data = [Path(os.environ.get("XDG_DATA_HOME") or home / ".local/share")] + \
+        [Path(d) for d in (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":") if d]
+    return sorted(i for i in on if any((d / k / "scripts" / i).is_dir() for d in data for k in ("kwin-wayland", "kwin")))
+
+
 class DisplayTrace(QObject):
     """Logs a window's sizes and states, and the compositor's configure events, for ``seconds`` after start()."""
 
@@ -76,7 +97,10 @@ class DisplayTrace(QObject):
         DisplayTrace._active = self
         self.t0 = time.monotonic()
         from PySide6.QtWidgets import QApplication
-        log.info("couch display trace: compositor %s (%s)", compositor_name() or "?", QApplication.platformName())
+        compositor = compositor_name()
+        log.info("couch display trace: compositor %s (%s)", compositor or "?", QApplication.platformName())
+        if "kwin" in compositor:
+            log.info("couch display trace: KWin scripts switched on: %s", ", ".join(kwin_scripts()) or "none")
         self.window.installEventFilter(self)
         if QApplication.platformName().startswith("wayland"):
             self._previous = qInstallMessageHandler(self._message)

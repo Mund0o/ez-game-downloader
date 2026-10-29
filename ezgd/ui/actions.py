@@ -333,7 +333,7 @@ class Actions(QObject):
         box.setText(f"Add “{entry.title}” to Steam?")
         box.setInformativeText(
             "Your games go into Steam's library as non-Steam games (they start with this app's Proton setup and "
-            "fixes). Play here still starts them directly, with the app's quick menu instead of Steam's overlay. "
+            "fixes). Play here still starts them directly; the app's quick menu opens instead of Steam's overlay. "
             "Steam only reads that list when it starts, so it is closed and opened again now; its list is checked "
             "and backed up first, and put back automatically if Steam does not start normally.\n\n"
             "Close any game that is running in Steam first.")

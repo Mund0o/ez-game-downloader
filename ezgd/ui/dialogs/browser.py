@@ -26,6 +26,7 @@ from PySide6.QtWidgets import QCheckBox, QDialog, QHBoxLayout, QLineEdit, QMessa
 
 from ezgd.net import adblock, filterlists
 from ezgd.ui.widgets.common import Banner, button, label
+from ezgd.ui.window_control import OwnAppId
 
 log = logging.getLogger(__name__)
 
@@ -559,7 +560,7 @@ def manager(actions) -> BrowserDownloads | None:
 
 
 # --------------------------------------------------------------------- pop-up
-class BrowserDownloadDialog(QDialog):
+class BrowserDownloadDialog(OwnAppId, QDialog):
     """Only for the user's part: the check and the click. Hides itself as soon as a download starts."""
 
     went_away = Signal()            # hidden (a download started) or closed — couch mode comes back then
@@ -1128,7 +1129,7 @@ def show_clickable(dlg: "BrowserDownloadDialog") -> None:
     dlg.show()
 
 
-def open_browser_download(actions, game, url: str, host_label: str, parent):
+def open_browser_download(actions, game, url: str, host_label: str, parent, app_id_role: str | None = None):
     if not AVAILABLE:
         QMessageBox.information(parent, "In-app browser not installed",
                                 "The in-app browser component (Qt WebEngine) is not part of this build. Use “Open "
@@ -1137,5 +1138,6 @@ def open_browser_download(actions, game, url: str, host_label: str, parent):
     # owned by the main window, not the game page: closing the game page must not stop the download
     dlg = BrowserDownloadDialog(actions, game, url, host_label, actions.parent() or parent)
     dlg.setAttribute(Qt.WA_DeleteOnClose, False)     # disposed explicitly once its downloads are done
+    dlg.app_id_role = app_id_role                    # couch mode's browser: its own app (see OwnAppId)
     show_clickable(dlg)
     return dlg

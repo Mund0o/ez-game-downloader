@@ -5,9 +5,22 @@ is wanted: Shift+Tab is everyone's (reverse Tab in every app, Steam's overlay in
 app's games runs (KDE Plasma only):
 
 * a KWin script reports each window that takes the focus (its process) to the app over D-Bus;
-* when that window belongs to one of the app's games without Steam's overlay (LibraryManager.quick_menu_key),
-  a second script registers Shift+Tab, whose action calls the app back; when the focus goes elsewhere, it is
-  unloaded and the shortcut unregistered from KDE's shortcut list (nothing stays in kglobalshortcutsrc).
+* when that window belongs to one of the app's games (LibraryManager.quick_menu_key; only with our overlay on) — or
+  is the quick menu itself, open over one — a second script registers Shift+Tab, whose action calls the app back;
+  when the focus goes elsewhere, it is unloaded and the shortcut unregistered from KDE's shortcut list (nothing stays
+  in kglobalshortcutsrc). Held down, it calls once (the action does not repeat: KDE repeats a held shortcut, which
+  flipped the menu open and shut).
+
+The key stays taken while the quick menu has the focus, so the Shift+Tab that closes it is KWin's too. Given up
+there (0.6.10), that press went to the menu window, which hid at once — and the game got the focus back while the key
+was still down: KWin hands a newly focused window the keys being held (all but those a shortcut took,
+``unfilteredKeys``), and the game's Steam overlay opened on that Shift+Tab (Steam's own log: its overlay shown the
+second the menu closed, 2026-10-28). A key KWin took is neither in that list nor is its release sent to anyone.
+
+KWin runs a global shortcut before the focused window gets the key: KWin 6.8.1's GlobalShortcutFilter returns true
+for a press a shortcut took and marks the key filtered, so neither the press nor its release reaches the game — nor
+Steam's overlay in it, which looks for its key (Shift+Tab) among the game's own key events. (Not while a program
+inhibits shortcuts: then the game gets every key, and Shift+Tab is Steam's.)
 
 Checked on KWin 6.8 (2026-10-27): a real Shift+Tab press reached the app; after unloading + ``unregister`` the
 shortcut was gone and Shift+Tab was everyone's again.
@@ -37,7 +50,8 @@ report(workspace.activeWindow);
 """
 
 KEY_SCRIPT = """
-registerShortcut("%(action)s", "EZ Game Downloader: quick menu over the game", "%(key)s", function() {
+registerShortcut("%(action)s", "EZ Game Downloader: quick menu over the game", "%(key)s", function(action) {
+    if (action) action.autoRepeat = false;              // held down: once (later repeats are still KWin's)
     callDBus(%(svc)s, "%(path)s", "%(iface)s", "Open");
 });
 """
@@ -72,7 +86,7 @@ class QuickMenuKey(QObject):
 
     @Slot()
     def Open(self) -> None:                                    # noqa: N802
-        log.info("Shift+Tab over the game: quick menu")
+        log.info("Shift+Tab over the game (KWin): quick menu")
         QTimer.singleShot(0, self._on_open)
 
     # ----------------------------------------------------------- on / off

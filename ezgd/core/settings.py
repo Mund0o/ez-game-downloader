@@ -73,8 +73,9 @@ class Settings:
     confirm_before_launch: bool = True
     launch_through_steam: bool = True            # start games through Steam shortcuts (full Steam overlay)
     steam_overlay: bool = True                   # load Steam's overlay into games (friends list only)
-    # the app's own overlay (the quick menu) instead of Steam's: no Steam overlay in games, the guide / Steam button
-    # (tap or hold) opens the quick menu — friends, chat and invites from there, carried out by Steam itself
+    # the app's own overlay (the quick menu) over Steam's: Steam's overlay stays in games (its FPS counter, pop-ups),
+    # but the guide / Steam button (tap or hold) and Shift+Tab open the quick menu, never Steam's overlay — friends,
+    # chat and invites from there, carried out by Steam itself
     own_overlay: bool = False
     proton_version: str = ""                     # "" = newest detected
     steam_root: str = ""                         # "" = auto-detect

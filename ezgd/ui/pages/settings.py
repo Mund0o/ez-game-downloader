@@ -453,10 +453,11 @@ class SettingsPage(QWidget):
         f.addRow("", self.share_info)
         self.bridge.call(self.bridge.core.crowd_status(), self._crowd_status, owner=self)
         own = QCheckBox("Our overlay instead of Steam's: the quick menu over games, with chat, invites and joining")
-        own.setToolTip("On: games start without Steam's overlay, and the PS / Xbox / Steam button (tap or hold) or "
-                       "Shift+Tab opens the app's quick menu over the game — switch or suspend games, volume, quit, "
-                       "your Steam chats, one-click invites to your game, joining theirs — through the Steam client "
-                       "itself, without Steam's windows. Off: Steam's overlay as usual, and no quick menu at all.")
+        own.setToolTip("On: the PS / Xbox / Steam button (tap or hold) or Shift+Tab opens the app's quick menu over "
+                       "the game instead of Steam's overlay — switch or suspend games, volume, quit, your Steam chats, "
+                       "one-click invites to your game, joining theirs — through the Steam client itself, without "
+                       "Steam's windows. Steam's overlay stays in the game for its FPS counter and pop-ups, but those "
+                       "buttons never open it. Off: Steam's overlay as usual, and no quick menu at all.")
         own.toggled.connect(self._own_overlay_toggled)
         f.addRow("", own)
         self.widgets["own_overlay"] = own
@@ -469,9 +470,7 @@ class SettingsPage(QWidget):
                     "to restart once for that (the app asks first); the change is verified and backed up, and put "
                     "back automatically if Steam does not start normally. OnlineFix games do not see Steam's game "
                     "ids (they trigger OnlineFix's activation message). With our overlay on, games are still added "
-                    "to Steam, but Play starts them here (with the quick menu instead of Steam's overlay).")
-        # ours replaces Steam's overlay while it is on (the games are still added to Steam)
-        own.toggled.connect(lambda on, w=self.widgets["steam_overlay"]: w.setEnabled(not on))
+                    "to Steam, but Play starts them here (the quick menu opens instead of Steam's overlay).")
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(button("Remove the app's games from Steam…", "trash", "ghost",

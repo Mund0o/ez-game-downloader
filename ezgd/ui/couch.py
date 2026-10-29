@@ -38,7 +38,7 @@ from ezgd.ui import artwork, gcguard, theme
 from ezgd.ui.couch_intro import CouchIntro
 from ezgd.ui.couch_pages import GamePage, Keyboard, Page, SettingsPage, StorePage, WishlistPage
 from ezgd.ui.gamepad import Gamepads
-from ezgd.ui.window_control import WindowControl, bring_game_forward, real_scale
+from ezgd.ui.window_control import OwnAppId, WindowControl, bring_game_forward, real_scale
 from ezgd.ui.widgets.common import ToastHost, relative_time
 
 log = logging.getLogger(__name__)
@@ -444,8 +444,9 @@ FAMILY_NAMES = {"xbox": "Xbox controller", "playstation": "PlayStation controlle
                 "nintendo": "Nintendo controller", "generic": "Controller"}
 
 
-class _Couch:
+class _Couch(OwnAppId):
     """Couch mode itself — drawn by one of the two windows below (the GPU one by default)."""
+    app_id_role = "couch"                 # its own app to the desktop (see OwnAppId)
     BG_REST = 0.25                        # seconds the focus rests on a game before the background follows it
     #                                       (each change cross-fades two full-screen images: not on every step)
 
@@ -543,13 +544,8 @@ class _Couch:
         self._focus_rect: QRectF | None = None          # where the focused tile (and its glow) is drawn
         self._waiting: dict[str, QRectF] = {}           # picture url → the tile waiting for it
         self._move_tries: dict[str, int] = {}           # screen name → attempts to move there (see _fit_screen)
-        self._size_tries = 0                             # attempts to make a too-small "full screen" fill it
+        self._size_tries = 0                             # attempts to make a borderless / custom window its size
         self._titled = False                             # the last tile drawn wrote the game's title on itself
-        self._refits = 0                                 # times it was shrunk back after filling (see _shrunk)
-        self._refit = QTimer(self)
-        self._refit.setSingleShot(True)
-        self._refit.setInterval(500)
-        self._refit.timeout.connect(self._refill)
         self._bands: OrderedDict = OrderedDict()       # see _copy_tile
         self._shown: dict[tuple, tuple] = {}     # tile → the picture it showed last
         self._tab_fit: dict[tuple, tuple[float, bool]] = {}
@@ -989,7 +985,6 @@ class _Couch:
             handle.requestActivate()
         self.wc.keep_above(True)
         self.wc.activate()                              # Wayland would not give the focus back by itself
-        self._refits = 0
         QTimer.singleShot(250, self, self._fit_screen)
 
     def _poll_downloads(self) -> None:
@@ -1062,7 +1057,6 @@ class _Couch:
         self._target_name = self._target_screen.name() if self._target_screen is not None else ""
         self._move_tries.clear()
         self._size_tries = 0
-        self._refits = 0
         if not self.background:
             from ezgd.ui.display_trace import DisplayTrace
             DisplayTrace(self).start()               # the compositor's answers, in the log (display_trace)
@@ -1080,10 +1074,9 @@ class _Couch:
         if screen is not None:
             screen.geometryChanged.connect(lambda _g: self._fit_screen())
         self._set_pace(screen)
-        # kept above and activated first, its size checked after: in a friend's log KWin shrank a full-screen couch
-        # mode back to the desktop window's size together with activating it — when it was activated after the size
-        # had been fixed, it came back small a second later; coming back from a game (activated, then fixed) it
-        # stayed full. Same order here, and _shrunk fills it again if KWin still does it.
+        # kept above (Steam's pop-ups) and given the keyboard. (A friend's couch mode shrank to the desktop window's
+        # size right after this, and again a second later: a window-memory script handing it the desktop window's
+        # place — fixed by couch mode's own app id, see OwnAppId; nothing here fights it any more.)
         QTimer.singleShot(150, self, lambda: (self.wc.keep_above(True), self.wc.activate()) if not self._exiting
                           else None)
         QTimer.singleShot(450, self, self._fit_screen)    # the window manager has placed it: check it fills it
@@ -1264,23 +1257,21 @@ class _Couch:
                          "not full screen")
                 self.place_window(self, self.wc)
             elif short and self._size_tries < 2:
-                # "full screen", but the window kept its old size (seen on a friend's PC: couch mode came up the
-                # size of the desktop window) — make it fill the monitor
                 self._size_tries += 1
-                log.warning("couch mode: full screen but only %dx%d of %dx%d — making it fill the screen",
-                            self.width(), self.height(), g.width(), g.height())
-                if self.wc.kwin:
-                    self.wc.force_fullscreen(on.name())     # KWin sizes it itself
-                    QTimer.singleShot(500, self, self._fit_screen)
-                elif not on_wayland():
+                if not on_wayland():
+                    log.warning("couch mode: full screen but only %dx%d of %dx%d — making it fill the screen",
+                                self.width(), self.height(), g.width(), g.height())
                     self.showNormal()                   # X11: the window can set its own size
                     self.setGeometry(g)
                     self.showFullScreen()
                     QTimer.singleShot(500, self, self._fit_screen)
                 else:
-                    # Wayland: a full-screen window's size is the compositor's answer (the log's display trace has
-                    # it). Leaving full screen to ask again ended in an 800×500 window (tested on KWin) — the bug
-                    # behind couch mode coming up small on a friend's PC — so nothing is changed here.
+                    # Wayland: a full-screen window's size is the compositor's answer, and nothing here argues
+                    # with it — leaving full screen to ask again ended in an 800×500 window (tested on KWin), and
+                    # filling it again only fought whatever had resized it (a friend's window-memory script: that
+                    # one is kept away by couch mode's own app id, see OwnAppId). Said in the log, so it is known.
+                    log.warning("couch mode: full screen but only %dx%d of %dx%d — something on this desktop "
+                                "resized it (left as it is)", self.width(), self.height(), g.width(), g.height())
                     self._size_tries = 2
         elif self.isFullScreen() or moved:
             self.place_window(self, self.wc)
@@ -1565,8 +1556,9 @@ class _Couch:
                 self.give_game_screen(game.id, f"Steam's window put away: back to {game.title}")
 
     def own_overlay(self) -> bool:
-        """"Our overlay instead of Steam's" (Settings): the quick menu is ours over the game. Off, Steam's overlay is
-        the one there, and the quick menu does not show at all (the user's rule, 2026-10-28)."""
+        """"Our overlay instead of Steam's" (Settings): the quick menu is ours over the game (Steam's overlay stays in
+        it, for its FPS counter, but never opens on the guide button or Shift+Tab). Off, Steam's overlay is the one
+        there, and the quick menu does not show at all (the user's rule, 2026-10-28)."""
         return bool(self.actions.settings.get("own_overlay", False))
 
     def _pad(self, name: str) -> None:
@@ -1727,34 +1719,6 @@ class _Couch:
     def resizeEvent(self, e) -> None:                         # noqa: N802
         super().resizeEvent(e)
         self._drop_caches()
-        self._shrunk(e.oldSize())
-
-    def _short_of(self, w: int, h: int) -> bool:
-        """Is a w×h window short of what the display settings ask for (full screen: the monitor)?"""
-        _target, want, mode = self.display_target()
-        on = self.screen()
-        g = on.geometry() if mode == "fullscreen" and on is not None else want
-        return g is not None and g.width() > 0 and (w < g.width() * 0.92 or h < g.height() * 0.92)
-
-    def _shrunk(self, old) -> None:
-        """Seen on a friend's PC (KWin, 2026-10-20): couch mode filled the screen, then a second later KWin handed it
-        the desktop window's size again (1711×989 of 2560×1440) — and it stayed that small until a game had been
-        played. The checks after showing were over by then, so a window that had filled the screen and is shrunk
-        back is filled again (a few times per showing, never in a loop)."""
-        if self._exiting or not self.isVisible() or self.isMinimized() or self._refits >= 3 or not old.isValid():
-            return
-        if not self._short_of(old.width(), old.height()) and self._short_of(self.width(), self.height()):
-            self._refit.start()
-
-    def _refill(self) -> None:
-        if self._exiting or not self.isVisible() or self.isMinimized() or not self._short_of(self.width(),
-                                                                                              self.height()):
-            return
-        self._refits += 1
-        log.warning("couch mode: shrunk back to %dx%d after filling the screen — filling it again", self.width(),
-                    self.height())
-        self._size_tries = min(self._size_tries, 1)
-        self._fit_screen()
 
     def _drop_caches(self) -> None:
         """Everything drawn ahead (tiles, layers, text) goes: the size, the scale or the colours changed."""
@@ -3409,6 +3373,8 @@ class _Couch:
             e.ignore()                     # Alt+F4 / the window manager: the same as the ✕ (asks if a game runs)
             self.request_exit()
             return
+        if self.isMinimized():
+            self.wc.unminimize_unseen()    # (not remembered minimized by a window-memory tool: see OwnAppId)
         self._shutdown()
         e.accept()
         self.closed.emit()
