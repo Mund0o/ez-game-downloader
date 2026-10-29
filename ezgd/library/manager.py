@@ -1097,6 +1097,7 @@ class LibraryManager:
         it knows no controller to switch — nothing to judge, the first stays asked for) and, for a Valve
         controller, made its virtual pad. None making one: the first is kept and the player told what helps."""
         layouts, notes = choice["layouts"], []
+        start, padded = since, None
         for k, (appid, label) in enumerate(layouts):
             if k:
                 since = steaminput.log_size(root)
@@ -1118,6 +1119,7 @@ class LibraryManager:
                 break
             if self._steam_made_pad():
                 notes.append(f"Steam Controller: {label} — Steam made a gamepad for it")
+                padded = appid
                 break
             notes.append(f"{label} makes no gamepad")
         else:
@@ -1131,6 +1133,43 @@ class LibraryManager:
                     "Add the game to Steam (its ⋯ menu → Add to Steam) and start it again — Steam then gives it a "
                     "gamepad layout of its own. Until then a Steam Controller does nothing in the game.")))
         self._note_layout(e, log_path, "; ".join(notes))
+        if padded not in (None, steaminput.GAME_LAYOUT) and self.talks_to_steam_itself(e):
+            self._pad_after_sign_in(e, log_path, root, start, bool(choice.get("own")))
+
+    SIGN_IN_WAIT = 120.0       # s an OnlineFix game may take to sign in to Steam (its launcher, a slow disk)
+
+    def _pad_after_sign_in(self, e: LibraryEntry, log_path: Path, root, since: int, own: bool) -> None:
+        """An OnlineFix game started here signs in to Steam as Spacewar a few seconds in — and Steam then turned a
+        friend's Steam Controller's virtual pad off for the rest of the game, the game's own layout forced or not
+        (see pad_needs_steam): the controller did nothing in the game, and the log said "Steam made a gamepad". Steam's
+        answer to the sign-in goes into the game's log, and a pad taken away is told to the player with what helps."""
+        end = time.monotonic() + self.SIGN_IN_WAIT
+        seen = off = False
+        while not seen:
+            if time.monotonic() >= end or not self.is_running(e.id):
+                return
+            time.sleep(0.5)
+            seen, off, since = steaminput.signed_in(root, since)
+        gone = 0
+        for _check in range(2):                    # (a pad Steam makes again in between counts as kept)
+            time.sleep(1.5)
+            if not self.is_running(e.id):
+                return
+            gone += not steaminput.virtual_pads()
+            off = off or steaminput.signed_in(root, since)[1]
+        if gone < 2:
+            self._note_layout(e, log_path, "Steam kept the gamepad after the game signed in to it as Spacewar (480)")
+            return
+        self._note_layout(e, log_path, "Steam took the gamepad away when the game signed in to it as Spacewar (480)"
+                          + (" (\"mapping uses xinput : false\")" if off else "")
+                          + " — it keeps one only in OnlineFix games it starts itself")
+        self.emit("notify", (f"No gamepad from Steam in {e.title}", (
+            f"{e.title} signs in to Steam as Spacewar, and Steam then takes a Steam Controller's gamepad away unless "
+            "Steam started the game itself. " + (
+                "Start it through Steam to play it with the controller: Play does that while Settings → “Full Steam "
+                "overlay” is on (and the Steam overlay is not switched off for the game on its Fixes screen)."
+                if own else "Add it to Steam (its ⋯ menu → Add to Steam) and start it again: Play then starts it "
+                "through Steam, which keeps the gamepad."))))
 
     def _steam_made_pad(self) -> bool:
         """Does Steam's virtual pad exist a moment after the switch? (The pad of the layout before goes within
@@ -3110,7 +3149,8 @@ class LibraryManager:
             return out
         if self.settings.settings.own_overlay:
             # our overlay: the game is still added to Steam (it is in the Steam library), but Play starts it here,
-            # with Steam's overlay loaded by the app (_add_overlay) and the Steam button kept for the quick menu
+            # with Steam's overlay loaded by the app (_add_overlay) and the Steam button kept for the quick menu —
+            # unless Steam would take a Steam Controller's gamepad away from it (pad_needs_steam, below)
             out["add_only"] = True
         elif "no_steam_overlay" in e.compat_config.fixes:
             out["reason"] = "the Steam overlay is off for this game"
@@ -3135,7 +3175,20 @@ class LibraryManager:
                 out["in_steam_as"] = copy["name"]
                 return out
         out.update(use=True, ready=ready, steam_running=steam.is_steam_running(), appid=appid)
+        if out.get("add_only") and ready and self.pad_needs_steam(e):
+            del out["add_only"]                    # our overlay: through Steam all the same, for the gamepad
+            out["for_pad"] = True
         return out
+
+    def pad_needs_steam(self, e: LibraryEntry) -> bool:
+        """Does a Valve controller get its gamepad in ``e`` only when Steam starts the game? An OnlineFix game signs in
+        to Steam as Spacewar (480), and Steam then turns the virtual pad off for every layout — the game's own one
+        asked for included — unless Steam started that game itself. Measured in a friend's Steam logs (new Steam
+        Controller, Steam 1792618285, 2026-10-29): Clair Obscur started by the app lost its pad ~2 s in, four starts out
+        of four ("mapping uses xinput : false"); through its shortcut it kept it ("uses xinput : true (warmed config for
+        app <shortcut>)"). Only while the app keeps the game's layout (Spacewar's own makes no gamepad either way)."""
+        return IS_LINUX and steaminput.enabled() and self.settings.settings.steam_input_layout \
+            and self.talks_to_steam_itself(e) and bool(steam.valve_controllers())
 
     def start_steam(self, timeout: float = 90.0) -> bool:
         """Start the Steam client in the background (on the user's Play) and wait until it is up and signed in."""

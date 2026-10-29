@@ -630,12 +630,8 @@ class MainWindow(QMainWindow):
 
     def force_quit(self) -> None:
         self._quitting = True
-        visible = self.isVisible()
-        self.close()
-        if not visible:
-            # in the tray (or never shown, --minimized): closing a hidden window does not end Qt's loop, so a
-            # logout / SIGTERM / update left the app running without a window
-            QApplication.instance().quit()
+        self.close()          # (closeEvent ends Qt's loop — also from the tray or --minimized, where closing a hidden
+                              #  window alone did not, and a logout / SIGTERM / update left the app running)
 
     def _open_diagnose(self, entry_id: int) -> None:
         from ezgd.ui.dialogs.diagnose import open_diagnose
@@ -961,3 +957,9 @@ class MainWindow(QMainWindow):
             self.tray.hide()
         self.launcher.clear()
         e.accept()
+        # the app ends with this window, whatever Qt's "quit with the last window" says: couch mode and the quick menu
+        # switch it off while they are up, and a friend's app, left with it off, stayed in memory (1.3 GB) with no
+        # window and no tray icon after its ✕ (2026-10-29) — and a window hidden in the tray never counts as the last
+        app = QApplication.instance()
+        app.setQuitOnLastWindowClosed(True)
+        app.quit()

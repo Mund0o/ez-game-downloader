@@ -401,16 +401,22 @@ class Gamepads(QObject):
             if path not in found:
                 self._close(path)
                 changed = True
+        # A controller that cannot be opened is tried again at every scan (said once): Steam's new virtual pad can
+        # show up before Linux has given the person at the computer access to it — a friend's quick menu found it
+        # "Permission denied" once and never read it again (2026-10-29), so it did not answer the controller.
+        self._denied &= set(found)
         for path, name in found.items():
-            if path in self.devices or path in self._denied:
+            if path in self.devices:
                 continue
             try:
                 fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
             except OSError as exc:
-                if exc.errno in (errno.EACCES, errno.EPERM):
+                if exc.errno in (errno.EACCES, errno.EPERM) and path not in self._denied:
                     self._denied.add(path)
                     log.info("controller %s (%s) cannot be opened: %s", name, path, exc.strerror)
+                    QTimer.singleShot(250, self, self.rescan)     # (access usually comes a moment later)
                 continue
+            self._denied.discard(path)
             _n, vendor, product, keys = info[path]
             dev = _Device(path, name, fd, vendor, product, keys)
             dev.notifier = QSocketNotifier(fd, QSocketNotifier.Read, self)

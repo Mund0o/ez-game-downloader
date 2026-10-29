@@ -361,6 +361,32 @@ def test_steam_files_never_written_while_steam_runs_or_unverified(library, tmp_p
     assert not hasattr(library, "sync_steam_shortcuts")               # nothing is ever written in the background
 
 
+def test_our_overlay_plays_an_onlinefix_game_through_steam_for_a_steam_controller(library, tmp_path, monkeypatch):
+    """Our overlay starts games here — but an OnlineFix game signs in to Steam as Spacewar (480), and Steam then turns
+    a Valve controller's gamepad off unless Steam started the game itself. Measured in a friend's Steam logs (new
+    Steam Controller, 2026-10-29): Clair Obscur started by the app lost its pad ~2 s in, four times out of four
+    ("mapping uses xinput : false"); started through its shortcut it kept it ("uses xinput : true (warmed config for
+    app <shortcut>)"). So with a Valve controller on, Play goes through the game's shortcut, our overlay or not."""
+    from ezgd.platform import steaminput
+    root = fake_steam(tmp_path, monkeypatch)
+    library.settings.set("steam_root", str(root))
+    library.settings.set("launch_through_steam", True)
+    monkeypatch.setattr(steaminput, "enabled", lambda: True)
+    of = script_game(library, tmp_path, "exit 0", "OF Pad Game")
+    (Path(of.install_path) / "OnlineFix.ini").write_text("[Main]\nRealAppId=1903340\nFakeAppId=480\n")
+    plain = script_game(library, tmp_path, "exit 0", "Plain Pad Game")
+    library.prepare_steam_shortcuts()                      # (Steam closed: both go into its list)
+    monkeypatch.setattr(steam, "is_steam_running", lambda: True)
+    library.settings.set("own_overlay", True)
+    assert library.steam_overlay_status(of.id).get("add_only") is True          # no Valve controller: here
+    monkeypatch.setattr(steam, "valve_controllers", lambda base=None: {0x1304})
+    st = library.steam_overlay_status(of.id)
+    assert st["use"] and st["ready"] and not st.get("add_only") and st.get("for_pad")
+    assert library.steam_overlay_status(plain.id).get("add_only") is True       # (never signs in as Spacewar)
+    library.settings.set("steam_input_layout", False)                            # (no layout kept by the app:
+    assert library.steam_overlay_status(of.id).get("add_only") is True          #  Spacewar's — Steam's way is no help)
+
+
 def test_onlinefix_games_get_the_overlay_without_steams_game_ids(library, tmp_path, monkeypatch, app_paths):
     """OnlineFix asks for a "Steamworks activation" when it sees the game ids Steam sets for a shortcut: those are
     hidden from it in play mode, while the overlay keeps its own id and preload."""

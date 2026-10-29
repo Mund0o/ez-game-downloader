@@ -151,6 +151,20 @@ def test_find_a_setting(ui, qtbot):  # noqa: F811
     assert all(c.isVisibleTo(page) for c, _h, _f in page._sections) and not page.no_match.isVisibleTo(page)
 
 
+def test_closing_the_window_ends_the_app_whatever_couch_mode_left(ui, qtbot, monkeypatch):  # noqa: F811
+    """A friend's app stayed in memory (1.3 GB) after its window was closed (2026-10-29): couch mode and the quick menu
+    over a desktop-started game switch Qt's "quit with the last window" off while they are up, and with it left off
+    the window's ✕ only hid the window — no window, no tray icon, the app still running. Closing the window (nothing
+    asked to keep it in the tray) ends the app, whatever that rule says."""
+    win, _core, _ = ui
+    quits = []
+    monkeypatch.setattr(QApplication.instance(), "quit", lambda: quits.append(1))
+    QApplication.instance().setQuitOnLastWindowClosed(False)
+    win.close()
+    assert quits == [1] and not win.isVisible()
+    assert QApplication.instance().quitOnLastWindowClosed()
+
+
 def test_quitting_from_the_tray_ends_the_app(ui, qtbot, monkeypatch):  # noqa: F811
     """Started with --minimized (or hidden in the tray), SIGTERM's force_quit must still end Qt's loop."""
     win, _core, _ = ui

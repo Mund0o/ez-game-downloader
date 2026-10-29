@@ -388,6 +388,10 @@ the Steam / PS / Xbox button and Shift+Tab open the quick menu instead of it:
 * **Steam's overlay is still there when wanted:** the quick menu's *Steam overlay* opens it over the game (friends,
   Steam's browser, guides). While it is open the Steam button is Steam's — it closes it, and the quick menu does not
   open over it. A long press of a Steam Controller's Steam button is Steam's too (its chord: mouse on the right pad).
+* **A Steam Controller in OnlineFix games:** they sign in to Steam as Spacewar, and Steam turns a Valve controller's
+  gamepad off in a game it did not start itself (measured in Steam's own logs). With one connected, Play starts
+  OnlineFix games through their Steam shortcut — also with *Our overlay* on — so the gamepad stays; if Steam still takes
+  it away, the game's log and a message say so. Steam's own extras stay: hold the Steam button for its mouse.
 
 **Quick overlay (fallback)** — for a game Steam does not know yet (you chose *Just play* instead of restarting
 Steam), the app loads Steam's overlay into the game itself (`gameoverlayrenderer.so` preloaded — Steam Linux Runtime

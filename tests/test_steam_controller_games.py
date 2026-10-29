@@ -42,6 +42,7 @@ class FakeSteam:
         self.connected = connected                # a controller Steam drives is on
         self.active = DESKTOP
         self.shortcuts: dict = {}
+        self.pad_off = False                      # Steam turned its virtual pad off (a game signed in as Spacewar)
 
     def opener(self, url: str) -> None:
         self.sent.append(url)
@@ -56,7 +57,15 @@ class FakeSteam:
                      f"{appid}\n")
 
     def pads(self, base=None) -> list[str]:
-        return ["input90"] if self.active in self.pads_for else []
+        return ["input90"] if self.active in self.pads_for and not self.pad_off else []
+
+    def sign_in(self, keeps_pad: bool = False) -> None:
+        """An OnlineFix game signs in to Steam as Spacewar: Steam readies Spacewar's layout — and for a game it did not
+        start itself turns its virtual pad off, whatever layout is forced (a friend's Steam, 2026-10-29)."""
+        with open(self.log, "a") as fh:
+            fh.write("[2026-10-29 02:21:49] Add to Config Cache Request 0 480 - adopting binding 279\n"
+                     "[2026-10-29 02:21:49] Controller 0 mapping uses xinput : false\n")
+        self.pad_off = not keeps_pad
 
     def add_shortcut(self, appid: int, name: str, entry_id: int | None = None, exe: str = "/opt/ezgd/ezgd") -> None:
         opts = f"--play {entry_id}" if entry_id is not None else ""
@@ -158,6 +167,36 @@ def test_onlinefix_games_get_a_gamepad_from_a_steam_controller(steam_pc, tmp_pat
     assert forced(s) == [3802265475]
     ended(core, e.id)
     assert until(lambda: forced(s)[-1:] == [0])
+
+
+def test_steam_taking_the_gamepad_away_at_the_sign_in_is_noticed(steam_pc, tmp_path, monkeypatch):
+    """A friend's Steam (new Steam Controller, 2026-10-29), four starts out of four: the game's own layout made Steam's
+    virtual pad, the app wrote "Steam made a gamepad for it" — and ~2 s later the OnlineFix game signed in to Steam as
+    Spacewar and Steam turned the pad off for the rest of the session ("mapping uses xinput : false"). The controller
+    did nothing in the game and nothing said why. The app watches for the sign-in now and says what happened."""
+    core, s = steam_pc
+    s.valve = {0x1304}                                     # the new Steam Controller's receiver
+    e = game(core, tmp_path, "Clair Obscur")
+    monkeypatch.setattr(core.library, "talks_to_steam_itself", lambda _e: True)
+    s.add_shortcut(4222309748, "Clair Obscur", entry_id=e.id)
+    s.pads_for = {4222309748}
+    log_path = core.paths.logs / f"game-{e.id}.log"
+    core.library.launch(e.id, confirmed=True)
+    assert until(lambda: "Steam made a gamepad" in log_path.read_text(), 6)
+    s.sign_in()
+    assert until(lambda: "took the gamepad away" in log_path.read_text(), 8)
+    assert until(lambda: bool(warnings(s)), 3)
+    title, text = warnings(s)[0][:2]
+    assert "Clair Obscur" in title and "through Steam" in text
+    ended(core, e.id)
+    s.events.clear()
+    s.pad_off = False
+    core.library.launch(e.id, confirmed=True)
+    assert until(lambda: log_path.read_text().count("Steam made a gamepad") == 2, 6)
+    s.sign_in(keeps_pad=True)                              # (its pad stays: Steam's choice was fine)
+    assert until(lambda: "kept the gamepad after" in log_path.read_text(), 8)
+    assert warnings(s) == []
+    ended(core, e.id)
 
 
 def test_a_game_not_in_steam_borrows_a_gamepad_layout_and_says_when_there_is_none(steam_pc, tmp_path):

@@ -246,10 +246,11 @@ class Actions(QObject):
                 mine = next((x for x in skipped if x["title"] == entry.title), None)
                 if mine is not None:                # this game itself: Steam has it under another entry
                     return direct(f"Steam already has it as “{mine['in_steam_as']}”")
+            why = ("Steam keeps a Steam Controller's gamepad only in OnlineFix games it starts itself."
+                   if st.get("for_pad") else "with the Steam overlay (Shift+Tab in the game).")
             self.bridge.call(self.core.library_call("launch_via_steam", entry.id),
-                             lambda _p: (self.toasts.show("Starting through Steam",
-                                                          f"{entry.title} — with the Steam overlay "
-                                                          "(Shift+Tab in the game).", "success"), ok_started()),
+                             lambda _p: (self.toasts.show("Starting through Steam", f"{entry.title} — {why}",
+                                                          "success"), ok_started()),
                              lambda e: (self.toasts.show("Steam did not take it", f"{e} — starting it directly.",
                                                          "warning"), direct()))
 

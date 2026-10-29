@@ -122,6 +122,20 @@ def read_activations(root: Path | None, since: int) -> tuple[list[tuple[int, int
     return [(int(c), unsigned(int(a))) for c, a in ACTIVATED.findall(text)], end
 
 
+SIGNED_IN = re.compile(r"Add to Config Cache Request \d+ 480 ")   # (controller.txt) a game signed in as Spacewar
+PAD_OFF = "mapping uses xinput : false"                            # … Steam's virtual pad off for it (no gamepad)
+
+
+def signed_in(root: Path | None, since: int) -> tuple[bool, bool, int]:
+    """Did a game sign in to Steam as Spacewar after byte ``since`` of controller.txt (Steam readies Spacewar's
+    layout: ``Add to Config Cache Request 0 480 - adopting binding 279``), did Steam say it turns its virtual pad off
+    (``Controller 0 mapping uses xinput : false``) — and the byte the log was read up to."""
+    if root is None:
+        return False, False, since
+    text, end = _read_new(root / "logs" / "controller.txt", since)
+    return bool(SIGNED_IN.search(text)), PAD_OFF in text, end
+
+
 GUIDE_TAP = "Guide button sent to JS"                # (controller_ui.txt) the Steam button let go after a tap …
 GUIDE_HOLD = "Guide button skipped due to length"    # … or after a long press (its chord: Steam's own)
 

@@ -387,6 +387,32 @@ class _Grabs:
         monkeypatch.setattr(gp.fcntl, "ioctl", ioctl)
 
 
+def test_a_pad_steam_just_made_is_opened_once_it_may_be(qtbot, tmp_path):
+    """Steam's new virtual pad can show up before Linux has given the person at the computer access to it: a friend's
+    quick menu found it "Permission denied" once (2026-10-29) and never tried it again — the menu did not answer the
+    controller, and the Steam button was pressed again and again. It is tried again (said once), soon."""
+    import os as _os
+    if _os.geteuid() == 0:
+        pytest.skip("root opens anything")
+    from ezgd.ui import gamepad as gp
+    node = tmp_path / "event258"
+    _os.mkfifo(node)
+    _os.chmod(node, 0)
+    real = gp.gamepad_info
+    gp.gamepad_info = lambda: [(str(node), "Microsoft X-Box 360 pad 0", 0x28DE, 0x11FF, 0)]
+    g = gp.Gamepads()
+    try:
+        g.rescan()
+        assert str(node) not in g.devices
+        _os.chmod(node, 0o600)                             # (udev's access for the person at the computer)
+        qtbot.waitUntil(lambda: str(node) in g.devices, timeout=1500)    # before the next 2-s scan
+    finally:
+        gp.gamepad_info = real
+        g.stop()
+        g.deleteLater()
+        qtbot.wait(50)
+
+
 def _pad(gp, fd=-1):
     dev = gp._Device("/dev/input/event90", "Microsoft X-Box 360 pad 0", fd, 0x28DE, 0x11FF, 0)
     dev.ranges.update({gp.ABS_X: (-32768, 32767), gp.ABS_Y: (-32768, 32767), gp.ABS_Z: (0, 255),
