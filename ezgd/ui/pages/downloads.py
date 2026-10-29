@@ -205,11 +205,13 @@ class BrowserRow(QFrame):
         parts = [f"{s['game']}" if s["game"] else ""]
         if s["state"] in ("downloading", "paused"):
             parts.append(f"{format_bytes(got)} / {format_bytes(total)}" if total else format_bytes(got))
-            if s["state"] == "downloading" and s["speed"]:
+            if s.get("note"):
+                parts.append(s["note"])                  # (its connection dropped: tried again by itself)
+            elif s["state"] == "downloading" and s["speed"]:
                 parts.append(format_speed(s["speed"]))
                 if s["eta"] is not None:
                     parts.append(f"{format_eta(s['eta'])} left")
-            if s["state"] == "paused":
+            if s["state"] == "paused" and not s.get("note"):
                 parts.append("paused")
         elif s["state"] == "completed":
             lib = s["library"]

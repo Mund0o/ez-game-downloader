@@ -4534,7 +4534,9 @@ class _Couch(OwnAppId):
         got, total = d.get("received") or 0, d.get("total") or 0
         frac = got / total if total else (1.0 if st == "completed" else 0.0)
         extra = f"{format_bytes(got)} of {format_bytes(total)}" if total else format_bytes(got)
-        if st == "downloading" and d.get("speed"):
+        if d.get("note"):
+            extra += f"  ·  {d['note']}"                # (its connection dropped: tried again by itself)
+        elif st == "downloading" and d.get("speed"):
             extra += f"  ·  {format_speed(d['speed'])}"
             if d.get("eta"):
                 m = int(d["eta"]) // 60

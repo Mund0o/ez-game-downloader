@@ -385,6 +385,54 @@ def test_in_app_browser_download_pause_resume_cancel(ui, qtbot, server):
     assert m.active() == 0
 
 
+def test_in_app_browser_download_goes_on_after_the_connection_drops(ui, qtbot, server, monkeypatch):
+    """An AnkerGames download stopped for good at 31.7 GiB (2026-10-29): the connection dropped and the browser's
+    engine left the download "interrupted", waiting for someone to resume it. The app only watched for "finished" and
+    "paused", so it showed it as downloading at 0 B/s forever, logged nothing and never tried again. Now a dropped
+    download is tried again from where it stopped (the server's byte ranges), says so, and goes on to the end."""
+    from ezgd.ui.dialogs import browser
+    if not browser.AVAILABLE:
+        pytest.skip("Qt WebEngine not installed")
+    monkeypatch.setattr(browser.BrowserDownloads, "RETRY_AFTER", (0.2, 0.4), raising=False)
+    win, core, _ = ui
+    data = bytes(range(256)) * 2048                                  # 512 KiB
+    m = browser.manager(win.actions)
+    notes = []
+    m.changed.connect(lambda: notes.extend(s.get("note") for s in m.snapshots() if s.get("note")))
+
+    def dropped(name: str, errors: int):
+        """A download whose connection drops after 96 KiB, and whose host then answers HTTP 503 ``errors`` times —
+        measured: the browser's engine tries once by itself and stops at the first 503 for good."""
+        res = server.add(f"/file/{name}", data=data, etag='"v1"', drop_after=96 * 1024, drop_times=1,
+                         chunk_delay=0.2, headers={"Content-Disposition": f'attachment; filename="{name}"'})
+        server.add(f"/d/{name}", data=f'<a id="a" href="/file/{name}">get</a>'.encode(), content_type="text/html")
+        g = Game("ankergames", name, f"Drop {name}", f"https://ankergames.net/game/{name}")
+        core.games.save(g)
+        browser.open_browser_download(win.actions, g, server.url(f"/d/{name}"), "AnkerGames", win)
+        dlg = next(w for w in win.findChildren(browser.BrowserDownloadDialog) if w.game.id == g.id)
+        loaded = []
+        dlg.view.loadFinished.connect(loaded.append)
+        qtbot.waitUntil(lambda: bool(loaded), timeout=20000)
+        dlg.page.runJavaScript("document.getElementById('a').click();")
+        qtbot.waitUntil(lambda: bool(dlg.started) and dlg.started[0].req.receivedBytes() > 0, timeout=20000)
+        res.status_sequence = [503] * errors
+        return dlg.started[0], res
+
+    d, res = dropped("big.zip", 3)
+    qtbot.waitUntil(lambda: "connection lost" in " ".join(notes), timeout=20000)
+    res.chunk_delay = 0.0
+    qtbot.waitUntil(lambda: d.state in ("completed", "failed", "cancelled"), timeout=30000)
+    assert d.state == "completed" and d.path.read_bytes() == data
+    assert res.range_requests[-1] != "bytes=0-"                       # (went on from where it stopped)
+    # given up on (cancelled) while it waits: no partial file is left behind — a stuck AnkerGames download, cancelled,
+    # left 31.7 GiB in the game's folder
+    d2, _res2 = dropped("gone.zip", 1000)
+    qtbot.waitUntil(lambda: any("gone.zip" in s["name"] and s.get("note") for s in m.snapshots()), timeout=20000)
+    m.cancel(d2.id)
+    qtbot.waitUntil(lambda: d2.state == "cancelled", timeout=10000)
+    assert not d2.path.with_name(d2.path.name + ".download").exists() and not d2.path.exists()
+
+
 def test_download_all_parts_button(ui, qtbot, monkeypatch, routes):
     import json as _json
     from ezgd.catalog.models import DownloadMethod, MethodKind

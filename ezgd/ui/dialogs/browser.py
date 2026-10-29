@@ -24,6 +24,7 @@ from urllib.parse import urlsplit
 from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtWidgets import QCheckBox, QDialog, QHBoxLayout, QLineEdit, QMessageBox, QVBoxLayout
 
+from ezgd.core.fsutil import format_bytes
 from ezgd.net import adblock, filterlists
 from ezgd.ui.widgets.common import Banner, button, label
 from ezgd.ui.window_control import OwnAppId
@@ -298,6 +299,12 @@ class BrowserDownload:
     _last: tuple[float, int] = (0.0, 0)
     library: str = ""                   # "", "adding", "added", "failed: …"
     final: dict | None = None           # copied when finished: Qt deletes the request with its page
+    note: str = ""                      # why it is not simply downloading (its connection dropped, …)
+    retry_at: float = 0.0               # when it is tried again after a dropped connection (0: not waiting)
+    retries: int = 0                    # tries since the last byte came in
+    gave_up: bool = False               # out of tries: waits for the player's Resume (shown as paused)
+    held: bool = False                  # paused by the player while it waited to be tried again
+    lost_at: int = -1                   # bytes it had when its connection last dropped
 
     def freeze(self) -> None:
         r = self.req
@@ -317,10 +324,15 @@ class BrowserDownload:
         return self.final["path"] if self.final else Path(self.req.downloadDirectory()) / self.req.downloadFileName()
 
     @property
+    def partial(self) -> Path:
+        """The file the browser's engine writes until the download is done (``big.zip.download``)."""
+        return self.path.with_name(self.path.name + ".download")
+
+    @property
     def state(self) -> str:
         if self.final:
             return self.final["state"]
-        return "paused" if self.req.isPaused() else "downloading"
+        return "paused" if self.req.isPaused() or self.gave_up or self.held else "downloading"
 
     @property
     def error(self) -> str:
@@ -334,7 +346,7 @@ class BrowserDownload:
         eta = (total - got) / self.speed if self.speed > 0 and total > 0 else None
         return {"id": self.id, "name": self.name, "game": self.game.title if self.game else "", "host": self.host,
                 "state": self.state, "received": got, "total": total if total > 0 else None, "speed": self.speed,
-                "eta": eta, "error": self.error, "library": self.library, "path": str(self.path)}
+                "eta": eta, "error": self.error, "library": self.library, "path": str(self.path), "note": self.note}
 
 
 def _plain_name(name: str) -> str:
@@ -346,6 +358,8 @@ class BrowserDownloads(QObject):
     """Owns every in-app browser transfer for the app's lifetime (pop-ups come and go)."""
 
     changed = Signal()
+    RETRY_AFTER = (5, 15, 30, 60, 120)      # s before each try again after a dropped connection; then every 2 min
+    RETRY_TRIES = 30                         # … about an hour without a byte: then it waits for the player's Resume
 
     def __init__(self, actions):
         super().__init__(actions)
@@ -404,13 +418,56 @@ class BrowserDownloads(QObject):
         self.items[d.id] = d
         req.isFinishedChanged.connect(lambda d=d: self._finished(d))
         req.isPausedChanged.connect(self.changed.emit)
+        # (after the state: Qt says whether it is finished only once the state has changed)
+        req.stateChanged.connect(lambda _s, d=d: QTimer.singleShot(0, self, lambda: self._interrupted(d)))
         self._timer.start()
+        log.info("browser download: %s from %s started (%s)", req.downloadFileName(), d.host,
+                 format_bytes(req.totalBytes()) if req.totalBytes() > 0 else "size not given")
         session.download_started(d)
+        self.changed.emit()
+
+    def _interrupted(self, d: BrowserDownload) -> None:
+        """Its connection dropped: the browser's engine tries once by itself, and a host's one error on the way back
+        (HTTP 503, measured) stops the download for good — left "interrupted", waiting for someone to go on, and shown
+        here as downloading at 0 B/s, without a word (an AnkerGames download stood still at 31.7 GiB, 2026-10-29). It
+        is tried again from where it stopped (the host's byte ranges), after a pause that grows with each try."""
+        if d.final is not None or d.req.isFinished() or d.req.state() != QWebEngineDownloadRequest.DownloadInterrupted \
+                or d.retry_at or d.gave_up or d.held or d.req.isPaused():
+            return
+        got = d.req.receivedBytes()
+        if got > d.lost_at:
+            d.retries = 0                            # it got further since the last drop: a fresh start
+        d.lost_at = got
+        why = d.req.interruptReasonString()
+        if d.retries >= self.RETRY_TRIES:
+            d.gave_up = True
+            d.note = f"connection lost ({why}) — press Resume to try again"
+            log.info("browser download: %s stopped at %s (%s) — %d tries without a byte, waiting for Resume", d.name,
+                     format_bytes(got), why, d.retries)
+        else:
+            wait = self.RETRY_AFTER[min(d.retries, len(self.RETRY_AFTER) - 1)]
+            d.retry_at = time.monotonic() + wait
+            d.note = f"connection lost — trying again in {wait:.0f} s"
+            log.info("browser download: %s stopped at %s of %s (%s) — trying again in %.0f s", d.name,
+                     format_bytes(got), format_bytes(d.req.totalBytes()) if d.req.totalBytes() > 0 else "?", why, wait)
+        self._timer.start()
         self.changed.emit()
 
     def _tick(self) -> None:
         now = time.monotonic()
         for d in self.items.values():
+            if d.final is None and d.retry_at:
+                left = d.retry_at - now
+                if left > 0:
+                    d.note = f"connection lost — trying again in {left:.0f} s"
+                else:
+                    d.retry_at, d.note = 0.0, "connection lost — trying again now"
+                    d.retries += 1
+                    d.req.resume()
+            elif d.note and d.final is None and not (d.gave_up or d.held) and d.req.receivedBytes() > d.lost_at \
+                    and d.req.state() == QWebEngineDownloadRequest.DownloadInProgress:
+                d.note = ""
+                log.info("browser download: %s going again (from %s)", d.name, format_bytes(d.lost_at))
             if d.state == "downloading" and d.final is None:
                 t0, b0 = d._last
                 got = d.req.receivedBytes()
@@ -424,8 +481,27 @@ class BrowserDownloads(QObject):
             self._timer.stop()
         self.changed.emit()
 
+    @staticmethod
+    def _drop_partial(d: BrowserDownload) -> None:
+        """The part of a cancelled or failed download: the browser's engine leaves it in the game's folder when the
+        download was waiting after a dropped connection (measured) — 31.7 GiB of a cancelled AnkerGames download
+        stayed — and the in-app browser can never go on with it (its downloads do not outlive the app)."""
+        try:
+            part = d.partial
+            if part.is_file():
+                size = part.stat().st_size
+                part.unlink()
+                log.info("browser download: %s — its unfinished part (%s) was deleted", d.name, format_bytes(size))
+        except OSError as exc:
+            log.info("browser download: %s — its unfinished part could not be deleted: %s", d.name, exc)
+
     def _finished(self, d: BrowserDownload) -> None:
         d.freeze()
+        d.note, d.retry_at = "", 0.0
+        log.info("browser download: %s %s (%s%s)", d.name, d.state, format_bytes(d.final["received"]),
+                 f" — {d.error}" if d.error else "")
+        if d.state in ("cancelled", "failed"):
+            self._drop_partial(d)
         self.changed.emit()
         if d.state == "completed" and d.game is not None:
             # each file goes to the library as soon as it is done; parts of a multi-part archive are
@@ -518,12 +594,23 @@ class BrowserDownloads(QObject):
 
     def pause(self, did: int) -> None:
         if (r := self._running(did)) is not None:
+            d = self.items[did]
+            if d.retry_at or r.state() == QWebEngineDownloadRequest.DownloadInterrupted:
+                d.held, d.retry_at, d.note = True, 0.0, ""       # waiting after a dropped connection: not tried again
+                self.changed.emit()
             r.pause()
 
     def resume(self, did: int) -> None:
         if (r := self._running(did)) is not None:
+            d = self.items[did]
+            if d.held or d.gave_up:
+                d.held = d.gave_up = False
+                d.retries = 0
+                if r.state() == QWebEngineDownloadRequest.DownloadInterrupted:
+                    d.note = "connection lost — trying again now"
             r.resume()
             self._timer.start()
+            self.changed.emit()
 
     def cancel(self, did: int) -> None:
         if (r := self._running(did)) is not None:
@@ -542,6 +629,7 @@ class BrowserDownloads(QObject):
         for d in self.items.values():
             if d.final is None:
                 d.req.cancel()
+                self._drop_partial(d)                # (the app is closing: its end may never be handled)
 
 
 def manager(actions) -> BrowserDownloads | None:
