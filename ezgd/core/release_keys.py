@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import base64
 
-PUBLIC_KEYS: tuple[str, ...] = ("/wCVmkqdETAQEw8yIClwPg5F1nNjVk/QF0KNyMoOWu0=",)    # made 2026-10-21
+PUBLIC_KEYS: tuple[str, ...] = (
+    "/wCVmkqdETAQEw8yIClwPg5F1nNjVk/QF0KNyMoOWu0=",    # made 2026-10-21; its private half was lost 2026-10-29
+    "ZAnwFgRiqiWCtynTCaAyibxYdQLjA9CSg3tNE4i+AgI=",    # made 2026-11-03, signs releases from 0.6.15 on
+)
 
 
 def message(asset: str, version: str, sha256: str) -> bytes:
