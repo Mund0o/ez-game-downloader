@@ -157,7 +157,9 @@ def chip(text: str, color: str) -> QLabel:
 
 def set_chip(c: QLabel, text: str, color: str) -> None:
     c.setText(text)
-    c.setStyleSheet(theme.chip_style(color))
+    style = theme.chip_style(color)
+    if c.styleSheet() != style:          # (Qt parses and re-polishes even an unchanged style sheet: every update)
+        c.setStyleSheet(style)
 
 
 def card(layout_cls=QVBoxLayout, margins=(16, 14, 16, 14), spacing=10) -> tuple[QFrame, QVBoxLayout]:

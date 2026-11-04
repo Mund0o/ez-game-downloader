@@ -82,3 +82,20 @@ async def test_core_update_conditional_and_errors(app_paths):
         from ezgd.net import filterlists
         filterlists.set_data_dir(None)              # later tests use the bundled lists again
         filterlists._ENGINE = None
+
+
+def test_filter_engine_is_built_only_when_the_browser_needs_it(monkeypatch):
+    # compiled at every app start it held ~80 MB for the whole run and paused the interface (its compiler holds
+    # Python's lock) — also for everyone who never opens the in-app browser
+    from ezgd.net import filterlists
+    monkeypatch.setattr(filterlists, "_ENGINE", None)
+    monkeypatch.setattr(filterlists, "_INFO", {})
+    built = []
+    real = filterlists.build_engine
+    monkeypatch.setattr(filterlists, "build_engine", lambda: built.append(1) or real())
+    info = filterlists.info()                          # Settings showing what the lists hold
+    assert info["available"] and info["rules"] > 100_000 and len(info["lists"]) == 6
+    filterlists.reload()                               # the daily update stored new lists
+    assert not built and filterlists._ENGINE is None
+    assert filterlists.engine() is not None and built == [1]      # the browser's first request builds it
+    assert filterlists.info()["rules"] == info["rules"]

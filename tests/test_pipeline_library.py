@@ -78,6 +78,42 @@ async def test_corrupt_archive_keeps_entry_downloaded(repos, settings, tmp_path)
     assert any(n == "notify" and "Extraction failed" in p[0] for n, p in events)
 
 
+async def test_unexpected_extraction_error_never_leaves_the_game_extracting(repos, settings, tmp_path, monkeypatch):
+    lib, ext, games, _ = repos
+    (tmp_path / "dl").mkdir()
+    archive = tmp_path / "dl" / "g.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("a.txt", b"a")
+
+    def boom(*a, **k):
+        raise ValueError("a library's own error")
+    monkeypatch.setattr("ezgd.installation.archives.extract", boom)
+    events = []
+    post = PostProcessor(lib, ext, games, settings, lambda n, p: events.append((n, p)))
+    entry = lib.get((await post.on_download_completed(make_task(repos, tmp_path, "g.zip"), archive)).id)
+    assert entry.status is LibraryStatus.DOWNLOADED
+    row = ext.for_library(entry.id)[0]
+    assert row["status"] == "failed" and "ValueError" in row["error"]
+    assert any(n == "notify" and "Extraction failed" in p[0] for n, p in events)
+
+
+async def test_a_failing_step_after_extracting_still_saves_it_extracted(repos, settings, tmp_path, monkeypatch):
+    lib, ext, games, _ = repos
+    (tmp_path / "dl").mkdir()
+    archive = tmp_path / "dl" / "g.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("a.txt", b"a")
+
+    def fail(*a):
+        raise RuntimeError("bookkeeping")
+    monkeypatch.setattr(PostProcessor, "_record_release", fail)
+    post = PostProcessor(lib, ext, games, settings, lambda *a: None)
+    with pytest.raises(RuntimeError):
+        await post.on_download_completed(make_task(repos, tmp_path, "g.zip"), archive)
+    (entry,) = lib.all()
+    assert entry.status is LibraryStatus.EXTRACTED          # not "Extracting" for good
+
+
 async def test_plain_folder_download_becomes_install_path(repos, settings, tmp_path):
     lib, ext, games, _ = repos
     folder = tmp_path / "dl" / "PreInstalled"
@@ -110,6 +146,30 @@ def library(repos, settings, app_paths):
     return LibraryManager(lib, games, settings, app_paths, lambda *a: None)
 
 
+def test_missing_files_and_their_return(library, tmp_path):
+    d = tmp_path / "dl"
+    d.mkdir()
+    (d / "Big.part2.rar").write_bytes(b"2")
+    # a multi-part set whose part 2 came in first: its download path names part 1 already — not "missing files"
+    e = library.repo.insert(LibraryEntry(title="Big", status=LibraryStatus.DOWNLOADED,
+                                         download_path=str(d / "Big.part1.rar")))
+
+    def status(entry_id):
+        return next(x.status for x in library.all() if x.id == entry_id)
+    assert status(e.id) is LibraryStatus.DOWNLOADED
+    (d / "Big.part2.rar").unlink()
+    assert status(e.id) is LibraryStatus.BROKEN
+    # back (a drive mounted again, the first part in): only downloaded — "extracted" made the set never be extracted
+    (d / "Big.part1.rar").write_bytes(b"1")
+    assert status(e.id) is LibraryStatus.DOWNLOADED
+    game = tmp_path / "games" / "G"
+    g = library.repo.insert(LibraryEntry(title="G", status=LibraryStatus.INSTALLED, install_path=str(game),
+                                         executable="g.exe"))
+    assert status(g.id) is LibraryStatus.BROKEN
+    game.mkdir(parents=True)
+    assert status(g.id) is LibraryStatus.INSTALLED
+
+
 def test_executable_ranking(tmp_path):
     root = tmp_path / "Game"
     (root / "Engine" / "Binaries").mkdir(parents=True)
@@ -124,6 +184,21 @@ def test_executable_ranking(tmp_path):
     assert ranked[-1].path.name in ("unins000.exe", "UnityCrashHandler64.exe")
     hinted = rank(found, root, "Super Game", hint="UnityCrashHandler64.exe")
     assert hinted[0].path.name == "UnityCrashHandler64.exe"
+
+
+def test_tool_words_inside_game_names_are_not_tools(tmp_path):
+    # "server" is in Observer, "eac" (EasyAntiCheat) in Breach: those games' own exe was ranked as a tool — below any
+    # helper next to it, so Play started the helper
+    for title, exe in (("Observer: System Redux", "Observer.exe"), ("Into the Breach", "Breach.exe")):
+        root = tmp_path / title.replace(":", "")
+        root.mkdir()
+        (root / exe).write_bytes(b"MZ" + b"\0" * 200_000)
+        (root / "UnrealCEFSubProcess.exe").write_bytes(b"MZ" + b"\0" * 2000)
+        (root / "GameServer.exe").write_bytes(b"MZ" + b"\0" * 2000)
+        ranked = rank(find_executables(root), root, title)
+        assert ranked[0].path.name == exe and ranked[0].kind == "game"
+        server = next(c for c in ranked if c.path.name == "GameServer.exe")
+        assert server.kind == "tool" and "Dedicated server" in server.modes
 
 
 def test_import_set_executable_and_trust(library, tmp_path):
@@ -406,6 +481,11 @@ async def test_onlinefix_fix_only_game_goes_into_the_steam_game(repos, settings,
     assert await post.extract(entry, fix, post.default_extract_dest(entry, fix), download_root=fix.parent)
     entry = lib.get(entry.id)
     assert not entry.setup and not post.fixes_ready_for_steam()          # applied: not again
+    walks = []                                                           # … nor looked for every 20 s
+    real = post._has_onlinefix
+    post._has_onlinefix = lambda folder: walks.append(folder) or real(folder)
+    post.fixes_ready_for_steam()
+    assert not walks
     assert Path(entry.install_path) == game_dir and (game_dir / "OnlineFix64.dll").exists()
     backups = list(game_dir.glob(".ezgd-backup-*/LittleNightmaresIII/Binaries/Win64/steam_api64.dll"))
     assert backups and backups[0].read_bytes() == b"MZ original"           # Steam's own file kept

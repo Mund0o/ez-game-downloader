@@ -26,6 +26,9 @@ class HomePage(QWidget):
         self.actions = actions
         self.bridge = actions.bridge
         self.active: dict[int, dict] = {}
+        self._active_ids: list[int] | None = None                       # the downloads the rows show now
+        self._active_rows: dict[int, tuple[QLabel, QProgressBar, QLabel]] = {}
+        self._statuses: dict[int, str] = {}                            # each download's last status
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         scroll = QScrollArea()
@@ -213,37 +216,52 @@ class HomePage(QWidget):
 
     # ------------------------------------------------------------ downloads
     def download_updated(self, snap: dict) -> None:
-        if snap["status"] in ("downloading", "metadata", "checking", "verifying", "queued"):
-            self.active[snap["id"]] = snap
-        else:
-            self.active.pop(snap["id"], None)
-            if snap["status"] == "completed":
-                self.bridge.call(self.bridge.core.recently_downloaded(6), self._downloaded, owner=self)
+        tid, status = snap["id"], snap["status"]
+        before = self._statuses.get(tid)
+        self._statuses[tid] = status
+        if status in ("downloading", "metadata", "checking", "verifying", "queued"):
+            self.active[tid] = snap
+        elif self.active.pop(tid, None) is None and status == before:
+            return                     # (a paused or seeding torrent says so every second: nothing here changes)
+        if status == "completed" and before != "completed":
+            self.bridge.call(self.bridge.core.recently_downloaded(6), self._downloaded, owner=self)
         self._render_active()
 
     def download_removed(self, tid: int) -> None:
         self.active.pop(tid, None)
+        self._statuses.pop(tid, None)
         self._render_active()
 
     def _render_active(self) -> None:
-        clear_layout(self.active_list)
         items = sorted(self.active.values(), key=lambda s: s["id"])[:5]
-        if not items:
-            self.active_list.addWidget(label("No active downloads.", "muted"))
-            return
+        ids = [s["id"] for s in items]
+        if ids != self._active_ids:
+            # rows only when downloads come or go — every progress update built them all again (2.5× a second per
+            # download, with the page out of sight too: in couch mode, in the tray, during a game)
+            self._active_ids = ids
+            clear_layout(self.active_list)
+            self._active_rows = {}
+            if not items:
+                self.active_list.addWidget(label("No active downloads.", "muted"))
+            for s in items:
+                w = QWidget()
+                row = QHBoxLayout(w)
+                row.setContentsMargins(0, 0, 0, 0)
+                title, info = label(), label("", "small")
+                bar = QProgressBar()
+                bar.setRange(0, 1000)
+                bar.setFixedHeight(8)
+                row.addWidget(title, 2)
+                row.addWidget(bar, 3)
+                row.addWidget(info, 1, Qt.AlignRight)
+                self.active_list.addWidget(w)
+                self._active_rows[s["id"]] = (title, bar, info)
         for s in items:
-            w = QWidget()
-            row = QHBoxLayout(w)
-            row.setContentsMargins(0, 0, 0, 0)
-            row.addWidget(label(s["title"]), 2)
-            bar = QProgressBar()
-            bar.setRange(0, 1000)
+            title, bar, info = self._active_rows[s["id"]]
+            title.setText(s["title"])
             bar.setValue(int(s["progress"] * 1000))
-            bar.setFixedHeight(8)
-            row.addWidget(bar, 3)
-            info = "queued" if s["status"] == "queued" else f"{s['progress'] * 100:.0f}% · {format_speed(s['speed'])}"
-            row.addWidget(label(info, "small"), 1, Qt.AlignRight)
-            self.active_list.addWidget(w)
+            info.setText("queued" if s["status"] == "queued" else
+                         f"{s['progress'] * 100:.0f}% · {format_speed(s['speed'])}")
 
     def _search(self) -> None:
         q = self.search.text().strip()

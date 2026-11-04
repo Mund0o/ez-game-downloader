@@ -77,8 +77,9 @@ QT_TYPES = {0: "document", 1: "sub_frame", 2: "stylesheet", 3: "script", 4: "ima
 
 
 def set_data_dir(path: Path | None) -> None:
-    global _DATA_DIR
+    global _DATA_DIR, _INFO
     _DATA_DIR = Path(path) if path is not None else None
+    _INFO = {}                                      # (counted again from the lists there)
 
 
 def _downloaded(key: str) -> Path | None:
@@ -106,21 +107,30 @@ def _read_list(fl: FilterList) -> tuple[str, str]:
         return "", "missing"
 
 
-def build_engine():
-    """Compile every list into one engine (≈0.2 s); returns (engine, info)."""
-    if not AVAILABLE:
-        return None, {"available": False}
-    fs = _adblock.FilterSet(debug=False)
-    lists, rules = {}, 0
+def _lists() -> tuple[list[str], dict]:
+    """The text of every usable list, and what they hold: (texts, info)."""
+    texts, lists, rules = [], {}, 0
     for fl in LISTS:
         text, origin = _read_list(fl)
         if text:
-            fs.add_filter_list(text, format="standard")
+            texts.append(text)
             n = rule_count(text)
             rules += n
             lists[fl.key] = {"name": fl.name, "rules": n, "origin": origin}
+    return texts, {"available": AVAILABLE, "rules": rules, "lists": lists}
+
+
+def build_engine():
+    """Compile every list into one engine (≈0.3 s, ~80 MB resident — and the compiler holds Python's lock for up to
+    ~0.2 s, so the interface pauses meanwhile); returns (engine, info)."""
+    if not AVAILABLE:
+        return None, {"available": False}
+    texts, info = _lists()
+    fs = _adblock.FilterSet(debug=False)
+    for text in texts:
+        fs.add_filter_list(text, format="standard")
     engine = _adblock.Engine(fs, optimize=True)
-    return engine, {"available": True, "rules": rules, "lists": lists, "built_at": time.time()}
+    return engine, {**info, "built_at": time.time()}
 
 
 def engine():
@@ -138,16 +148,35 @@ def engine():
 
 
 def reload() -> None:
-    """Rebuild from the current files and swap the engine in (call from a worker thread)."""
+    """Rebuild from the current files and swap the engine in (call from a worker thread). An engine nothing has used
+    yet is not built for this: the browser builds it from the new files when it opens."""
     global _ENGINE, _INFO
+    if _ENGINE is None:
+        with _LOCK:
+            _INFO = {}
+        return
     eng, info = build_engine()
     with _LOCK:
         _ENGINE, _INFO = eng, info
 
 
 def info() -> dict:
-    engine()
+    """What the lists hold — counted from them when the engine has not been built (Settings showing the numbers
+    compiled it: ~80 MB for the rest of the run)."""
+    global _INFO
+    if not _INFO and AVAILABLE:
+        counted = _lists()[1]
+        with _LOCK:
+            _INFO = _INFO or counted
     return dict(_INFO) if _INFO else {"available": AVAILABLE}
+
+
+def warm_up() -> None:
+    """Build the engine now (the in-app browser is opening; call from a worker thread)."""
+    try:
+        engine()
+    except Exception:
+        log.exception("the filter lists could not be compiled")
 
 
 def _is_check(url: str) -> bool:

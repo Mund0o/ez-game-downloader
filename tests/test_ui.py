@@ -1178,3 +1178,32 @@ def test_all_games_keeps_its_order_while_more_results_arrive():
     assert shown[-1][:2] == first and shown[-1][-1] == "N game"                       # appended, nothing moved
     AllGamesPage._refilter(page)                                                      # e.g. the sort changed
     assert shown[-1][0] == "N game"
+
+
+def test_download_progress_updates_rows_in_place(ui, qtbot, monkeypatch, tmp_path):
+    # every progress update rebuilt Home's rows and re-styled the Downloads page's (2.5× a second per download, the
+    # window out of sight too: couch mode, the tray, a game) — now the same rows only change their numbers
+    from ezgd.downloads.models import DownloadKind, DownloadStatus, DownloadTask
+    win, _core, _ = ui
+    home, page = win.pages["home"], win.pages["downloads"]
+    task = DownloadTask(kind=DownloadKind.HTTP, title="Peak", uri="https://x.test/f", dest_dir=str(tmp_path),
+                        id=9001, status=DownloadStatus.DOWNLOADING, total_bytes=1000, downloaded_bytes=100)
+    home.download_updated(task.snapshot())
+    page.upsert(task.snapshot())
+    (_title, bar, _info), = home._active_rows.values()
+    item, row = page.rows[9001]
+    styles = []
+    monkeypatch.setattr(row.status, "setStyleSheet", styles.append)
+    task.downloaded_bytes = 600
+    home.download_updated(task.snapshot())
+    page.upsert(task.snapshot())
+    assert home._active_rows[9001][1] is bar and bar.value() == 600
+    assert page.rows[9001] == (item, row) and row.bar.value() == 600 and not styles
+    # paused: off Home's list once; its update every second after that leaves the page alone
+    task.status = DownloadStatus.PAUSED
+    home.download_updated(task.snapshot())
+    assert home._active_ids == [] and not home._active_rows
+    rendered = []
+    monkeypatch.setattr(home, "_render_active", lambda: rendered.append(1))
+    home.download_updated(task.snapshot())
+    assert not rendered

@@ -225,6 +225,7 @@ class TorrentEngine:
         h.unset_flags(lt.torrent_flags.auto_managed)
         h.pause()
         self.request_resume_data(task)
+        self._stall_since.pop(task.id, None)      # (a resumed torrent looks for peers afresh before "Stalled")
         task.status = DownloadStatus.PAUSED
         task.speed = task.upload_speed = 0.0
 
@@ -235,12 +236,14 @@ class TorrentEngine:
             return
         h.unset_flags(lt.torrent_flags.auto_managed)
         h.resume()
+        self._stall_since.pop(task.id, None)
         task.status = DownloadStatus.DOWNLOADING
 
     def remove(self, task: DownloadTask, delete_files: bool = False) -> None:
         h = self.handles.pop(task.id, None)
         self.tasks.pop(task.id, None)
         self._pending_resume.discard(task.id)
+        self._stall_since.pop(task.id, None)
         if task.info_hash:
             self._by_hash.pop(task.info_hash, None)
         if h is not None and h.is_valid():

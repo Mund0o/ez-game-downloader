@@ -583,7 +583,9 @@ class MainWindow(QMainWindow):
             self.nav_buttons["downloads"].setText(f"  Downloads ({n})" if n else "  Downloads")
             self.launcher.update(s.get("progress"), n)
             if self.tray:
-                self.tray.setToolTip(taskbar.tray_tooltip(APP_DISPLAY_NAME, s))
+                tip = taskbar.tray_tooltip(APP_DISPLAY_NAME, s)
+                if tip != self.tray.toolTip():   # (Qt sends every call to the panel over D-Bus — unchanged ones too,
+                    self.tray.setToolTip(tip)    #  once a second for as long as the app ran, during games too)
         self.bridge.call(self.bridge.core.summary(), show, owner=self)
 
     # --------------------------------------------------------------- window

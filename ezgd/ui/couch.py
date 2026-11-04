@@ -1445,9 +1445,13 @@ class _Couch(OwnAppId):
 
     def _pump_tick(self) -> None:
         self._meter_tick()
-        if not self.isVisible() or self.isMinimized() or not self.isActiveWindow():
-            if self.isVisible() and not self.isMinimized():
-                self._flush()
+        if not self.isVisible() or self.isMinimized():
+            # out of sight (a game in front: couch mode minimizes itself) — it ticked 60–144 times a second for the
+            # whole game, waking the processor for nothing; started again when couch mode is active (changeEvent)
+            self._pump.stop()
+            return
+        if not self.isActiveWindow():
+            self._flush()
             return
         if not self._flush():
             self._request(QRect(0, 0, 1, 1))            # nothing moved: a one-pixel frame keeps the rate steady
@@ -1608,6 +1612,9 @@ class _Couch(OwnAppId):
         if self.isActiveWindow():
             self._idle_away.stop()
             self._refocus.stop()
+            if not self._pump.isActive() and self._pump.interval() > 0 and \
+                    self.actions.settings.get("couch_steady_frames", True):
+                self._pump.start()                      # (stopped while out of sight: _pump_tick)
             if not self._playing_here():
                 self.wc.keep_above(True)
             self.update()

@@ -17,6 +17,7 @@ pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="Linux launch se
 
 # ------------------------------------------------------------ launch options
 def test_launch_options_without_command_are_appended():
+    assert launcher.parse_launch_options("# -dx11").args == []        # only a comment: it raised IndexError
     o = launcher.parse_launch_options('-windowed -lang "en us"')
     assert o.args == ["-windowed", "-lang", "en us"] and not o.uses_command and not o.env
 

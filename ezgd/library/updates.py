@@ -46,14 +46,17 @@ def parse_version(text: str | None) -> str | None:
 def _key(v: str) -> tuple[str, tuple] | None:
     v = v.strip().lower()
     if v.startswith("build "):
-        return ("build", (int(v.split()[1]),))
+        # (a page's own text when it holds no version: "Build EA" — int() of it stopped every game's update check)
+        n = v.split()[1]
+        return ("build", (int(n),)) if n.isdigit() else None
     m = re.fullmatch(r"v?(\d+(?:\.\d+)*)([a-z]?)", v)
     if not m:
         return None
     nums = tuple(int(x) for x in m.group(1).split("."))
     while len(nums) > 1 and nums[-1] == 0:                # 1.2.0 == 1.2
         nums = nums[:-1]
-    return ("ver", nums + ((ord(m.group(2)) - 96,) if m.group(2) else ()))
+    # the letter after the numbers, not one more number: as a number "1.0.5a" was the same as "1.0.5.1" (no update)
+    return ("ver", (nums, ord(m.group(2)) - 96 if m.group(2) else 0))
 
 
 def compare(a: str | None, b: str | None) -> int | None:

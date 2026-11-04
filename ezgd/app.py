@@ -37,9 +37,17 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 def _handle_db_problems(core, QMessageBox) -> bool:
     """Open the database, guiding the user through unusual states. Returns False to quit."""
+    import sqlite3
     from ezgd.database.db import SchemaTooNewError
     try:
         core.open_database()
+    except sqlite3.OperationalError as exc:
+        # (not a damaged file — it is left exactly as it is)
+        QMessageBox.critical(None, APP_DISPLAY_NAME,
+                             f"The database could not be opened: {exc}.\n\n{core.paths.database}\n\nNothing was "
+                             "changed. Free some disk space, or check the folder (its permissions, a drive that is "
+                             "not mounted), then start the app again.")
+        return False
     except SchemaTooNewError as exc:
         box = QMessageBox()
         box.setIcon(QMessageBox.Warning)

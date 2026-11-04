@@ -91,8 +91,10 @@ class DownloadRow(QFrame):
     def update_snap(self, snap: dict) -> None:
         self.snap = snap
         s = snap["status"]
-        self.icon.setPixmap(icon("magnet" if snap["kind"] == "torrent" else "download",
-                                 theme.status_color(s), 22).pixmap(22, 22))
+        look = ("magnet" if snap["kind"] == "torrent" else "download", theme.status_color(s))
+        if getattr(self, "_look", None) != look:      # (a new pixmap re-lays the row out: only when it changes)
+            self._look = look
+            self.icon.setPixmap(icon(look[0], look[1], 22).pixmap(22, 22))
         self.title.setText(snap["title"])
         set_chip(self.status, STATUS_TEXT.get(s, s), theme.status_color(s))
         self.bar.setValue(int(snap["progress"] * 1000))
@@ -126,7 +128,9 @@ class DownloadRow(QFrame):
         elif s == "completed":
             lines.append("Transfer finished. Extraction and installation are tracked separately in Library.")
         self.extra.setText("\n".join(lines))
-        self.extra.setStyleSheet(f"color: {theme.CURRENT.danger};" if s == "failed" else "")
+        style = f"color: {theme.CURRENT.danger};" if s == "failed" else ""
+        if self.extra.styleSheet() != style:
+            self.extra.setStyleSheet(style)
         self.extra.setVisible(bool(lines))
         finished = s in ("completed", "failed", "cancelled")
         self.btn_pause.setVisible(not finished and s != "paused")
@@ -413,7 +417,9 @@ class DownloadsPage(QWidget):
             if tid in self.extractions:
                 row.set_extraction(self.extractions[tid])
         item.setSizeHint(QSize(100, _row_height(row)))
-        item.setHidden(not matches_filter(snap, self.filter_key))
+        hide = not matches_filter(snap, self.filter_key)
+        if item.isHidden() != hide:          # (Qt lays the whole list out again on every setHidden, even unchanged)
+            item.setHidden(hide)
         if self.list.currentItem() is item:
             self._show_details(snap)
         self._refresh_empty()

@@ -223,6 +223,8 @@ def parse_launch_options(text: str, posix: bool = not IS_WINDOWS) -> LaunchOptio
     if not text:
         return LaunchOptions()
     tokens = _tokenize(text, posix)
+    if not tokens:
+        return LaunchOptions()                 # only a comment ("# -dx11"): no options — it raised IndexError
     bad = [t for t in tokens if t in REJECTED_OPERATORS or t.startswith(("$(", "`"))
            or (t and set(t) <= set(";&|<>()") and t not in CHAIN_OPERATORS)]
     if bad:

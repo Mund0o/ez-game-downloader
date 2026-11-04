@@ -9,12 +9,17 @@ what the exit code means.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+log = logging.getLogger(__name__)
+
 READ_LIMIT = 8 * 1024 * 1024
+TRIM_AT = 4 * READ_LIMIT          # a game's log longer than this keeps its last READ_LIMIT bytes (trim)
 SETUP_MARK = "#ezgd-setup "
 
 _HEADER = re.compile(r"^=== (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) (.*)$")
@@ -76,6 +81,27 @@ class Run:
             m = re.search(r"fixes: ([^·]+)", d)
             return sorted(x.strip() for x in m.group(1).split(",")) if m else []
         return None
+
+
+def trim(log_path: Path) -> None:
+    """Before a start: a game's log only ever grew — every start, and everything the game printed (one printing an
+    error every frame writes tens of MB an hour). Past TRIM_AT it keeps its end, from the first whole run in it: all
+    the app ever reads of it (READ_LIMIT)."""
+    try:
+        size = log_path.stat().st_size
+        if size <= TRIM_AT:
+            return
+        with open(log_path, "rb") as fh:
+            fh.seek(size - READ_LIMIT)
+            tail = fh.read()
+        m = re.search(rb"\n=== \d{4}-\d\d-\d\d \d\d:\d\d:\d\d ", tail)
+        tail = tail[m.start() + 1:] if m else tail[tail.find(b"\n") + 1:]
+        tmp = log_path.with_name(log_path.name + ".trim")
+        tmp.write_bytes(tail)
+        os.replace(tmp, log_path)
+        log.info("%s was %d MB — its last %d MB are kept", log_path.name, size >> 20, len(tail) >> 20)
+    except OSError as exc:
+        log.warning("could not shorten %s: %s", log_path, exc)
 
 
 def runs(log_path: Path, limit: int = 60) -> list[Run]:

@@ -124,6 +124,7 @@ def test_russian_dates():
     assert of.parse_ru_datetime("15 августа 2026, 12:35") is not None
     assert of.parse_ru_datetime("8 October 2026, 22:00") is not None
     assert of.parse_ru_datetime("Вчера, 22:00") is not None
+    assert of.parse_ru_datetime("Вчера, 25:99") is None                 # an impossible time: no date
     assert of.parse_ru_datetime("31 февраля 2026, 10:00") is None
     assert of.parse_ru_datetime("garbage") is None
 

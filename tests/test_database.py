@@ -33,6 +33,27 @@ def test_corrupt_file_is_quarantined_and_recreated(tmp_path):
     db.close()
 
 
+def test_a_full_disk_or_a_lock_never_moves_the_database_aside(tmp_path, monkeypatch):
+    # OperationalError is a DatabaseError too: a full disk (or a lock, no permission, an I/O error) had a good
+    # database moved aside as "damaged" and the app start with an empty library
+    path = tmp_path / "ezgd.sqlite3"
+    Database(path).open().close()
+    for msg in ("database or disk is full", "database is locked"):
+        def failing(self, msg=msg):
+            raise sqlite3.OperationalError(msg)
+        monkeypatch.setattr(Database, "_check_integrity", failing)
+        with pytest.raises(sqlite3.OperationalError):
+            Database(path).open()
+        assert path.exists() and not list(tmp_path.glob("*.corrupt-*"))
+    monkeypatch.undo()
+    # a guest of the running app (play mode) never moves it aside, even when it is damaged
+    broken = tmp_path / "broken.sqlite3"
+    broken.write_bytes(b"this is definitely not sqlite" * 100)
+    with pytest.raises(sqlite3.DatabaseError):
+        Database(broken).open(recover=False)
+    assert broken.exists() and not list(tmp_path.glob("broken.sqlite3.corrupt-*"))
+
+
 def test_incremental_migration_with_backup(tmp_path):
     path = tmp_path / "m.sqlite3"
     Database(path).open().close()
@@ -81,6 +102,21 @@ def test_backup_validate_and_restore(db, tmp_path):
     keys = {r[0] for r in db.query("SELECT key FROM settings")}
     assert "before" in keys and "after" not in keys
     assert any(p.name.startswith("pre-restore") for p in db.list_backups())
+
+
+def test_a_restore_that_fails_midway_leaves_the_database_as_it_was(db, tmp_path, monkeypatch):
+    # the backup was copied straight over the live file: a full disk midway left it half copied (and closed)
+    import shutil
+    bk = db.backup(tmp_path / "backups" / "b.sqlite3")
+    db.execute("INSERT INTO settings (key, value, updated_at) VALUES ('kept', '1', 0)")
+
+    def full_disk(src, dst):
+        open(dst, "wb").write(b"half")
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(shutil, "copyfile", full_disk)
+    with pytest.raises(OSError):
+        db.restore(bk)
+    assert "kept" in {r[0] for r in db.query("SELECT key FROM settings")}      # open, and as it was
 
 
 def test_validate_backup_rejects_garbage(tmp_path):

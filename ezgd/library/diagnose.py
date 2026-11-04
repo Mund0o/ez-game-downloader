@@ -1084,7 +1084,7 @@ def r_fix_archive(c: Context) -> list[Finding]:
         elif dp.parent.is_dir():               # its own file and ones next to it named after the same game
             def key(t: str) -> str:
                 return re.sub(r"[^a-z0-9]", "", t.lower())
-            own = key(re.split(r"[._\- ]", dp.name, 1)[0]) or "\0"
+            own = key(re.split(r"[._\- ]", dp.name, maxsplit=1)[0]) or "\0"
             title = key(c.entry.title) or "\0"
             for a in ar.find_archives(dp.parent, 1):
                 k = key(a.name)

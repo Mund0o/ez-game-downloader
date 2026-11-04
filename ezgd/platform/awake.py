@@ -19,6 +19,7 @@ import shutil
 import signal
 import subprocess
 import threading
+import time
 
 log = logging.getLogger(__name__)
 
@@ -28,8 +29,10 @@ APP = "EZ Game Downloader"
 class KeepAwake:
     """Named holds (``"game:12"``, ``"couch"``); each one is one ``systemd-inhibit`` helper."""
 
+    RETRY_AFTER = 60.0     # s: a helper that ended by itself this soon (no logind, refused) is not started at once again
+
     def __init__(self) -> None:
-        self._holds: dict[str, tuple[subprocess.Popen, str]] = {}
+        self._holds: dict[str, tuple[subprocess.Popen, str, float]] = {}      # key → (helper, why, started)
         self._lock = threading.Lock()
 
     @staticmethod
@@ -43,6 +46,8 @@ class KeepAwake:
                 if cur[1] == why:
                     return True
                 self._end(cur[0])
+            elif cur is not None and time.monotonic() - cur[2] < self.RETRY_AFTER:
+                return False      # (its helper ended by itself: it was started again every 2 s, for the whole game)
             if not self.available():
                 return False
             try:
@@ -54,7 +59,7 @@ class KeepAwake:
             except OSError:
                 log.exception("could not keep the screen awake")
                 return False
-            self._holds[key] = (p, why)
+            self._holds[key] = (p, why, time.monotonic())
             log.info("keeping the screen awake: %s", why)
             return True
 
@@ -73,7 +78,7 @@ class KeepAwake:
             self.hold(key, why)
 
     def held(self) -> dict[str, str]:
-        return {k: why for k, (p, why) in self._holds.items() if p.poll() is None}
+        return {k: why for k, (p, why, _t) in self._holds.items() if p.poll() is None}
 
     def release_all(self) -> None:
         for key in list(self._holds):

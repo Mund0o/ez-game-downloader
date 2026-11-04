@@ -77,3 +77,25 @@ async def test_a_running_game_keeps_the_screen_on(core, tmp_path, fake_inhibit):
         time.sleep(0.1)
     core._keep_awake()
     assert awake.shared().held() == {}
+
+
+def test_a_helper_that_ends_at_once_is_not_started_every_tick(tmp_path, monkeypatch):
+    # no logind, or the hold refused: systemd-inhibit ends at once — it was started again on every 2 s tick
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "calls"
+    (bin_dir / "systemd-inhibit").write_text(f'#!/bin/sh\necho x >> {calls}\nexit 1\n')
+    (bin_dir / "systemd-inhibit").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv("EZGD_AWAKE", "1")
+    k = awake.KeepAwake()
+    k.hold("game:1", "Bloodborne is running")
+    k._holds["game:1"][0].wait(5)
+    for _ in range(5):
+        assert not k.hold("game:1", "Bloodborne is running")
+    assert calls.read_text().count("x") == 1 and k.held() == {}
+    real = time.monotonic
+    monkeypatch.setattr(awake.time, "monotonic", lambda: real() + k.RETRY_AFTER + 1)
+    k.hold("game:1", "Bloodborne is running")                      # tried again a minute later
+    k._holds["game:1"][0].wait(5)
+    assert calls.read_text().count("x") == 2

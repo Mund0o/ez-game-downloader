@@ -86,6 +86,7 @@ class PostProcessor:
         self.on_ready = None                 # (entry id) a game is installed and has its executable: checked next
         self.before_update = None            # LibraryManager.backup_saves: saves are zipped before an update
         self.resumable: list[dict] = []      # extractions the app was closed during (finished on the next start)
+        self._fix_seen: dict[int, float] = {}  # fix-only entries whose fix was found in their Steam game (when)
 
     # -------------------------------------------------------------- entries
     _FIX = re.compile(r"(fix[\s._-]*repair|fix files only|_fix_|hot[\s._-]?fix|\bupdate\b|\bpatch\b)", re.I)
@@ -249,13 +250,18 @@ class PostProcessor:
         except OSError:
             return False
 
+    FIX_RECHECK = 600.0     # s: a fix found in its Steam game is looked for again this rarely
+
     def fixes_ready_for_steam(self) -> list[tuple[LibraryEntry, Path, Path]]:
         """Fix-only entries whose free Steam game is installed now but which do not have the fix in it yet:
         (entry, archive, Steam game folder). Covers entries waiting for Steam and ones left without the fix."""
         out = []
+        now = time.monotonic()
         for e in self.library.all():
             if e.status is LibraryStatus.EXTRACTING:
                 continue
+            if now - self._fix_seen.get(e.id, -self.FIX_RECHECK) < self.FIX_RECHECK:
+                continue          # (in place a moment ago: three walks of a big game's folder, every 20 s, all day)
             waiting = (e.setup or {}).get("state") == "waiting_steam"
             if not waiting and e.source != "onlinefix":
                 continue
@@ -263,7 +269,10 @@ class PostProcessor:
             if not base or base[1] is None:
                 continue
             archive = self.fix_archive_of(e)
-            if archive is None or self._has_onlinefix(base[1]):
+            if archive is None:
+                continue
+            if self._has_onlinefix(base[1]):
+                self._fix_seen[e.id] = now
                 continue
             out.append((e, archive, base[1]))
         return out
@@ -377,12 +386,15 @@ class PostProcessor:
         try:
             result = await asyncio.to_thread(ar.extract, archive, dest, password=password, progress=progress,
                                              cancel=cancel, rar_tool=rar_tool)
-        except (ar.ArchiveError, InsufficientSpaceError, OSError) as exc:
+        except Exception as exc:          # (anything: an error escaping here left the game "Extracting" for good)
             if isinstance(exc, ar.ExtractionCancelled) and getattr(self, "_shutting_down", False):
                 log.info("extraction of %s stopped because the app is closing; it resumes next time", archive.name)
                 return False
             msg = self._describe(exc, password)
-            log.warning("extraction of %s failed: %s", archive.name, msg)
+            if isinstance(exc, (ar.ArchiveError, InsufficientSpaceError, OSError)):
+                log.warning("extraction of %s failed: %s", archive.name, msg)
+            else:
+                log.exception("extraction of %s failed", archive.name)
             self.extractions.update(ext_id, status="cancelled" if isinstance(exc, ar.ExtractionCancelled)
                                     else "failed", error=msg)
             entry.status = prev_status if prev_status is not LibraryStatus.EXTRACTING else LibraryStatus.DOWNLOADED
@@ -400,33 +412,37 @@ class PostProcessor:
                                 completed_at=time.time())
         entry.install_path = str(dest)
         entry.status = LibraryStatus.EXTRACTED
-        self._record_release(entry, archive)
-        notes = []
-        if result.nested_archives:
-            notes.append("Contains nested archives (not extracted automatically): "
-                         + ", ".join(result.nested_archives[:5]))
-        if result.skipped:
-            notes.append(f"Skipped {len(result.skipped)} link/special entries for safety.")
-        if entry.source == "onlinefix":
-            odd = await asyncio.to_thread(suspicious_release_files, dest)
-            if odd:
-                notes.append("⚠ OnlineFix states its releases never contain installers or a renpy folder, but this "
-                             "archive has: " + ", ".join(odd[:5]) + ". It may not be a genuine OnlineFix release — "
-                             "do not run these files unless you trust them.")
-                self.emit("notify", ("Check this download", f"{entry.title} contains files OnlineFix says its "
-                                                            f"releases never include."))
-        base = await asyncio.to_thread(self.steam_base, entry)
-        if base and base[1] is not None and Path(base[1]) == Path(dest):
-            # OnlineFix's own override set (the same line its users put into Steam's launch options)
-            dlls = "OnlineFix64=n;SteamOverlay64=n;winmm=n,b;dnet=n;steam_api64=n;winhttp=n,b"
-            entry.notes = (f"The fix is in the Steam game's folder ({dest}); replaced files are in .ezgd-backup-*. "
-                           "Press Play here with Steam running. To start it from Steam instead, put this into the "
-                           f"game's Properties → Launch options in Steam: WINEDLLOVERRIDES=\"{dlls}\" %command%")
-            notes = [n for n in notes if "renpy" not in n]
-        if notes:
-            entry.notes = " ".join(filter(None, [entry.notes, *notes]))
-        installer = await asyncio.to_thread(self._mark_installer, entry)
-        self.library.update(entry)
+        try:
+            self._record_release(entry, archive)
+            notes = []
+            if result.nested_archives:
+                notes.append("Contains nested archives (not extracted automatically): "
+                             + ", ".join(result.nested_archives[:5]))
+            if result.skipped:
+                notes.append(f"Skipped {len(result.skipped)} link/special entries for safety.")
+            if entry.source == "onlinefix":
+                odd = await asyncio.to_thread(suspicious_release_files, dest)
+                if odd:
+                    notes.append("⚠ OnlineFix states its releases never contain installers or a renpy folder, but "
+                                 "this archive has: " + ", ".join(odd[:5]) + ". It may not be a genuine OnlineFix "
+                                 "release — do not run these files unless you trust them.")
+                    self.emit("notify", ("Check this download", f"{entry.title} contains files OnlineFix says its "
+                                                                f"releases never include."))
+            base = await asyncio.to_thread(self.steam_base, entry)
+            if base and base[1] is not None and Path(base[1]) == Path(dest):
+                # OnlineFix's own override set (the same line its users put into Steam's launch options)
+                dlls = "OnlineFix64=n;SteamOverlay64=n;winmm=n,b;dnet=n;steam_api64=n;winhttp=n,b"
+                entry.notes = (f"The fix is in the Steam game's folder ({dest}); replaced files are in "
+                               ".ezgd-backup-*. Press Play here with Steam running. To start it from Steam instead, "
+                               "put this into the game's Properties → Launch options in Steam: "
+                               f"WINEDLLOVERRIDES=\"{dlls}\" %command%")
+                notes = [n for n in notes if "renpy" not in n]
+            if notes:
+                entry.notes = " ".join(filter(None, [entry.notes, *notes]))
+            installer = await asyncio.to_thread(self._mark_installer, entry)
+        finally:
+            # saved also when a step above failed: the game is extracted — it was left "Extracting" for good
+            self.library.update(entry)
         if delete_archive if delete_archive is not None else self.settings.settings.delete_archive_after_extract:
             root = download_root if download_root is not None else self.app_folder_of(archive)
             if root is not None:
@@ -493,6 +509,8 @@ class PostProcessor:
                                                            if password else "; enter the password and retry."))
         if isinstance(exc, OSError) and not isinstance(exc, InsufficientSpaceError):
             return f"File system error: {exc.strerror or exc}"
+        if not isinstance(exc, (ar.ArchiveError, InsufficientSpaceError)):
+            return f"Unexpected error while extracting: {type(exc).__name__}: {exc}"
         return str(exc)
 
     def app_folder_of(self, path: Path) -> Path | None:

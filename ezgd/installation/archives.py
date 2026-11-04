@@ -29,6 +29,7 @@ import subprocess
 import tarfile
 import threading
 import time
+import zlib
 try:                                   # zip with Zstandard (method 93, e.g. AnkerGames): Python 3.14's zipfile,
     from backports.zstd import zipfile  # backported (ships with py7zr) — the stdlib one before 3.14 cannot read it
 except ImportError:                    # pragma: no cover - Python ≥ 3.14 or no backport
@@ -252,7 +253,7 @@ def list_members(path: Path, fmt: ArchiveFormat, password: str | None = None,
             return _list_rar(path, password, tool)
         if fmt in (ArchiveFormat.GZIP, ArchiveFormat.BZIP2, ArchiveFormat.XZ):
             return [Member(_single_name(path), None)]
-    except (zipfile.BadZipFile, tarfile.TarError, EOFError) as exc:
+    except (zipfile.BadZipFile, tarfile.TarError, EOFError, zlib.error, gzip.BadGzipFile, lzma.LZMAError) as exc:
         raise CorruptArchiveError(f"The archive is incomplete or corrupted: {exc}") from exc
     except ArchiveError:
         raise
@@ -623,6 +624,8 @@ def _extract_zip_builtin(archive: Path, staging: Path, password: str | None, pro
         raise CorruptArchiveError(f"The zip archive is incomplete or corrupted: {exc}") from exc
     except (zipfile.LargeZipFile, EOFError) as exc:
         raise CorruptArchiveError(f"The zip archive is truncated: {exc}") from exc
+    except zlib.error as exc:                     # a damaged deflate stream (not an OSError)
+        raise CorruptArchiveError(f"The zip archive is corrupted: {exc}") from exc
     except OSError as exc:
         if "Bad CRC" in str(exc) or "CRC" in str(exc):
             raise CorruptArchiveError("The zip archive is corrupted (CRC mismatch).") from exc
@@ -643,7 +646,7 @@ def _extract_tar(archive: Path, staging: Path, prog: _Progress, only: set[str] |
                 prog.add(ti.size, ti.name)
     except tarfile.FilterError as exc:
         raise UnsafeArchiveError(f"Unsafe tar member: {exc}") from exc
-    except (tarfile.TarError, EOFError) as exc:
+    except (tarfile.TarError, EOFError, zlib.error, gzip.BadGzipFile, lzma.LZMAError) as exc:
         raise CorruptArchiveError(f"The tar archive is incomplete or corrupted: {exc}") from exc
 
 
@@ -755,7 +758,7 @@ def _extract_single(src: Path, target: Path, fmt: ArchiveFormat, prog: _Progress
                     break
                 fout.write(block)
                 prog.add(len(block), target.name)
-    except (OSError, EOFError, lzma.LZMAError) as exc:
+    except (OSError, EOFError, lzma.LZMAError, zlib.error) as exc:
         raise CorruptArchiveError(f"The compressed file is incomplete or corrupted: {exc}") from exc
 
 

@@ -51,14 +51,24 @@ class Database:
         self.migrated_from: int | None = None
 
     # ------------------------------------------------------------------ open
-    def open(self) -> "Database":
+    def open(self, recover: bool = True) -> "Database":
+        """Open (and migrate) the database. ``recover``: a damaged file is moved aside and a new one started — never
+        by a guest that shares the file with the running app (play mode)."""
         if self.path:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
             self._connect()
             self._check_integrity()
+        except sqlite3.OperationalError:
+            # locked, disk full, no permission, an I/O error, a drive not mounted: the file is not damaged. These
+            # count as DatabaseError too, so a full disk had the library moved aside and the app start empty —
+            # and play mode could move the running app's database away from under it
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+            raise
         except sqlite3.DatabaseError as exc:
-            if not self.path:
+            if not self.path or not recover:
                 raise
             log.error("Database %s is unreadable (%s); moving it aside", self.path, exc)
             self._quarantine()
@@ -238,7 +248,14 @@ class Database:
                 p = Path(str(self.path) + suffix)
                 if p.exists():
                     p.unlink()
-            shutil.copyfile(backup_path, self.path)
+            tmp = self.path.with_name(self.path.name + ".restoring")
+            try:
+                shutil.copyfile(backup_path, tmp)
+                os.replace(tmp, self.path)          # (all at once: a full disk midway left the live file half copied)
+            except OSError:
+                tmp.unlink(missing_ok=True)
+                self._connect()                     # the current database goes on as it was
+                raise
             self._connect()
             self._check_integrity()
             self._migrate()

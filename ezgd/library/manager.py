@@ -514,13 +514,28 @@ class LibraryManager:
         for e in entries:
             if e.status is not LibraryStatus.EXTRACTING:
                 path = e.install_path or e.download_path
-                if path and not Path(path).exists() and e.status is not LibraryStatus.BROKEN:
+                if path and not self._present(path) and e.status is not LibraryStatus.BROKEN:
                     e.status = LibraryStatus.BROKEN
                     self.repo.update(e)
-                elif e.status is LibraryStatus.BROKEN and path and Path(path).exists():
-                    e.status = LibraryStatus.INSTALLED if e.executable else LibraryStatus.EXTRACTED
+                elif e.status is LibraryStatus.BROKEN and path and self._present(path):
+                    # back as what it was — a game that was only downloaded (an archive, the parts of one) came back
+                    # "extracted", and a multi-part set marked so was never extracted when its last part came in
+                    e.status = (LibraryStatus.INSTALLED if e.executable else LibraryStatus.EXTRACTED) \
+                        if e.install_path else LibraryStatus.DOWNLOADED
                     self.repo.update(e)
         return entries
+
+    @staticmethod
+    def _present(path: str) -> bool:
+        """Are an entry's files there? A multi-part set's download path names its first part from the start: while
+        other parts come in first, the set is there — not "missing files"."""
+        p = Path(path)
+        if p.exists():
+            return True
+        from ezgd.installation import volumes
+        v = volumes.volume_info(p.name)
+        key = v.set_key if v is not None else f"{p.stem.lower()}|oldrar" if p.suffix.lower() == ".rar" else None
+        return key is not None and bool(volumes.set_status(p.parent, key).have)
 
     def get(self, entry_id: int) -> LibraryEntry:
         e = self.repo.get(entry_id)
@@ -985,6 +1000,8 @@ class LibraryManager:
             plan.env = {**plan.env, **self.GRAPHICS_LOG_ENV, "WINEDEBUG": self.DIAGNOSTIC_WINEDEBUG}
             plan.description += " · diagnostic run"
         log_path = self.paths.logs / f"game-{e.id}.log"
+        from ezgd.library import history
+        history.trim(log_path)
         with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} {plan.description}\n"
                      f"{self.setup_snapshot(e, plan)}\n{launcher.display_command(plan)}\n")
@@ -1280,7 +1297,10 @@ class LibraryManager:
         return steamrun.read_marker(self.running_dir, entry_id) is not None
 
     def running_ids(self) -> list[int]:
-        return sorted({i for i in self._processes if self.is_running(i)} | set(steamrun.sessions(self.running_dir)))
+        # (a snapshot: launches, stops and the reaper change the dict from other threads — "changed size during
+        #  iteration" otherwise)
+        return sorted({i for i in list(self._processes) if self.is_running(i)}
+                      | set(steamrun.sessions(self.running_dir)))
 
     @property
     def running_dir(self) -> Path:
@@ -1654,7 +1674,7 @@ class LibraryManager:
         return max(0, int(secs - frozen))
 
     def suspended_ids(self) -> list[int]:
-        return sorted(i for i in self._suspended if self.is_running(i))
+        return sorted(i for i in list(self._suspended) if self.is_running(i))       # (a snapshot, as running_ids)
 
     def is_suspended(self, entry_id: int) -> bool:
         return entry_id in self._suspended

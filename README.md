@@ -316,11 +316,12 @@ On by default (switch in the browser window and in *Settings → Sources*):
   [StevenBlack/hosts](https://github.com/StevenBlack/hosts) (unified adware + malware list, MIT licence,
   bundled in `ezgd/resources/adblock/` with its licence) plus a few pop-under networks it does not list yet.
   Pages cannot load ads, pop-up scripts or overlays from them, and a page cannot redirect itself to one.
-* **Filter lists, like uBlock Origin** — about 154,000 rules from EasyList, EasyPrivacy, uBlock filters (+ badware
+* **Filter lists, like uBlock Origin** — about 151,000 rules from EasyList, EasyPrivacy, uBlock filters (+ badware
   risks, + unbreak) and Peter Lowe's list, run by Brave's adblock-rust engine (`adblock` package). They block ad
   scripts by their path even on rotating throw-away domains, `$popup` rules decide new windows and redirects,
   and ad elements are hidden (site-specific rules, plus generic ones for the classes/ids actually on the page).
   Bundled in `ezgd/resources/adblock/filters/` (licences in `LICENSES.txt`) and refreshed daily with the domain list.
+  The engine (about 77 MB) is built the first time the in-app browser is used, not at every start.
 * **Pop-unders are stopped**: the browser remembers what you actually pressed (link or form) — on mouse/pointer
   *down*, since pop-under scripts fire then — in an isolated script world the page cannot tamper with. A new
   window only opens if it goes where that link points; one opened when you pressed something else is blocked
@@ -1067,8 +1068,9 @@ started. Not every Windows game works under Proton (anti-cheat, some launchers).
   address is secret — but any program on the computer, including a game, could control Steam through it): switch it
   off when you do not use it (Settings → Library & launching), then restart Steam.
 * **Database**: WAL mode, transactions for every write, integrity check on start
-  (a damaged file is moved aside and a fresh one created), backup before every
-  migration and on exit, manual backup/restore with validation.
+  (a damaged file is moved aside and a fresh one created — a locked file, a full disk or a read error is not damage:
+  the app says so and changes nothing, and play mode never moves the file), backup before every
+  migration and on exit, manual backup/restore with validation (a restore swaps the file in at once).
 
 ## Architecture
 

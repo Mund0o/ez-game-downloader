@@ -56,6 +56,20 @@ def test_malformed_posts_are_skipped():
     assert games[0].genres == [] and games[0].cover_url is None
 
 
+def test_a_post_shaped_differently_does_not_lose_the_page():
+    # a plugin's post (its title a plain string, its categories one number) raised out of the parser: the whole
+    # page of a site was lost; only a page none of whose posts can be read is a changed layout
+    posts = json.loads(fixture_bytes("steamrip_posts.json"))
+    whole = len(sr.parse_posts(json.dumps(posts).encode(), CATS))
+    posts[0]["title"] = "Plain Title"
+    posts[1]["categories"] = 5
+    assert len(sr.parse_posts(json.dumps(posts).encode(), CATS)) == whole - 2
+    for p in posts:
+        p["title"] = "Plain Title"
+    with pytest.raises(LayoutChangedError):
+        sr.parse_posts(json.dumps(posts).encode(), CATS)
+
+
 async def test_adapter_listing_search_details(routes, mock_fetcher):
     routes.add(f"{API}/categories*", fixture_bytes("steamrip_categories.json"), content_type=JSON)
     routes.add(f"{API}/posts?per_page=*", fixture_bytes("steamrip_posts.json"), content_type=JSON,

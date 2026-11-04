@@ -72,6 +72,7 @@ class LibraryPage(QWidget):
         self.running: set[int] = set()
         self.suspended: set[int] = set()         # running games frozen from couch mode's quick menu (or here)
         self._password: str | None = None
+        self._thumbs: dict[int, QIcon] = {}      # list thumbnails by cover (QPixmap.cacheKey)
         actions.covers.ready.connect(self._cover_ready)
 
         lay = QVBoxLayout(self)
@@ -239,8 +240,16 @@ class LibraryPage(QWidget):
     def _thumb(self, e) -> QIcon:
         pm = self.actions.covers.get(e.cover_url) if e.cover_url else None
         if pm is not None and not pm.isNull():
-            return QIcon(pm.scaled(QSize(128, 72), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-                         .copy(0, 0, 128, 72))
+            # scaled once per cover: every refresh scaled every game's again — at start-up once per cover that came
+            # in (60 games: 26 ms each time, 1.6 s of the interface's time while the covers loaded)
+            thumb = self._thumbs.get(pm.cacheKey())
+            if thumb is None:
+                if len(self._thumbs) > 500:
+                    self._thumbs.clear()
+                thumb = self._thumbs[pm.cacheKey()] = QIcon(
+                    pm.scaled(QSize(128, 72), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+                    .copy(0, 0, 128, 72))
+            return thumb
         return icon("library", theme.status_color("installed" if e.id in self.running else str(e.status)), 36)
 
     def _cover_ready(self, url: str) -> None:

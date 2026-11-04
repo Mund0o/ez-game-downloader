@@ -133,7 +133,12 @@ def play(paths, entry_id: int) -> int:
     from ezgd.platform import launcher
 
     shortcut = started_shortcut()                 # (before an OnlineFix game's ids replace Steam's below)
-    db = Database(paths.database, backup_dir=paths.backups).open()
+    import sqlite3
+    try:
+        db = Database(paths.database, backup_dir=paths.backups).open(recover=False)   # (the app has it open too)
+    except sqlite3.DatabaseError as exc:          # (locked, full disk, damaged: never moved aside from here)
+        log.error("play mode: the database could not be opened (%s) — the game was not started", exc)
+        return 2
     try:
         settings = SettingsStore(db)
         lib = LibraryManager(LibraryRepository(db), GameRepository(db), settings, paths, lambda *_a: None,
@@ -182,6 +187,8 @@ def play(paths, entry_id: int) -> int:
                     os.environ.pop(k, None)
                 log.info("play mode: %s uses OnlineFix (no FakeAppId found) — Steam's game ids hidden", e.title)
         log_path = paths.logs / f"game-{e.id}.log"
+        from ezgd.library import history
+        history.trim(log_path)
         overlay = "loaded" if "gameoverlayrenderer" in os.environ.get("LD_PRELOAD", "") or os.name == "nt" else \
             "not loaded (not started by Steam?)"
         with open(log_path, "a", encoding="utf-8") as fh:

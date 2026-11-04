@@ -237,6 +237,12 @@ def test_versions_and_installed_release():
     assert updates.status("1.0.10", "1.0.10") == "current"
     assert updates.status("1.2", "build 77") == "different"
     assert updates.compare("2.0", "10.0") == -1
+    # a letter is not one more number: 1.0.5a was "the same" as 1.0.5.1, and the update was never offered
+    assert updates.status("1.0.5a", "1.0.5.1") == "update"
+    assert updates.compare("1.2.3a", "1.2.3") == 1 and updates.compare("1.2.3b", "1.2.3a") == 1
+    assert updates.compare("1.2.0a", "1.2a") == 0
+    # a page's version that is no version ("Build EA") is a different one — it raised and stopped every game's check
+    assert updates.status("1.0", "Build EA") == "different" and updates.compare("build ea", "build 5") is None
 
 
 async def test_update_check_download_over_the_game_keeps_entry_and_saves(core, tmp_path):

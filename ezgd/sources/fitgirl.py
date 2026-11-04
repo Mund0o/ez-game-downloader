@@ -36,7 +36,7 @@ from ezgd.core.fsutil import parse_size
 from ezgd.sources.base import (LayoutChangedError, ManualActionRequired, Page, ResolvedDownload, SourceError,
                                SourceInfo)
 from ezgd.sources.hosts import HOST_LABELS, classify_host_link
-from ezgd.sources.steamrip import PAGE_SIZE, SteamRipAdapter, _wp_time
+from ezgd.sources.steamrip import PAGE_SIZE, SteamRipAdapter, _wp_time, parse_each
 from ezgd.sources import parsing
 
 log = logging.getLogger(__name__)
@@ -124,7 +124,7 @@ def _info(soup: BeautifulSoup) -> dict[str, str]:
 
 def parse_listing_posts(data: list, tags: dict[int, str]) -> list[Game]:
     """Every post of an API page (run in the parse helper process)."""
-    return [g for g in (parse_listing_post(p, tags) for p in data) if g]
+    return parse_each(data, lambda p: parse_listing_post(p, tags), "fitgirl")
 
 
 def parse_listing_post(post: dict, tags: dict[int, str] | None = None) -> Game | None:

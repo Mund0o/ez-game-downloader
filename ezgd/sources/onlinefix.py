@@ -86,7 +86,10 @@ def parse_ru_datetime(text: str, now: datetime | None = None) -> float | None:
         base = (now or datetime.now(MSK)).astimezone(MSK)
         if m.group(1).lower() in ("вчера", "yesterday"):
             base -= timedelta(days=1)
-        return base.replace(hour=int(m.group(2)), minute=int(m.group(3)), second=0, microsecond=0).timestamp()
+        try:
+            return base.replace(hour=int(m.group(2)), minute=int(m.group(3)), second=0, microsecond=0).timestamp()
+        except ValueError:
+            return None                        # (an impossible time: like the full date above, no date)
     return None
 
 

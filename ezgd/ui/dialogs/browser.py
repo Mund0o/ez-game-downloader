@@ -94,6 +94,10 @@ def profile():
         _PROFILE.scripts().insert(_click_recorder())
         _PROFILE.scripts().insert(_cosmetic_collector())
         install_gl_guard()
+        # the ad blocker's lists are built as the browser first opens — not at every app start, where the filter
+        # engine held ~80 MB for the whole run and its compiler paused the interface (it holds Python's lock)
+        threading.Thread(target=lambda: (adblock.blocked_domains(), filterlists.warm_up()), name="adblock-lists",
+                         daemon=True).start()
     return _PROFILE
 
 
@@ -509,7 +513,10 @@ class BrowserDownloads(QObject):
             self._add_to_library(d.game, [d])
         elif d.state == "failed":
             self.actions.toasts.show("Browser download failed", f"{d.name}: {d.error}", "error")
+        import shiboken6
         session = d.session
+        if not shiboken6.isValid(session):
+            return                      # its window went with the main window (the app closing, the download cancelled)
         if not any(x.state in ("downloading", "paused") for x in self.items.values() if x.session is session):
             session.downloads_settled()
 

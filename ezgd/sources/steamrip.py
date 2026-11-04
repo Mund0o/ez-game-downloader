@@ -97,7 +97,26 @@ def parse_posts(body: bytes, categories: dict[int, str], source: str = "steamrip
         raise SourceError(f"WordPress API error: {data.get('message') or data['code']}")
     if not isinstance(data, list):
         raise LayoutChangedError("The site's WordPress API returned an unexpected structure")
-    return [g for g in (parse_post(p, categories, source) for p in data) if g]
+    return parse_each(data, lambda p: parse_post(p, categories, source), source)
+
+
+def parse_each(posts: list, parse, source: str) -> list[Game]:
+    """Every post a parser can read. One a plugin shaped differently (its title a plain string, its categories one
+    number …) is left out — it raised out of the parser and the whole page was lost; only a page none of whose posts
+    can be read is a changed layout."""
+    out, failed = [], 0
+    for p in posts:
+        try:
+            g = parse(p)
+        except (AttributeError, TypeError, ValueError, KeyError) as exc:
+            failed += 1
+            log.info("%s: a post the app could not read was left out (%s: %s)", source, type(exc).__name__, exc)
+            continue
+        if g:
+            out.append(g)
+    if failed and not out and failed == len(posts):
+        raise LayoutChangedError("The site's WordPress API returned posts the app cannot read")
+    return out
 
 
 def download_links(soup: BeautifulSoup) -> list[DownloadMethod]:

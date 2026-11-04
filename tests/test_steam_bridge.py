@@ -328,9 +328,22 @@ def test_core_renews_the_steam_button_guard_and_gives_it_back(monkeypatch, caplo
         clock[0] += 9
         tick()
         assert len(calls) == 2
-        ids.add("480")                                   # a second game with Steam's overlay: sent at once
+        running.append(5)                                # a second game with Steam's overlay: sent at once
+        ids.add("480")
         tick()
         assert calls[-1] == ["12710882028086624256", "480"]
+        scans = []                                       # (each scan reads every process's environment)
+        core.library.steam_overlay_ids_by_game = lambda: scans.append(1) or {3: set(ids)}
+        for _ in range(15):                              # a game's first half minute: every 2 s (its overlay comes up)
+            clock[0] += 2
+            tick()
+        assert len(scans) == 14
+        scans.clear()
+        for _ in range(20):                              # then only as often as the guard is renewed — it was every
+            clock[0] += 2                                # 2 s for as long as the game ran
+            tick()
+        assert len(scans) == 4
+        calls[:] = calls[:3]
         settings.own_overlay = False
         tick()
         assert calls[-1] == []                           # switched off: Steam's again, at once

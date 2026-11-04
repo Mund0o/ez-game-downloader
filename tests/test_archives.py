@@ -1,5 +1,6 @@
 """Extraction safety and robustness with synthetic archives."""
 
+import gzip
 import io
 import os
 import shutil
@@ -121,6 +122,23 @@ def test_crc_corruption_detected(tmp_path):
     with pytest.raises((ar.CorruptArchiveError, ar.ArchiveError)):
         ar.extract(a, tmp_path / "out")
     assert not (tmp_path / "out" / "f.txt").exists()
+
+
+def test_damaged_compressed_streams_are_corrupt_archives(tmp_path):
+    # a broken deflate stream raises zlib.error and a bad gzip trailer BadGzipFile — neither an ArchiveError; one
+    # escaping the extractor left the game "Extracting" for good
+    raw = bytearray(gzip.compress(b"A" * 500_000))
+    raw[10] |= 0b110                                   # the first deflate block's type → 11 (reserved)
+    (tmp_path / "data.bin.gz").write_bytes(bytes(raw))
+    with pytest.raises(ar.CorruptArchiveError):
+        ar.extract(tmp_path / "data.bin.gz", tmp_path / "out")
+    t = make_tar(tmp_path / "game.tar.gz", {"game/data.bin": b"A" * 500_000})
+    raw = bytearray(t.read_bytes())
+    raw[-30] ^= 0xFF
+    raw[-31] ^= 0xFF
+    t.write_bytes(bytes(raw))
+    with pytest.raises(ar.CorruptArchiveError):
+        ar.extract(t, tmp_path / "out2")
 
 
 def test_failure_leaves_destination_untouched(tmp_path):

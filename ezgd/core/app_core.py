@@ -140,6 +140,21 @@ def _exe_ticks(pids: list[int]) -> int | None:
             continue
     return total if found else None
 
+def _save_json(path: Path, data) -> None:
+    """A state file (fix outcomes, follow-ups, checks …), written whole or not at all: written in place, one cut
+    short — often by the very crash that ended a game and froze the computer — read back as empty, and its
+    history was gone."""
+    import secrets
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")      # (unique: threads write these too)
+    try:
+        tmp.write_text(json.dumps(data), "utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 class AppCore:
     def __init__(self, paths: AppPaths, *, allow_private_network: bool = False,
                  transport=None, enable_torrents: bool = True, torrent_overrides: dict | None = None):
@@ -199,6 +214,7 @@ class AppCore:
         self.registry.hide_adult = s.hide_adult_games
         self._verify_task: asyncio.Task | None = None
         self._import_tasks: set[asyncio.Task] = set()
+        self._soon_tasks: set[asyncio.Task] = set()    # (_soon: the loop holds its tasks only weakly)
 
         self.bucket = TokenBucket(s.http_speed_limit_kbps * 1024)
         self.http_engine = HttpEngine(self.client, self.bucket, max_retries=s.http_max_retries)
@@ -663,12 +679,23 @@ class AppCore:
         reaches Steam's overlay anyway (LibraryManager.quick_menu_key)."""
         want: frozenset[str] = frozenset()
         by_game: dict[int, set[str]] = {}
-        if self.settings.settings.own_overlay and self.library.running_ids():
-            by_game = await asyncio.to_thread(self.library.steam_overlay_ids_by_game)
+        now = time.monotonic()
+        running = frozenset(self.library.running_ids()) if self.settings.settings.own_overlay else frozenset()
+        if running:
+            # the ids come from a scan of every process's environment (several MB read): it ran every 2 s for as
+            # long as a game was played. A game's ids do not change while it runs — scanned every 2 s for its first
+            # half minute (until its overlay is up), then as often as the guard is renewed
+            seen, by_game, scanned, since = getattr(self, "_overlay_scan", (frozenset(), {}, 0.0, 0.0))
+            if running != seen:
+                since = now
+            if running != seen or now - scanned >= (2.0 if now - since < 30 else self.GUIDE_RENEW):
+                by_game, scanned = await asyncio.to_thread(self.library.steam_overlay_ids_by_game), now
+            self._overlay_scan = (running, by_game, scanned, since)
             want = frozenset(set().union(*by_game.values()))
+        else:
+            self._overlay_scan = (frozenset(), {}, 0.0, 0.0)          # (the next session is scanned afresh)
         self._overlay_ids = by_game                      # (steam_overlay_busy / steam_overlay_show read it)
         have, at = getattr(self, "_guide_guard", (frozenset(), 0.0))
-        now = time.monotonic()
         if want == have and (not want or now - at < self.GUIDE_RENEW):
             return
         if now < getattr(self, "_guide_retry", 0.0):
@@ -1198,6 +1225,14 @@ class AppCore:
                 else:
                     freed += r["size"]
                     deleted.append(str(p))
+        if "files" not in keys:
+            # a download folder the game was extracted into (extracting next to the download, or into a chosen
+            # folder) holds the game the user keeps: "Downloaded archives" alone deleted the game with it
+            game = [r["path"] for r in items.get("files", {}).get("paths", [])]
+            for key in ("downloads", "repack"):
+                for r in items.get(key, {}).get("paths", []):
+                    if r["ok"] and any(is_within(g, r["path"]) for g in game):
+                        r["ok"], r["why"] = False, "the installed game you keep is inside it"
         for key in ("files", "downloads", "repack", "prefix", "shadercache"):
             if key in items and key in keys:
                 await asyncio.to_thread(wipe, items[key]["paths"])
@@ -1669,6 +1704,11 @@ class AppCore:
     async def _protondb_loop(self) -> None:
         await asyncio.sleep(60)                       # not during start-up
         while True:
+            if self.library.running_ids():
+                # not while a game runs: a new monthly dump is ~70 MB to download and ~390,000 reports to index —
+                # seconds of the processor and of Python's lock (the app's own interface, the quick menu, lag)
+                await asyncio.sleep(600)
+                continue
             try:
                 if self.settings.settings.protondb_fixes:
                     await self.update_protondb()      # cheap when the newest dump is already indexed
@@ -1763,7 +1803,7 @@ class AppCore:
             rec["keys"] = keys
         recs.append(rec)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(recs[-2000:]), "utf-8")
+        _save_json(p, recs[-2000:])
         log.info("fix outcome for %s: %s", e.title, "worked" if worked else "did not work")
         return self.fix_stats()
 
@@ -2240,7 +2280,7 @@ class AppCore:
     def _save_good_run(self, entry_id: int, trace) -> None:
         from ezgd.library import tracer
         try:
-            self._good_run_path(entry_id).write_text(json.dumps(tracer.summary(trace)), "utf-8")
+            _save_json(self._good_run_path(entry_id), tracer.summary(trace))
         except OSError:
             pass
 
@@ -2623,7 +2663,7 @@ class AppCore:
                                           "fix": sx.fix.to_dict() if sx.fix is not None else None},
                               "queue": queue, "record": rec.get("folder")}
         try:
-            self._followup_path().write_text(json.dumps(fol), "utf-8")
+            _save_json(self._followup_path(), fol)
         except OSError:
             pass
         mins = max(1, (rec.get("played") or 0) // 60)
@@ -2689,7 +2729,7 @@ class AppCore:
 
     def _write_followups(self, d: dict) -> None:
         try:
-            self._followup_path().write_text(json.dumps(d), "utf-8")
+            _save_json(self._followup_path(), d)
         except OSError:
             pass
 
@@ -2842,7 +2882,7 @@ class AppCore:
         all_keys = [k for k in prev.get("keys", []) if k not in (keys or [])][-8:] + list(keys or [])
         d[str(entry_id)] = {"what": whats, "keys": all_keys, "at": time.time()}
         try:
-            self._followup_path().write_text(json.dumps(d), "utf-8")
+            _save_json(self._followup_path(), d)
         except OSError:
             pass
 
@@ -2864,7 +2904,7 @@ class AppCore:
                 self._explain_soon(entry_id, played, code)        # a failed start: say why right away
             return
         try:
-            self._followup_path().write_text(json.dumps(d), "utf-8")
+            _save_json(self._followup_path(), d)
         except OSError:
             pass
         try:
@@ -2885,9 +2925,14 @@ class AppCore:
 
     def _soon(self, coro) -> None:
         try:
-            asyncio.get_running_loop().create_task(coro)
+            task = asyncio.get_running_loop().create_task(coro)
         except RuntimeError:
             coro.close()
+            return
+        # kept until done: the loop references tasks only weakly, and one nobody holds can be collected half-way
+        # (after a session, a new game's check)
+        self._soon_tasks.add(task)
+        task.add_done_callback(self._soon_tasks.discard)
 
     # ------------------------------------------------- crashes and freezes while playing (ezgd.library.crashes)
     FREEZE_IDLE_SECONDS = 60             # no processor time at all for this long: probably frozen
@@ -3014,7 +3059,7 @@ class AppCore:
         d = self.new_game_checks()
         d[str(entry_id)] = {**d.get(str(entry_id), {}), **state, "at": time.time()}
         try:
-            self._checks_path().write_text(json.dumps(d), "utf-8")
+            _save_json(self._checks_path(), d)
         except OSError:
             pass
         self.emit("library_changed", entry_id)
@@ -3213,10 +3258,10 @@ class AppCore:
 
     def _explain_soon(self, entry_id: int, played: int, code) -> None:
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
             return
-        loop.create_task(self._explain_failure(entry_id, played, code))
+        self._soon(self._explain_failure(entry_id, played, code))
 
     async def _explain_failure(self, entry_id: int, played: int, code) -> None:
         """A game stopped within a minute: analyse that run now and put the likely cause into the notification."""
@@ -3280,7 +3325,7 @@ class AppCore:
         recs.append(rec)
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(json.dumps(recs[-2000:]), "utf-8")
+            _save_json(p, recs[-2000:])
         except OSError:
             pass
 
@@ -4210,7 +4255,7 @@ class AppCore:
 
     def _save_app_update_state(self, d: dict) -> None:
         try:
-            self._app_update_path().write_text(json.dumps(d), "utf-8")
+            _save_json(self._app_update_path(), d)
         except OSError:
             pass
 
@@ -4333,12 +4378,9 @@ class AppCore:
         os.replace(tmp, p)
 
     async def _adblock_loop(self) -> None:
-        await asyncio.sleep(5)
-        try:                                      # compile the filter lists off the GUI thread, before first use
-            await asyncio.to_thread(filterlists.engine)
-        except Exception:
-            log.exception("filter lists could not be compiled")
-        await asyncio.sleep(15)                   # not during start-up
+        # (the filter lists are compiled when the in-app browser first opens — browser.profile(): compiled here at
+        # every start they held ~80 MB for the whole run, and the compiler holds Python's lock — the UI paused)
+        await asyncio.sleep(20)                   # not during start-up
         while True:
             s = self.settings.settings
             if s.browser_adblock and s.browser_adblock_auto_update and \
@@ -4378,7 +4420,7 @@ class AppCore:
         if changed:
             result = "updated"
         self._save_adblock_meta(meta)
-        return {**self.adblock_status(), "result": result}
+        return {**(await asyncio.to_thread(self.adblock_status)), "result": result}
 
     async def _update_filter_lists(self, meta: dict, force: bool = False) -> int:
         """EasyList & co.: one conditional request per list; the engine is rebuilt if any changed."""
@@ -4403,7 +4445,7 @@ class AppCore:
         if changed:
             await asyncio.to_thread(filterlists.reload)
             log.info("filter lists updated: %d changed, %s rules in total", changed,
-                     filterlists.info().get("rules"))
+                     (await asyncio.to_thread(filterlists.info)).get("rules"))
         return changed
 
     def adblock_status(self) -> dict:

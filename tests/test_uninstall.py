@@ -76,6 +76,23 @@ async def test_uninstall_keeps_saves_when_unticked_and_never_touches_outside_or_
     assert core.library.repo.get(shared.id) is not None
 
 
+async def test_the_game_kept_inside_its_download_folder_is_not_deleted_with_the_archives(core, tmp_path):
+    # extracted next to the download (or into a chosen folder): the download folder holds the game — ticking only
+    # "Downloaded archives" deleted the game the user had chosen to keep
+    dl = tmp_path / "dl" / "Big.Game-OFME"
+    game = dl / "Big Game"
+    game.mkdir(parents=True)
+    (game / "game.exe").write_bytes(b"MZ" + b"\0" * 100)
+    (dl / "Big.Game-OFME.zip").write_bytes(b"PK" + b"\0" * 100)
+    e = core.library.import_folder("Big Game", game)
+    e.download_path = str(dl)
+    core.library.repo.update(e)
+    plan = {i["key"]: i for i in (await core.uninstall_plan(e.id))["items"]}
+    assert plan["downloads"]["paths"][0]["ok"]                 # with the game files ticked too, it may all go
+    r = await core.uninstall_game(e.id, ["downloads"])
+    assert (game / "game.exe").exists() and "inside it" in r["kept"][0]["why"]
+
+
 async def test_uninstall_refuses_while_running(core, tmp_path, monkeypatch):
     e, games, _ = _game_on_disk(core, tmp_path)
     monkeypatch.setattr(core.library, "is_running", lambda entry_id: True)

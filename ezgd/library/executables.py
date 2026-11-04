@@ -16,9 +16,9 @@ from ezgd.platform.launcher import WINDOWS_EXTS, is_native_linux_binary
 
 _NOT_GAME = re.compile(
     r"(unins\d*|uninstall|crash ?handler|crashreport|crashpad|unitycrashhandler|vc_?redist|vcredist|dxsetup|"
-    r"dxwebsetup|dotnet|directx|^setup|installer|redist|prereq|easyanticheat|eac_?|battleye|cefsharp|"
+    r"dxwebsetup|dotnet|directx|^setup|installer|redist|prereq|easyanticheat|eac_?launcher|battleye|cefsharp|"
     r"^7z|unrar|quicksfv|notification_helper|helper|update|patcher|benchmark|dedicated_?server|"
-    r"server|zfgamebrowser|ue4prereq|ueprereq|steamcmd|python|java|ffmpeg|"
+    r"zfgamebrowser|ue4prereq|ueprereq|steamcmd|python|java|ffmpeg|"
     r"language|lang_?switch|langselect|config(urator|tool)?$|settings$|registry|regfix|activat|keygen)", re.I)
 _SCRIPTS = (".bat", ".cmd")
 _PREPARES = re.compile(r"^\s*(copy|xcopy|move|ren|rename|del|erase|mklink)\b", re.I)
@@ -36,8 +36,11 @@ _MODES = [
     ("Offline", re.compile(r"offline", re.I)),
     ("Launcher", re.compile(r"launcher", re.I)),
     ("Editor / tools", re.compile(r"editor|modkit|mod ?tools|(?:^|[\W_])sdk(?:$|[\W_])", re.I)),
-    ("Dedicated server", re.compile(r"dedicated|server", re.I)),
+    ("Dedicated server", re.compile(r"dedicated", re.I)),          # (and the word "server": modes_of)
 ]
+# tool words that also occur inside game names: they count only as words of their own (_words) — "server" is in
+# Observer, "eac" (EasyAntiCheat) in Breach, Peace, Beacon: those games' own exe was ranked as a tool
+_TOOL_WORDS = {"server", "eac"}
 
 
 @dataclass
@@ -166,8 +169,16 @@ def readme_mentions(root: Path, names: set[str]) -> dict[str, str]:
     return out
 
 
+def _words(name: str) -> set[str]:
+    """The words of a file name: "GameServer" → {game, server}, "EACLauncher" → {eac, launcher}, "Observer" →
+    {observer}."""
+    return {w.lower() for w in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+", name)}
+
+
 def modes_of(name: str) -> list[str]:
     found = [label for label, rx in _MODES if rx.search(name)]
+    if "server" in _words(name) and "Dedicated server" not in found:
+        found.append("Dedicated server")
     if "Dedicated server" in found and "Editor / tools" in found:
         found.remove("Editor / tools")
     return found
@@ -203,7 +214,7 @@ def rank(paths: list[Path], root: Path, title: str, hint: str | None = None) -> 
         if p.name.lower() in mentioned:
             score += 40
             why.append(f"mentioned in {mentioned[p.name.lower()]}")
-        if _NOT_GAME.search(name):
+        if _NOT_GAME.search(name) or _words(name) & _TOOL_WORDS:
             score -= 80
             kind = "tool"
             if re.match(r"^setup", name, re.I) and p.suffix.lower() == ".exe" and \

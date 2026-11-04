@@ -565,10 +565,8 @@ class DownloadManager:
         if delete_files and content is not None and content.exists():
             dest = Path(task.dest_dir)
             if is_within(content, dest) and Path(os.path.realpath(content)) != Path(os.path.realpath(dest)):
-                if content.is_dir():
-                    shutil.rmtree(content)
-                else:
-                    content.unlink()
+                # in a thread: a game's thousands of files took seconds, and every download and the UI waited
+                await asyncio.to_thread(shutil.rmtree if content.is_dir() else Path.unlink, content)
                 deleted.append(str(content))
             else:
                 raise DownloadCommandError("Refusing to delete files outside the download folder.")

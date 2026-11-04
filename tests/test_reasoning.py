@@ -369,3 +369,22 @@ def test_onlinefix_loaders_next_to_unreals_real_game_are_found_and_fixed_first(t
     d = dg.diagnose(e, tmp_path / "pfx", log, protons=[], proton_name="GE").to_dict()
     f = next(f for f in d["findings"] if f["key"] == "advisor:dll-overrides")
     assert f["confidence"] >= 0.85 and f["fix"]["kind"] == "enable_fix" and f["fix"]["value"] == "game_dlls"
+
+
+def test_a_long_game_log_keeps_what_the_assistant_reads(tmp_path, monkeypatch):
+    # every start and everything a game printed went into its log, which only ever grew (a game printing an error
+    # every frame: tens of MB an hour)
+    monkeypatch.setattr(history, "READ_LIMIT", 4000)
+    monkeypatch.setattr(history, "TRIM_AT", 16000)
+    log = tmp_path / "game-1.log"
+    runs = [f"\n=== 2026-10-{d:02d} 20:00:00 Proton-GE\n" + "fixme: noisy\n" * 300 + "=== exited with code 0 after 900s\n"
+            for d in range(1, 8)]
+    log.write_text("".join(runs[:3]))
+    history.trim(log)
+    assert log.read_text() == "".join(runs[:3])                        # short enough: untouched
+    log.write_text("".join(runs))
+    history.trim(log)
+    text = log.read_text()
+    assert len(text) <= 4000 and text.startswith("=== 2026-10-07 ")     # from the first whole run kept
+    (last,) = history.runs(log, limit=1)
+    assert last.exit_code == 0 and last.seconds == 900
