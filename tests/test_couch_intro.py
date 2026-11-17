@@ -175,6 +175,7 @@ def test_in_app_browser_downloads_show_in_couch_downloads(ui, qtbot, monkeypatch
 
 def test_browser_drops_a_second_request_for_the_same_file(qapp):
     """A double click (or a page asking twice) must not download the same file twice."""
+    from types import SimpleNamespace
     from ezgd.ui.dialogs import browser
     if not browser.AVAILABLE:
         pytest.skip("Qt WebEngine not available")
@@ -206,7 +207,7 @@ def test_browser_drops_a_second_request_for_the_same_file(qapp):
             self.req = req
 
     class Fake:
-        _session_for = staticmethod(lambda page: object())
+        _session_for = staticmethod(lambda page: SimpleNamespace(disposed=False))     # an open browser window
         items = {1: Running(Req("Game.part1.rar", "https://host/a?token=1"))}
     Req.page = lambda self: None
     for name, url in (("Game.part1 (1).rar", "https://host/a?token=2"), ("Other.rar", "https://host/a?token=1")):

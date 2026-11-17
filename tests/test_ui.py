@@ -584,6 +584,48 @@ def test_the_game_page_has_the_focus_when_the_browser_hides_after_a_download(ui,
     assert got["later"]                                                  # the page has the focus
 
 
+def test_closing_the_browser_while_its_page_starts_downloads_never_crashes_the_app(ui, qtbot, server):
+    """EZGD-SEGV-F117EA (2026-11-15, a friend's PC): Qt WebEngine hands a new download over in a posted event that
+    holds a bare pointer to its page. A page deleted in between — its window closed just then — made Qt call through
+    freed memory: the app died inside the game page's exec() (or in _requested's req.page()). For 25 s the browser
+    is opened over a game page and closed at a random moment while its page and six frames keep asking for downloads
+    (programs: refused, so none starts). Before the fix this crashed 3 runs in 3, 3-18 s in."""
+    import random
+    import shiboken6
+    from PySide6.QtWidgets import QDialog
+    from ezgd.ui.dialogs import browser
+    if not browser.AVAILABLE:
+        pytest.skip("Qt WebEngine not installed")
+    win, core, _ = ui
+    server.add("/file/setup.exe", data=b"MZ fake", content_type="application/octet-stream",
+               headers={"Content-Disposition": 'attachment; filename="FastDownloader_setup.exe"'})
+    asking = ("var n = 0; setInterval(function () { for (var i = 0; i < window.frames.length; i++) "
+              "{ window.frames[i].location.href = '/file/setup.exe?' + n++; } "
+              "location.href = '/file/setup.exe?' + n++; }, 15);")
+    server.add("/d/busy", content_type="text/html", data=(
+        "<html><body>" + "<iframe style='display:none'></iframe>" * 6 + f"<script>{asking}</script></body></html>"
+    ).encode())
+    g = Game("steamrip", "86", "Busy Game", "https://steamrip.com/busy-game/")
+    core.games.save(g)
+    page = QDialog(win)
+    windows = []
+    until = time.monotonic() + 25
+
+    def next_round():
+        if windows and shiboken6.isValid(windows[-1]):
+            windows[-1].close()                                          # the ✕, at any moment
+        if time.monotonic() > until:
+            page.accept()
+            return
+        windows.append(browser.open_browser_download(win.actions, g, server.url("/d/busy"), "TestHost", page))
+        QTimer.singleShot(random.randint(400, 1000), next_round)
+    QTimer.singleShot(100, next_round)
+    page.exec()
+    assert len(windows) > 15
+    # every closed window goes, a few seconds after its pages (see browser._retire)
+    qtbot.waitUntil(lambda: not any(shiboken6.isValid(w) for w in windows), timeout=10000)
+
+
 def test_in_app_browser_follows_clicks_into_other_sites(ui, qtbot, server):
     """SteamRIP-style pages open the host in a new tab on another site: the user's click must work (that was
     blocked as a pop-up); script pop-ups stay blocked; program downloads (ads) are refused."""
