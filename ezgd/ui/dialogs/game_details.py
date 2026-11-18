@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QButtonGroup, QDialog, QFormLayout, QFrame, QGrid
 from ezgd.catalog.models import Game, GameGroup, MethodKind
 from ezgd.core.fsutil import format_bytes
 from ezgd.ui import theme
-from ezgd.sources.hosts import browser_url
+from ezgd.sources.hosts import browser_url, refresh_method
 from ezgd.ui.dialogs import browser
 from ezgd.ui.dialogs.misc import open_url
 from ezgd.ui.icons import icon
@@ -167,7 +167,7 @@ class GameDetailsDialog(QDialog):
         return g.extra.get("archive_password") or theme.source_password(g.source)
 
     def _download_in_app(self, g: Game, m, target: str) -> None:
-        browser.open_browser_download(self.actions, g, target, m.label, self)
+        browser.open_browser_download(self.actions, g, target, m.label, self, method_url=m.url)
         if target != m.url:
             self.actions.toasts.show(f"Click “{m.label}” on the page",
                                      f"{m.label} only accepts visits that come from {theme.source_name(g.source)}'s "
@@ -537,6 +537,7 @@ class GameDetailsDialog(QDialog):
         return f
 
     def _method_row(self, g: Game, index: int, m) -> QFrame:
+        refresh_method(m)
         f = QFrame()
         f.setProperty("card", True)
         lay = QHBoxLayout(f)

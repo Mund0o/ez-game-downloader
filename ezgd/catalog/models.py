@@ -37,6 +37,7 @@ class DownloadMethod:
     checksum: str | None = None      # "sha256:<hex>" from a trusted API, else None
     archive_password: str | None = None  # password the source publishes for its archives
     flagged_dangerous: bool = False  # the source itself warns about this mirror
+    source_page: str | None = None   # page listing this mirror when different from Game.url (e.g. Hosters index)
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -45,10 +46,11 @@ class DownloadMethod:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "DownloadMethod":
+        from ezgd.sources.hosts import refresh_method
         d = dict(d)
         d["kind"] = MethodKind(d["kind"])
         known = {f for f in cls.__dataclass_fields__}
-        return cls(**{k: v for k, v in d.items() if k in known})
+        return refresh_method(cls(**{k: v for k, v in d.items() if k in known}))
 
 
 @dataclass

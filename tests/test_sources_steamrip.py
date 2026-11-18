@@ -157,3 +157,46 @@ async def test_fileditch_opens_via_the_game_page(db):
     with pytest.raises(ManualActionRequired) as exc:
         await reg.resolve(game, go)
     assert exc.value.url == go.url
+
+
+def test_rotated_fileditch_domains_and_cached_methods_open_game_page():
+    """Probably Stolen (steamrip:60440): FileDitch rotated from fileditchfiles.st to itsfileditchfiles.st; rotated
+    domains and previously cached DB entries must still label as FileDitch and open the specific game page instead
+    of getting bounced to the SteamRIP home page."""
+    from ezgd.catalog.models import DownloadMethod
+    from ezgd.sources.hosts import browser_url, classify_host_link, opens_from_source_page
+    game_page = "https://steamrip.com/probably-stolen-cyberpunk-shopkeeper-sim-free-download/"
+    m = classify_host_link("https://itsfileditchfiles.st/balpha39/d9a796f5cdcb7b23e2cd/Probably-Stolen-SteamRIP.com.rar")
+    assert m.label == "FileDitch"
+    assert opens_from_source_page(m.url)
+    assert browser_url(m, game_page) == game_page
+
+    # Any future rotated FileDitch / Buzzheavier domain is matched by family
+    future_fd = classify_host_link("https://cdn2-fileditch-mirror.st/x/Game.rar")
+    future_bz = classify_host_link("https://dl.bzzhr-mirror.net/x123")
+    assert future_fd.label == "FileDitch" and browser_url(future_fd, game_page) == game_page
+    assert future_bz.label == "Buzzheavier" and browser_url(future_bz, game_page) == game_page
+
+    # Stale cached row from SQLite with raw domain label upgrades on load
+    stale = DownloadMethod.from_dict({
+        "kind": "external",
+        "label": "itsfileditchfiles.st",
+        "url": "https://itsfileditchfiles.st/balpha39/d9a796f5cdcb7b23e2cd/Probably-Stolen-SteamRIP.com.rar",
+        "host": "itsfileditchfiles.st",
+        "supported": False,
+        "note": "This host is not supported for in-app downloads; open it in your browser.",
+    })
+    assert stale.label == "FileDitch"
+    assert "click “FileDitch” there" in stale.note
+    assert browser_url(stale, game_page) == game_page
+
+    # Self-links on SteamRIP itself are ignored when parsing shortc-buttons
+    html = (
+        '<html><body><p>Desc</p><ul><li>Genre: Action</li></ul>'
+        '<a class="shortc-button" href="https://steamrip.com/">Broken Home Link</a>'
+        '<a class="shortc-button" href="https://itsfileditchfiles.st/balpha39/abc/Game.rar">DOWNLOAD HERE</a>'
+        '</body></html>'
+    )
+    parsed = sr.parse_content(html, Game("steamrip", "60440", "Probably Stolen", game_page))
+    assert len(parsed.download_methods) == 1
+    assert parsed.download_methods[0].label == "FileDitch"

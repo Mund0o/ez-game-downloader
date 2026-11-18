@@ -1460,3 +1460,59 @@ def test_frozen_linux_open_url_uses_host_env_and_external_button_closes_browser(
         _buttons(dlg, "Open in my browser")[0].click()
         assert len(calls) == 2
         qtbot.waitUntil(lambda: dlg.disposed, timeout=3000)
+
+
+def test_browser_recovers_from_homepage_bounce_and_spotlights_game_link(ui, qtbot, server):
+    """When a mirror bounces a direct visit to the source site's bare home page (e.g. SteamRIP mirrors redirecting
+    direct links to https://steamrip.com/), the in-app browser detects the wrong destination, opens the specific
+    game's page instead, and scrolls/highlights the matching download button."""
+    from ezgd.sources import hosts
+    from ezgd.ui.dialogs import browser
+    if not browser.AVAILABLE:
+        pytest.skip("Qt WebEngine not installed")
+    win, core, _ = ui
+
+    mirror_base = server.base.replace("127.0.0.1", "localhost")
+    mirror_url = f"{mirror_base}/bounce/Probably-Stolen.rar"
+    game_path = "/probably-stolen-free-download/"
+    game_url = server.url(game_path)
+
+    server.add("/", data=b"<html><body><h1>Generic Site Home</h1></body></html>", content_type="text/html")
+    server.add("/bounce/Probably-Stolen.rar", redirect_to=server.url("/"), redirect_status=302)
+    server.add(
+        game_path,
+        data=(
+            b"<html><body><div style='height:1800px'>Long description</div>"
+            + f"<a id='target-btn' class='shortc-button' href='{mirror_url}'>DOWNLOAD HERE</a>"
+            .encode()
+            + b"</body></html>"
+        ),
+        content_type="text/html",
+    )
+
+    hosts._NEEDS_SOURCE_PAGE.discard("localhost")
+    try:
+        g = Game("steamrip", "60440", "Probably Stolen", game_url)
+        core.games.save(g)
+        dlg = browser.open_browser_download(
+            win.actions, g, mirror_url, "FileDitch", win, method_url=mirror_url
+        )
+        # Browser catches the bounce to "/" and automatically navigates to "/probably-stolen-free-download/"
+        qtbot.waitUntil(lambda: dlg.page.url().path() == game_path, timeout=10000)
+        assert dlg.notice.isVisible() and "Probably Stolen" in dlg.notice.text.text()
+        assert hosts.opens_from_source_page(mirror_url)
+
+        # And spotlights the exact download button on the game page
+        outlined = []
+        qtbot.waitUntil(
+            lambda: (
+                dlg.page.runJavaScript(
+                    "document.getElementById('target-btn').style.outline", 0, outlined.append
+                ),
+                any("solid" in str(x) for x in outlined),
+            )[1],
+            timeout=5000,
+        )
+        dlg.close()
+    finally:
+        hosts._NEEDS_SOURCE_PAGE.discard("localhost")

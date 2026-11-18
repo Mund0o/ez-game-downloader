@@ -34,7 +34,7 @@ from ezgd.catalog.normalize import canonical_genre, clean_title
 from ezgd.core.fsutil import parse_size
 from ezgd.sources.base import (LayoutChangedError, ManualActionRequired, Page, ResolvedDownload,
                                SourceAdapter, SourceError, SourceInfo)
-from ezgd.sources.hosts import classify_host_link, resolve_pixeldrain
+from ezgd.sources.hosts import browser_url, classify_host_link, known_host, resolve_pixeldrain
 from ezgd.sources import parsing
 
 log = logging.getLogger(__name__)
@@ -121,7 +121,7 @@ def parse_each(posts: list, parse, source: str) -> list[Game]:
 
 def download_links(soup: BeautifulSoup) -> list[DownloadMethod]:
     """Generic: magnet links, .torrent files and links to known file hosts anywhere in a post."""
-    from ezgd.sources.hosts import HOST_LABELS, pixeldrain_id
+    from ezgd.sources.hosts import pixeldrain_id
     out, seen = [], set()
     for a in soup.select("a[href]"):
         href = a["href"].strip()
@@ -147,7 +147,7 @@ def download_links(soup: BeautifulSoup) -> list[DownloadMethod]:
             seen.add(href)
             out.append(DownloadMethod(MethodKind.TORRENT, text or "Torrent file", href, host=host, supported=True,
                                       resolver="torrent-file", note="The .torrent is fetched and downloaded in the app."))
-        elif host in HOST_LABELS or pixeldrain_id(href):
+        elif known_host(host) or pixeldrain_id(href):
             seen.add(href)
             m = classify_host_link(href)
             if text and text.lower() not in ("download", "download here", "click here"):
@@ -219,12 +219,16 @@ def parse_content(content_html: str, game: Game, generic: bool = False) -> Game:
     seen = set()
     buttons = soup.select("a.shortc-button[href]") or [
         a for a in soup.select("a[href]") if "download here" in a.get_text(" ", strip=True).lower()]
+    site_hosts = SITE_HOSTS | {(urlsplit(game.url).hostname or "").lower().removeprefix("www.")}
     for a in buttons:
         href = a["href"].strip()
         if href.startswith("//"):
             href = "https:" + href
         if not href.startswith(("http://", "https://")) or href in seen:
             continue
+        link_host = (urlsplit(href).hostname or "").lower().removeprefix("www.")
+        if not link_host or link_host in site_hosts:
+            continue                               # ignore self-links on SteamRIP (FAQ / home / broken buttons)
         seen.add(href)
         methods.append(classify_host_link(href))
     game.download_methods = methods
@@ -339,5 +343,6 @@ class SteamRipAdapter(SourceAdapter):
         if method.resolver == "pixeldrain":
             return await resolve_pixeldrain(self.fetcher, method)
         if method.kind is MethodKind.EXTERNAL:
-            raise ManualActionRequired(method.note or "Open this link in your browser.", method.url)
+            raise ManualActionRequired(method.note or "Open this link in your browser.",
+                                       browser_url(method, game.url))
         raise SourceError("unsupported download method")

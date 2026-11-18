@@ -64,6 +64,53 @@ def _site(host: str) -> str:
     return ".".join(parts[-2:]) if len(parts) >= 2 else host
 
 
+def _is_site_root(url: QUrl, ref_url: str) -> bool:
+    """True when ``url`` is the bare root homepage (``/``) of ``ref_url``'s site while ``ref_url`` is a sub-page."""
+    if not ref_url or not url.isValid() or url.scheme() not in ("http", "https"):
+        return False
+    ref = QUrl(ref_url)
+    if not ref.isValid() or _site(_host(url)) != _site(_host(ref)):
+        return False
+    ref_path = (ref.path() or "").rstrip("/")
+    cur_path = (url.path() or "").rstrip("/")
+    return bool(ref_path) and cur_path == "" and not url.query()
+
+
+_SPOTLIGHT_JS = r"""
+(function (spec) {
+  var wantUrl = (spec.url || '').trim();
+  var wantPath = (spec.path || '').trim();
+  var wantHost = (spec.host || '').toLowerCase();
+  var wantFam = (spec.family || '').toLowerCase();
+  var links = Array.prototype.slice.call(document.querySelectorAll('a[href]'));
+  var best = null, bestScore = 0;
+  for (var i = 0; i < links.length; i++) {
+    var a = links[i], href = a.href || '';
+    if (!href || href.indexOf('javascript:') === 0) continue;
+    var score = 0;
+    if (wantUrl && href === wantUrl) score = 100;
+    else if (wantPath && wantPath.length > 4 && href.indexOf(wantPath) !== -1) score = 90;
+    else {
+      var h = (a.hostname || '').toLowerCase().replace(/^www\./, '');
+      if (wantHost && h === wantHost) score = 70;
+      else if (wantFam && h.indexOf(wantFam) !== -1) score = 60;
+      else if (wantFam === 'buzzheavier' && h.indexOf('bzzhr') !== -1) score = 60;
+    }
+    if (score > 0 && a.classList && a.classList.contains('shortc-button')) score += 5;
+    if (score > bestScore) { bestScore = score; best = a; }
+  }
+  if (!best) return false;
+  best.style.setProperty('outline', '3px solid #8b5cf6', 'important');
+  best.style.setProperty('outline-offset', '4px', 'important');
+  best.style.setProperty('box-shadow', '0 0 0 7px rgba(139,92,246,0.32), 0 8px 24px rgba(0,0,0,0.45)', 'important');
+  best.style.setProperty('border-radius', '8px', 'important');
+  try { best.scrollIntoView({behavior: 'smooth', block: 'center'}); }
+  catch (e) { best.scrollIntoView(true); }
+  return true;
+})
+"""
+
+
 class AdBlockState:
     """Read from Qt WebEngine's IO thread: only immutable values are swapped in, never mutated."""
 
@@ -697,13 +744,17 @@ class BrowserDownloadDialog(OwnAppId, QDialog):
 
     went_away = Signal()            # hidden (a download started) or closed — couch mode comes back then
 
-    def __init__(self, actions, game, url: str, host_label: str, parent=None):
+    def __init__(self, actions, game, url: str, host_label: str, parent=None, method_url: str | None = None):
         super().__init__(parent)
         self.actions = actions
         self.game = game
         self.host_label = host_label
         self.start_url = url
-        self.allowed_sites = {_site(_host(url)), _site(_host(game.url))}
+        self.method_url = method_url or url
+        self._bounce_recovered = False
+        self._search_recovered = False
+        self.allowed_sites = {s for s in (_site(_host(url)), _site(_host(game.url)),
+                                          _site(_host(self.method_url))) if s}
         ADBLOCK.enabled = bool(actions.settings.get("browser_adblock", True))
         ADBLOCK.add_allowed(*self.allowed_sites)
         self._last_click: tuple[str, float] = ("", 0.0)
@@ -774,6 +825,7 @@ class BrowserDownloadDialog(OwnAppId, QDialog):
         install_gl_guard(self.page)
         self.tabs: list = [self.page]                 # pages opened by the user's clicks, newest last
         self._attach(self.page)
+        self.page.loadFinished.connect(self._verify_and_spotlight)
         lay.addWidget(self.stack, 1)
         self.view.load(QUrl(url))
 
@@ -815,6 +867,57 @@ class BrowserDownloadDialog(OwnAppId, QDialog):
             self.stack.removeWidget(v)
             v.hide()
             v.deleteLater()
+
+    def _verify_and_spotlight(self, ok: bool) -> None:
+        """Verify the loaded page did not bounce back to a generic site homepage (e.g. SteamRIP mirrors redirecting
+        direct visits to https://steamrip.com/), and scroll/highlight the matching mirror button on the game page."""
+        import json
+        import shiboken6
+        from urllib.parse import quote_plus
+        from ezgd.sources import hosts
+        if not ok or self.disposed or not shiboken6.isValid(self) or not shiboken6.isValid(self.page):
+            return
+        cur = self.page.url()
+        game_url = getattr(self.game, "url", "") or ""
+        if _is_site_root(cur, game_url):
+            start_norm = self.start_url.rstrip("/")
+            game_norm = game_url.rstrip("/")
+            if not self._bounce_recovered and start_norm != game_norm:
+                self._bounce_recovered = True
+                hosts.remember_source_page_host(_host(self.method_url or self.start_url))
+                self._show_notice(
+                    f"{self.host_label} redirected direct visits to the site's home page — opened "
+                    f"“{self.game.title}”'s page instead so you can click its download button."
+                )
+                self.page.load(QUrl(game_url))
+                return
+            if not self._search_recovered and getattr(self.game, "source", "") == "steamrip" and self.game.title:
+                self._search_recovered = True
+                search_url = f"{cur.scheme()}://{cur.host()}/?s={quote_plus(self.game.title)}"
+                self._show_notice(
+                    f"That link redirected to the SteamRIP home page — searched SteamRIP for “{self.game.title}” "
+                    "so you can open the game directly."
+                )
+                self.page.load(QUrl(search_url))
+                return
+        if self.method_url and cur.toString().rstrip("/") != self.method_url.rstrip("/") \
+                and _site(_host(cur)) == _site(_host(game_url)):
+            m_host = _host(self.method_url)
+            spec = {"url": self.method_url, "path": urlsplit(self.method_url).path or "",
+                    "host": m_host, "family": hosts.host_family(m_host) or "", "label": self.host_label}
+
+            def on_highlighted(found) -> None:
+                if found and shiboken6.isValid(self) and not self.disposed:
+                    self._banner.set_text(
+                        f"Opened “{self.game.title}”'s page and highlighted “{self.host_label}” below — click it to "
+                        "start the download (this window hides automatically once the transfer begins).",
+                        "info",
+                    )
+
+            try:
+                self.page.runJavaScript(f"{_SPOTLIGHT_JS}({json.dumps(spec)})", 0, on_highlighted)
+            except RuntimeError:
+                pass
 
     def _drop(self, page, stop: bool = True) -> None:
         """Close a tab and its view: delete the view first, then retire the page into _RETIRED."""
@@ -1323,14 +1426,15 @@ def show_clickable(dlg: "BrowserDownloadDialog") -> None:
     dlg.show()
 
 
-def open_browser_download(actions, game, url: str, host_label: str, parent, app_id_role: str | None = None):
+def open_browser_download(actions, game, url: str, host_label: str, parent, app_id_role: str | None = None,
+                          method_url: str | None = None):
     if not AVAILABLE:
         QMessageBox.information(parent, "In-app browser not installed",
                                 "The in-app browser component (Qt WebEngine) is not part of this build. Use “Open "
                                 "in browser” and then “Import downloaded file…”.")
         return None
     # owned by the main window, not the game page: closing the game page must not stop the download
-    dlg = BrowserDownloadDialog(actions, game, url, host_label, actions.parent() or parent)
+    dlg = BrowserDownloadDialog(actions, game, url, host_label, actions.parent() or parent, method_url=method_url)
     dlg.setAttribute(Qt.WA_DeleteOnClose, False)     # disposed explicitly once its downloads are done
     dlg.app_id_role = app_id_role                    # couch mode's browser: its own app (see OwnAppId)
     show_clickable(dlg)

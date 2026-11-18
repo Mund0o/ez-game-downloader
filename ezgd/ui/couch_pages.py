@@ -1650,6 +1650,8 @@ class GamePage(Page):
                     items.append(Item(f"Download — {m.label}", lambda i=i: start_download(self.w, g, i),
                                       f"{kind} in the app{size}" + (f" · {m.note}" if m.note else ""), "primary"))
                 else:
+                    from ezgd.sources.hosts import refresh_method
+                    refresh_method(m)
                     target = browser_url(m, g.url)
                     items.append(Item(f"Download in the browser — {m.label}",
                                       lambda m=m, t=target: open_browser(self.w, g, m, t),
@@ -1990,7 +1992,8 @@ def open_browser(w, game, method, target: str) -> None:
         w.toasts.show("Opened in your browser", "Download it there; then import the file in the Library.", "info")
         w.step_away("browser")
         return
-    dlg = browser.open_browser_download(w.actions, game, target, label, w, app_id_role="couch-browser")
+    dlg = browser.open_browser_download(w.actions, game, target, label, w, app_id_role="couch-browser",
+                                        method_url=getattr(method, "url", None))
     if dlg is None:
         return
     from ezgd.ui.couch_browser import CouchBrowser

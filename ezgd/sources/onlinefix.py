@@ -550,7 +550,10 @@ class OnlineFixAdapter(SourceAdapter):
         res = await self.fetcher.get(method.url, ttl=1800)
         if res.status >= 400:
             raise SourceError(f"hosters page returned HTTP {res.status}")
-        return parse_hosters(res.text(), method.archive_password)
+        mirrors = parse_hosters(res.text(), method.archive_password)
+        for m in mirrors:
+            m.source_page = method.url
+        return mirrors
 
     async def resolve(self, method: DownloadMethod, game: Game) -> ResolvedDownload:
         if method.resolver == "onlinefix_torrent_index":

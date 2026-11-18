@@ -26,52 +26,128 @@ from ezgd.sources.cache import CachedFetcher
 _PIXELDRAIN_HOSTS = {"pixeldrain.com", "pixeldrain.net", "pixeldra.in"}
 _PIXELDRAIN_FILE = re.compile(r"^/(?:u|api/file)/([A-Za-z0-9]{6,32})/?$")
 
+_FILEDITCH_NOTE = (
+    "FileDitch only opens when you click it on the game's page (opened directly it sends "
+    "you to the SteamRIP home page), so the app opens that page — click “FileDitch” there."
+)
+_BUZZHEAVIER_NOTE = (
+    "Buzzheavier checks for a real browser (Cloudflare) and only opens when you click it on the game's "
+    "page (opened directly it sends you to the SteamRIP home page), so the app opens that page — "
+    "click “Buzzheavier” there."
+)
+_GENERIC_EXTERNAL_NOTE = "This host is not supported for in-app downloads; open it in your browser."
+
 HOST_NOTES = {
     "gofile.io": "Gofile only serves files to browsers with an account token.",
-    "buzzheavier.com": "Buzzheavier checks for a real browser (Cloudflare) and only opens when you click it on the game's "
-                       "page (opened directly it sends you to the SteamRIP home page), so the app opens that page — "
-                       "click “Buzzheavier” there.",
-    "bzzhr.to": "Buzzheavier checks for a real browser (Cloudflare) and only opens when you click it on the game's "
-                       "page (opened directly it sends you to the SteamRIP home page), so the app opens that page — "
-                       "click “Buzzheavier” there.",
-    "bzzhr.co": "Buzzheavier checks for a real browser (Cloudflare) and only opens when you click it on the game's "
-                       "page (opened directly it sends you to the SteamRIP home page), so the app opens that page — "
-                       "click “Buzzheavier” there.",
-    "fileditchfiles.st": "FileDitch only opens when you click it on the game's page (opened directly it sends "
-                         "you to the SteamRIP home page), so the app opens that page — click “FileDitch” there.",
-    "fileditch.com": "FileDitch only opens when you click it on the game's page (opened directly it sends "
-                     "you to the SteamRIP home page), so the app opens that page — click “FileDitch” there.",
+    "buzzheavier.com": _BUZZHEAVIER_NOTE,
+    "bzzhr.to": _BUZZHEAVIER_NOTE,
+    "bzzhr.co": _BUZZHEAVIER_NOTE,
+    "fileditchfiles.st": _FILEDITCH_NOTE,
+    "itsfileditchfiles.st": _FILEDITCH_NOTE,
+    "fileditch.com": _FILEDITCH_NOTE,
     "megadb.net": "MegaDB requires solving a captcha.",
     "filekeeper.net": "FileKeeper uses a waiting page and captcha.",
     "vikingfile.com": "VikingFile uses a waiting page and captcha.",
     "1fichier.com": "1fichier uses a waiting page and captcha.",
     "mega.nz": "MEGA downloads require its browser client.",
     "mediafire.com": "MediaFire download pages require a browser.",
+    "rootz.so": "Rootz download pages require a browser.",
 }
 
 HOST_LABELS = {
     "gofile.io": "Gofile", "buzzheavier.com": "Buzzheavier", "bzzhr.to": "Buzzheavier",
-    "bzzhr.co": "Buzzheavier", "fileditchfiles.st": "FileDitch", "fileditch.com": "FileDitch",
-    "megadb.net": "MegaDB", "filekeeper.net": "FileKeeper", "vikingfile.com": "VikingFile",
-    "pixeldrain.com": "Pixeldrain", "pixeldrain.net": "Pixeldrain", "pixeldra.in": "Pixeldrain",
-    "1fichier.com": "1fichier", "mega.nz": "MEGA", "mediafire.com": "MediaFire",
-    "datanodes.to": "DataNodes", "fuckingfast.co": "FuckingFast",
+    "bzzhr.co": "Buzzheavier", "fileditchfiles.st": "FileDitch", "itsfileditchfiles.st": "FileDitch",
+    "fileditch.com": "FileDitch", "megadb.net": "MegaDB", "filekeeper.net": "FileKeeper",
+    "vikingfile.com": "VikingFile", "pixeldrain.com": "Pixeldrain", "pixeldrain.net": "Pixeldrain",
+    "pixeldra.in": "Pixeldrain", "1fichier.com": "1fichier", "mega.nz": "MEGA",
+    "mediafire.com": "MediaFire", "datanodes.to": "DataNodes", "fuckingfast.co": "FuckingFast",
+    "rootz.so": "Rootz",
 }
 
 
 # hosts that only serve a link when the visit comes from the page that lists it (Referer check); the app never
 # fakes that, it opens the source's game page instead so the user's own click comes from there
-_NEEDS_SOURCE_PAGE = {"fileditchfiles.st", "fileditch.com", "fileditch.ch", "fileditchfiles.me",
-                      "buzzheavier.com", "bzzhr.to", "bzzhr.co"}
+_NEEDS_SOURCE_PAGE = {"fileditchfiles.st", "itsfileditchfiles.st", "fileditch.com", "fileditch.ch",
+                      "fileditchfiles.me", "buzzheavier.com", "bzzhr.to", "bzzhr.co"}
+
+
+def host_family(host: str) -> str | None:
+    """Recognize mirror families that rotate domains (e.g. fileditchfiles.st → itsfileditchfiles.st)."""
+    h = (host or "").lower().removeprefix("www.")
+    if not h:
+        return None
+    if "fileditch" in h:
+        return "fileditch"
+    if "buzzheavier" in h or "bzzhr" in h:
+        return "buzzheavier"
+    return None
+
+
+def known_host(host: str) -> bool:
+    h = (host or "").lower().removeprefix("www.")
+    return h in HOST_LABELS or host_family(h) is not None
+
+
+def host_label(host: str) -> str:
+    h = (host or "").lower().removeprefix("www.")
+    if h in HOST_LABELS:
+        return HOST_LABELS[h]
+    fam = host_family(h)
+    if fam == "fileditch":
+        return "FileDitch"
+    if fam == "buzzheavier":
+        return "Buzzheavier"
+    return h or "link"
+
+
+def host_note(host: str) -> str:
+    h = (host or "").lower().removeprefix("www.")
+    if h in HOST_NOTES:
+        return HOST_NOTES[h]
+    fam = host_family(h)
+    if fam == "fileditch":
+        return _FILEDITCH_NOTE
+    if fam == "buzzheavier":
+        return _BUZZHEAVIER_NOTE
+    return _GENERIC_EXTERNAL_NOTE
 
 
 def opens_from_source_page(url: str) -> bool:
-    return _host(url) in _NEEDS_SOURCE_PAGE
+    h = _host(url)
+    return h in _NEEDS_SOURCE_PAGE or host_family(h) in ("fileditch", "buzzheavier")
+
+
+def remember_source_page_host(host: str) -> None:
+    """Record a mirror host observed bouncing direct visits back to the source site's root home page."""
+    h = (host or "").lower().removeprefix("www.")
+    if h:
+        _NEEDS_SOURCE_PAGE.add(h)
 
 
 def browser_url(method: DownloadMethod, game_url: str | None) -> str:
     """What to open in the browser for a browser-only method."""
-    return game_url if game_url and opens_from_source_page(method.url) else method.url
+    via = getattr(method, "source_page", None) or game_url
+    return via if via and opens_from_source_page(method.url) else method.url
+
+
+def refresh_method(method: DownloadMethod) -> DownloadMethod:
+    """Upgrade cached DownloadMethod labels/notes when a rotated domain (e.g. itsfileditchfiles.st) is now known."""
+    if method.kind is not MethodKind.EXTERNAL:
+        return method
+    h = (method.host or _host(method.url)).lower().removeprefix("www.")
+    if not h:
+        return method
+    canonical = host_label(h)
+    if canonical != h:
+        if not method.label or method.label.lower() == h:
+            method.label = canonical
+        elif method.label.lower().startswith(h + " — "):
+            method.label = canonical + method.label[len(h):]
+    better_note = host_note(h)
+    if better_note != _GENERIC_EXTERNAL_NOTE and (not method.note or _GENERIC_EXTERNAL_NOTE in method.note):
+        prefix = "The source warns that this mirror shows deceptive ads. " if method.flagged_dangerous else ""
+        method.note = prefix + better_note
+    return method
 
 
 def _host(url: str) -> str:
@@ -89,22 +165,24 @@ def pixeldrain_id(url: str) -> str | None:
 
 
 def classify_host_link(url: str, *, label: str | None = None, file_name: str | None = None,
-                       dangerous: bool = False, archive_password: str | None = None) -> DownloadMethod:
+                       dangerous: bool = False, archive_password: str | None = None,
+                       source_page: str | None = None) -> DownloadMethod:
     """Build a DownloadMethod for a file-host link, marking what the app can do itself."""
     if url.startswith("//"):
         url = "https:" + url
     host = _host(url)
-    name = HOST_LABELS.get(host, host or "link")
+    name = host_label(host)
     if pixeldrain_id(url):
         return DownloadMethod(MethodKind.DIRECT, label or name, url, host=host, supported=True,
                               resolver="pixeldrain", file_name=file_name, archive_password=archive_password,
-                              flagged_dangerous=dangerous,
+                              flagged_dangerous=dangerous, source_page=source_page,
                               note="Downloaded through Pixeldrain's public API; SHA-256 verified when provided.")
-    note = HOST_NOTES.get(host, "This host is not supported for in-app downloads; open it in your browser.")
+    note = host_note(host)
     if dangerous:
         note = "The source warns that this mirror shows deceptive ads. " + note
     return DownloadMethod(MethodKind.EXTERNAL, label or name, url, host=host, supported=False, note=note,
-                          file_name=file_name, flagged_dangerous=dangerous, archive_password=archive_password)
+                          file_name=file_name, flagged_dangerous=dangerous, archive_password=archive_password,
+                          source_page=source_page)
 
 
 async def resolve_pixeldrain(fetcher: CachedFetcher, method: DownloadMethod) -> ResolvedDownload:
