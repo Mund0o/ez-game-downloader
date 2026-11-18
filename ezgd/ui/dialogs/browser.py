@@ -98,10 +98,11 @@ def profile():
         _PROFILE.scripts().insert(_click_recorder())
         _PROFILE.scripts().insert(_cosmetic_collector())
         install_gl_guard()
-        # the ad blocker's lists are built as the browser first opens — not at every app start, where the filter
-        # engine held ~80 MB for the whole run and its compiler paused the interface (it holds Python's lock)
-        threading.Thread(target=lambda: (adblock.blocked_domains(), filterlists.warm_up()), name="adblock-lists",
-                         daemon=True).start()
+        # the ad blocker's lists are built shortly after the browser opens — not at every app start (where the filter
+        # engine held ~80 MB for the whole run), and deferred 150 ms so its GIL lock does not stall window creation
+        QTimer.singleShot(150, lambda: threading.Thread(
+            target=lambda: (adblock.blocked_domains(), filterlists.warm_up()),
+            name="adblock-lists", daemon=True).start())
     return _PROFILE
 
 

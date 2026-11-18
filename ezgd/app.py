@@ -123,6 +123,7 @@ def _run(args, paths, log_file, previous_crash) -> int:
 
     from ezgd.ui import gpu
     gpu_start = gpu.apply_at_startup(paths.data, paths.database)    # (before Qt and Chromium start)
+    gpu.configure_browser()
     from PySide6.QtCore import QCoreApplication, Qt, QTimer
     from PySide6.QtWidgets import QApplication, QMessageBox
     QCoreApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)   # required by QWebEngineView / Wayland GPU sharing

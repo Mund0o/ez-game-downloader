@@ -241,9 +241,10 @@ def _journal(args: list[str]) -> list[dict]:
     exe = shutil.which("journalctl")
     if not exe:
         return []
+    from ezgd.platform.hostenv import host_env
     try:
         r = subprocess.run([exe, "--no-pager", "-o", "json", *args], capture_output=True, text=True, timeout=6,
-                           env={**os.environ, "SYSTEMD_COLORS": "0"})
+                           env={**host_env(), "SYSTEMD_COLORS": "0"})
     except (OSError, subprocess.SubprocessError):
         return []
     out = []
@@ -291,8 +292,8 @@ def native_trace(pid: int, since: float, crashed_at: float) -> tuple[str, str]:
         thread = _field(dump, "COREDUMP_THREAD_NAME")
         lines.append(f"{_field(dump, 'COREDUMP_SIGNAL_NAME') or 'signal'} in thread “{thread or '?'}”")
         stack = False
-        for ln in _field(dump, "MESSAGE").splitlines():
-            ln = ln.strip()
+        msg_lines = [ln.strip() for ln in _field(dump, "MESSAGE").splitlines()]
+        for ln in msg_lines:
             if not stack:                 # (the crashing thread's stack comes first)
                 stack = bool(_STACK_HEAD.match(ln))
                 if stack:
@@ -308,6 +309,10 @@ def native_trace(pid: int, since: float, crashed_at: float) -> tuple[str, str]:
             if len(lines) >= 45:
                 lines.append("…")
                 break
+        if len(lines) == 1 and msg_lines:
+            for extra_ln in msg_lines[:4]:
+                if extra_ln:
+                    lines.append(extra_ln)
     # the kernel's own line names the library too, also where core dumps are switched off (needs journal access)
     kernel = [m for e in _journal(["-k", *window]) if f"[{pid}]" in (m := _field(e, "MESSAGE")) and _FAULT_LINE.search(m)]
     if kernel:

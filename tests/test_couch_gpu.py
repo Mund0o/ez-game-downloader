@@ -198,8 +198,14 @@ def test_desktop_gpu_switches_at_start_up(tmp_path):
     assert gpu.apply_at_startup(data, db, env) == "on"
     assert "QT_WIDGETS_RHI" not in env           # desktop windows stay as they are (menus drew garbled through it)
     flags = env["QTWEBENGINE_CHROMIUM_FLAGS"].split()
-    assert flags[0] == "--foo" and any(f.startswith("--enable-features=Vaapi") for f in flags)
+    assert flags[0] == "--foo"
     assert "--ignore-gpu-blocklist" not in flags and "--enable-zero-copy" not in flags   # Chromium's blocklist holds
+    if gpu.sys.platform.startswith("linux"):
+        assert env.get("QT_QUICK_BACKEND") == "software"
+        assert env.get("QTWEBENGINE_FORCE_USE_GBM") == "0"
+        assert "--disable-gpu" in flags and "--disable-gpu-compositing" in flags
+    else:
+        assert any(f.startswith("--enable-features=Vaapi") for f in flags)
     assert (data / gpu.MARKER).exists()
     # that start never got as far as its window: the next one leaves the GPU out (and the one after tries again)
     env2 = {}

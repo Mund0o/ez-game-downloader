@@ -179,29 +179,37 @@ class FramelessResizeFilter(QObject):
         win.installEventFilter(self)
         self._attach_handle()
 
+    def _on_handle_destroyed(self, *_a) -> None:
+        self._handle = None
+
     def _attach_handle(self) -> None:
+        import shiboken6
         wh = self.win.windowHandle()
         if wh is not None and wh is not self._handle:
-            if self._handle is not None:
+            if self._handle is not None and shiboken6.isValid(self._handle):
                 try:
                     self._handle.removeEventFilter(self)
                 except RuntimeError:
                     pass
             self._handle = wh
+            wh.destroyed.connect(self._on_handle_destroyed)
             wh.installEventFilter(self)
 
     def cleanup(self) -> None:
+        import shiboken6
         self._clear_cursor()
         if self._handle is not None:
+            if shiboken6.isValid(self._handle):
+                try:
+                    self._handle.removeEventFilter(self)
+                except RuntimeError:
+                    pass
+            self._handle = None
+        if shiboken6.isValid(self.win):
             try:
-                self._handle.removeEventFilter(self)
+                self.win.removeEventFilter(self)
             except RuntimeError:
                 pass
-            self._handle = None
-        try:
-            self.win.removeEventFilter(self)
-        except RuntimeError:
-            pass
 
     def _clear_cursor(self) -> None:
         if self._override:
