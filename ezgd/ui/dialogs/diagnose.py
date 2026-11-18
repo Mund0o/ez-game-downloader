@@ -799,7 +799,9 @@ class DiagnoseDialog(QDialog):
 def _open_file(path) -> None:
     from PySide6.QtCore import QUrl
     from PySide6.QtGui import QDesktopServices
-    QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+    from ezgd.ui.dialogs.misc import _open_host
+    if not _open_host(str(path)):
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
 
 def open_diagnose(actions, entry, parent) -> None:

@@ -493,6 +493,7 @@ class _Couch(OwnAppId):
         self.running: set[int] = set(running)
         self.suspended: set[int] = set()         # running games frozen from the quick menu (continue where they were)
         self.quick = None                        # the quick menu (couch_quick.QuickMenu), made when first opened
+        self._wheel = None                       # the mouse wheel in steps (wheel_steps.WheelSteps), made when used
         self.background = False                  # made only for the quick menu over a desktop-started game: never
         self.on_promote = None                   #   shown unless asked (then on_promote, and it opens for real)
         self.on_desktop = None                   # … and back to the desktop app when its game ends or is quit there
@@ -1572,6 +1573,9 @@ class _Couch(OwnAppId):
         if name == "home":
             self.guide_pressed()
         if self.quick is not None and self.quick.isVisible():
+            if self.pads.family and self.pad_family != self.pads.family:
+                self.pad_family = self.pads.family        # the controller's prompts again (after keys)
+                self.quick.update()
             self.quick.pointer(False)
             self.quick.command(name)                      # the quick menu is over the game
             return
@@ -1747,7 +1751,7 @@ class _Couch(OwnAppId):
         if self.keyboard is not None:                         # typing into the on-screen keyboard
             try:
                 before = self._focus_key()
-                done = self.keyboard.key(k, e.text(), steam, self._keys_from_a_pad(), e.isAutoRepeat())
+                done = self.keyboard.key(k, e.text(), steam, self._keys_from_a_pad(), e.isAutoRepeat(), e.modifiers())
                 if done:
                     self._sound(done, before)
             except Exception:
@@ -2092,6 +2096,10 @@ class _Couch(OwnAppId):
         if self.keyboard is not None:
             if h and h[0] == "key":
                 self.keyboard.hit(h[1], False)
+            if h != getattr(self, "_hovered", None):
+                self._hovered = h
+                self.update()
+            elif h and h[0] == "key":
                 self.update()
             return
         if self.overlay is not None:
@@ -2115,12 +2123,16 @@ class _Couch(OwnAppId):
         if self._skip_intro():
             return
         if e.button() in (Qt.BackButton, Qt.RightButton):     # (a Steam controller's left trigger is a right click)
+            if self.keyboard is not None and not self.pads.steam_as_keys():
+                self.keyboard.cancel()
+                self.update()
+                return
             self.command("b")
             return
         if e.button() != Qt.LeftButton:
             return
         h = self._hit_at(e.position())
-        if h:
+        if h and h[0] != "kb_panel":
             self.sounds.play("select")                 # a click into something
         if h and h[0] == "x":
             self.keyboard = None
@@ -2137,8 +2149,13 @@ class _Couch(OwnAppId):
                     log.exception("couch mode: message action failed")
             return
         if self.keyboard is not None:
-            if h and h[0] == "key":
-                self.keyboard.hit(h[1], True)
+            kb_hit = next(((k, i) for r, k, i in reversed(self._hit)
+                           if k in ("key", "kb_close", "kb_panel") and r.contains(e.position())), None)
+            if kb_hit and kb_hit[0] == "key":
+                self.keyboard.typed = not self.pads.steam_as_keys()
+                self.keyboard.hit(kb_hit[1], True)
+            elif kb_hit is None or kb_hit[0] == "kb_close":
+                self.keyboard.cancel()
             self.update()
             return
         if self.overlay is not None:
@@ -2181,22 +2198,26 @@ class _Couch(OwnAppId):
         self.update()
 
     def wheelEvent(self, e) -> None:                          # noqa: N802
+        """One notch of the wheel moves once, however many parts the mouse sends it in (see wheel_steps)."""
+        if self._wheel is None:
+            from ezgd.ui.wheel_steps import WheelSteps
+            self._wheel = WheelSteps()
         if self.overlay is not None:
-            if self.overlay.menu:
-                dy = e.angleDelta().y()
-                if dy:
-                    self._overlay_command("up" if dy > 0 else "down")
+            if self.overlay.menu and e.angleDelta().y():
+                step = self._wheel.steps(e)
+                if step:
+                    self._overlay_command("up" if step > 0 else "down")
                     self.update()
             return
         if self.keyboard is not None:
             return
-        dy = e.angleDelta().y() or e.angleDelta().x()
-        if not dy:
+        step = self._wheel.steps(e)
+        if not step:
             return
         if self.current_page() is None and self.tab == T_HOME:
-            self.command("left" if dy > 0 else "right")
+            self.command("left" if step > 0 else "right")
         else:
-            self.command("up" if dy > 0 else "down")
+            self.command("up" if step > 0 else "down")
 
     # ============================================================== overlays
     def show_overlay(self, title: str, text: str = "", buttons=None, lines=None, focus: int = 0,
@@ -3213,11 +3234,11 @@ class _Couch(OwnAppId):
         """One of our games is being played and has the screen (couch mode is not the active window)."""
         return bool([i for i in self.running if i not in self.suspended]) and not self.isActiveWindow()
 
-    def _home_held(self) -> None:
-        """The PS / Xbox / Steam button held: the quick menu over the game (back to it, switch games with the
-        current one suspended, couch mode, volume, settings, quit). Only for games this app runs — directly or
-        through Steam for its overlay; a game started in Steam itself is not in ``running`` and gets nothing. Only
-        with our overlay (Settings): without it Steam's overlay is the one over the game."""
+    def _home_held(self, by_key: bool = False) -> None:
+        """The PS / Xbox / Steam button held (or Shift+Tab: ``by_key``): the quick menu over the game (back to it,
+        switch games with the current one suspended, couch mode, volume, settings, quit). Only for games this app
+        runs — directly or through Steam for its overlay; a game started in Steam itself is not in ``running`` and
+        gets nothing. Only with our overlay (Settings): without it Steam's overlay is the one over the game."""
         if self._exiting or (self.overlay is not None and self.overlay.tag in ("closing", "quit-game")):
             return
         if self.quick is not None and self.quick.isVisible():
@@ -3233,10 +3254,10 @@ class _Couch(OwnAppId):
         game = next((e for e in self.entries if e.id == current), None)
         self.keyboard = None
         if current is not None and game is None:          # started a moment ago: not in couch mode's list yet
-            self.bridge.call(self.bridge.core.library_call("get", current), self.open_quick, lambda _err: None,
-                             owner=self)
+            self.bridge.call(self.bridge.core.library_call("get", current),
+                             lambda g: self.open_quick(g, by_key=by_key), lambda _err: None, owner=self)
             return
-        self.open_quick(game)
+        self.open_quick(game, by_key=by_key)
 
     def _game_played(self, playing: list[int]) -> int | None:
         """Of the running (not suspended) games, the one being played: the last started or continued here — else
@@ -3247,7 +3268,7 @@ class _Couch(OwnAppId):
         when = {e.id: e.last_played_at or 0 for e in self.entries}
         return max(playing, key=lambda i: (when.get(i, float("inf")), i), default=None)   # (not listed yet: newest)
 
-    def open_quick(self, game, checked: bool = False) -> None:
+    def open_quick(self, game, checked: bool = False, by_key: bool = False) -> None:
         if self._exiting or not self.own_overlay():
             return
         if game is not None and not checked:
@@ -3255,18 +3276,19 @@ class _Couch(OwnAppId):
             # button closes it — and the quick menu does not open over it
             def answer(busy) -> None:
                 if not busy:
-                    self.open_quick(game, checked=True)
+                    self.open_quick(game, checked=True, by_key=by_key)
                     return
                 log.info("couch mode: Steam's overlay is open in %s — the button is Steam's (it closes it)", game.title)
                 if self.background:
                     QTimer.singleShot(0, self, self._dismiss_background)
             self.bridge.call(self.bridge.core.steam_overlay_busy(game.id), answer, lambda _e: answer(False), owner=self)
             return
-        log.info("couch mode: guide button held — quick menu for %s", game.title if game else "suspended games")
+        log.info("couch mode: %s — quick menu for %s", "Shift+Tab" if by_key else "guide button held",
+                 game.title if game else "suspended games")
         from ezgd.ui.couch_quick import QuickMenu
         if self.quick is None:
             self.quick = QuickMenu(self)
-        self.quick.open_for(game)
+        self.quick.open_for(game, by_key=by_key)
 
     def go_to_game(self, e) -> None:
         """Give the screen to a running game (continuing it first when it is suspended): couch mode steps aside and

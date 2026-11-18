@@ -17,6 +17,7 @@ import re
 import threading
 import time
 import weakref
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -40,6 +41,9 @@ except ImportError:                     # pragma: no cover - depends on the inst
 
 _PROFILE = None
 _PAGES: "weakref.WeakSet | None" = None
+_LIVE_PAGES: set = set()
+_RETIRED: deque = deque()
+MAX_RETIRED_PAGES = 64
 _MANAGER: "BrowserDownloads | None" = None
 
 
@@ -238,12 +242,16 @@ if AVAILABLE:
         """A tab in the pop-up. New windows the user clicked open as another tab; script pop-ups are blocked.
 
         Nothing a page does can lock the window: alert/confirm/prompt never open modal boxes (their text is shown
-        in the notice bar), full-screen requests are refused and log-in boxes are cancelled."""
+        in the notice bar), full-screen requests are refused and log-in boxes are cancelled. Parented to the shared
+        profile (not the dialog) so a retired page stays valid until shutdown and never leaves a dangling C++ pointer
+        inside queued downloadRequested events."""
 
         def __init__(self, prof, owner):
-            super().__init__(prof, owner)
+            super().__init__(prof, None)
+            _LIVE_PAGES.add(self)
             self.owner = owner
-            self.retired = False                              # closed: waiting to be deleted (see _retire)
+            self.closing = False                              # hidden by window.close(): may still finish a download
+            self.retired = False                              # stopped and parked in _RETIRED (see _retire)
             self.probation: tuple[str, float] | None = None   # blank pop-up: (href pressed, deadline)
             self.cosm_exceptions: set[str] = set()
             self.cosm_generic = True
@@ -251,53 +259,69 @@ if AVAILABLE:
             self.permissionRequested.connect(lambda perm: perm.deny())     # camera, location, notifications…
             self.settings().setAttribute(QWebEngineSettings.JavascriptCanOpenWindows, True)
             self.settings().setAttribute(QWebEngineSettings.FullScreenSupportEnabled, False)
-            # (a closed tab's own requests are dropped: a new window from it is never opened)
-            self.newWindowRequested.connect(lambda req: None if self.retired else owner._new_window(req, self))
+            # (a closed or retired tab's own UI requests are dropped: a new window from it is never opened)
+            self.newWindowRequested.connect(lambda req: o._new_window(req, self) if (o := self._live_owner()) else None)
             self.fullScreenRequested.connect(lambda req: req.reject())
-            self.windowCloseRequested.connect(lambda: None if self.retired else owner._close_tab(self))
+            self.windowCloseRequested.connect(lambda: o._close_tab(self) if (o := self._live_owner()) else None)
             self.renderProcessTerminated.connect(
-                lambda status, code: None if self.retired else owner._page_crashed(self, status))
-            self.authenticationRequired.connect(lambda _url, _auth: owner._show_notice(
-                "The page asked for a user name and password — cancelled (download sites never need one)."))
+                lambda status, code: o._page_crashed(self, status) if (o := self._live_owner()) else None)
+            self.authenticationRequired.connect(lambda _url, _auth: o._show_notice(
+                "The page asked for a user name and password — cancelled (download sites never need one).")
+                if (o := self._live_owner()) else None)
             self.proxyAuthenticationRequired.connect(lambda *_a: None)
             for name in ("fileSystemAccessRequested", "registerProtocolHandlerRequested"):
                 sig = getattr(self, name, None)
                 if sig is not None:
                     sig.connect(lambda req: req.reject())
 
+        def _live_owner(self, allow_closing: bool = False):
+            import shiboken6
+            o = self.owner
+            if self.retired or (self.closing and not allow_closing) or o is None:
+                return None
+            if not shiboken6.isValid(o) or getattr(o, "disposed", False):
+                return None
+            return o
+
         # --- page dialogs: shown in the notice bar, never modal
         def javaScriptAlert(self, origin, message):
-            if not self.retired:
-                self.owner._page_message(self, message)
+            if (o := self._live_owner()) is not None:
+                o._page_message(self, message)
 
         def javaScriptConfirm(self, origin, message):
-            if not self.retired:
-                self.owner._page_message(self, message, asked=True)
+            if (o := self._live_owner()) is not None:
+                o._page_message(self, message, asked=True)
             return False
 
         def javaScriptPrompt(self, origin, message, default):
-            if not self.retired:
-                self.owner._page_message(self, message, asked=True)
+            if (o := self._live_owner()) is not None:
+                o._page_message(self, message, asked=True)
             return False, ""
 
         def javaScriptConsoleMessage(self, level, message, line, source):
-            if self.retired:
+            o = self._live_owner()
+            if o is None:
                 return
             if message.startswith("__ezgd_click__ "):
-                self.owner._clicked(message[len("__ezgd_click__ "):])
+                o._clicked(message[len("__ezgd_click__ "):])
             elif message.startswith("__ezgd_cosm__ "):
-                self.owner._cosmetic(self, message[len("__ezgd_cosm__ "):])
+                o._cosmetic(self, message[len("__ezgd_cosm__ "):])
             # page console output is not logged
 
         def acceptNavigationRequest(self, url, nav_type, is_main_frame):
             if self.retired:
-                return False                     # a closed tab goes nowhere (and starts no download) any more
+                return url.toString() == "about:blank"   # allow blanking on retire; block every real navigation
+            o = self._live_owner(allow_closing=True)
+            if o is None:
+                return False
             if is_main_frame:
-                verdict = self.owner._navigation(self, url, nav_type)
+                verdict = o._navigation(self, url, nav_type)
                 if verdict is not None:
-                    self.owner._show_notice(verdict)
+                    if not self.closing:
+                        o._show_notice(verdict)
                     return False
-                self.owner._prepare_cosmetics(self, url)
+                if not self.closing:
+                    o._prepare_cosmetics(self, url)
             return super().acceptNavigationRequest(url, nav_type, is_main_frame)
 
 
@@ -743,6 +767,7 @@ class BrowserDownloadDialog(OwnAppId, QDialog):
         self.stack = QStackedWidget(self)
         self._views: dict = {}
         self._closed: list = []                       # tabs left with Back: kept until the window goes
+        self._closing: list = []                      # tabs hidden by window.close(): kept until the window goes
         self.page = _Page(profile(), self)
         _PAGES.add(self.page)
         install_gl_guard(self.page)
@@ -758,17 +783,21 @@ class BrowserDownloadDialog(OwnAppId, QDialog):
 
     @property
     def current(self):
-        return self.view.page()
+        v = self.view
+        return v.page() if v is not None else self.page
 
     def _attach(self, page):
+        import shiboken6
         v = QWebEngineView(self.stack)
         install_gl_guard(v)
         v.setPage(page)
         if self.zoom != 1.0:
             v.setZoomFactor(self.zoom)
         for sig in (page.loadStarted, page.loadFinished):
-            sig.connect(lambda *_a, page=page: self._page_loading(page))
-        v.urlChanged.connect(lambda u, v=v: self.address.setText(u.toString()) if v is self.stack.currentWidget()
+            sig.connect(lambda *_a, page=page: self._page_loading(page)
+                        if shiboken6.isValid(self) and not self.disposed else None)
+        v.urlChanged.connect(lambda u, v=v: self.address.setText(u.toString())
+                             if shiboken6.isValid(self) and not self.disposed and v is self.stack.currentWidget()
                              else None)
         self.stack.addWidget(v)
         self._views[page] = v
@@ -779,14 +808,17 @@ class BrowserDownloadDialog(OwnAppId, QDialog):
         self.stack.setCurrentWidget(v)
         self.address.setText(page.url().toString())
 
-    def _drop(self, page, stop: bool = True) -> None:
-        """Close a tab and its view: out of the window now, deleted together a little later (never detached from
-        each other first; see _retire)."""
+    def _detach_view(self, page) -> None:
         v = self._views.pop(page, None)
         if v is not None:
             self.stack.removeWidget(v)
             v.hide()
-        _retire(page, v, stop)
+            v.deleteLater()
+
+    def _drop(self, page, stop: bool = True) -> None:
+        """Close a tab and its view: delete the view first, then retire the page into _RETIRED."""
+        self._detach_view(page)
+        _retire(page, stop=stop)
 
     def _clicked(self, href: str) -> None:
         self._last_click = (href, time.monotonic())
@@ -835,7 +867,7 @@ class BrowserDownloadDialog(OwnAppId, QDialog):
             tab.probation = (self._gesture()[0], time.monotonic() + PROBATION_SECONDS)
             req.openIn(tab)
             self._pending.append(tab)
-            QTimer.singleShot(int(PROBATION_SECONDS * 1000) + 200, lambda t=tab: self._expire_probation(t))
+            QTimer.singleShot(int(PROBATION_SECONDS * 1000) + 200, self, lambda t=tab: self._expire_probation(t))
             return
         wanted, why = self._acceptable(url, opener, req.isUserInitiated())
         if wanted:
@@ -884,13 +916,13 @@ class BrowserDownloadDialog(OwnAppId, QDialog):
             self._last_click = (href, time.monotonic()) if time.monotonic() <= deadline else ("", 0.0)
             ok, why = self._acceptable(url, self.current.url(), True)
             if not ok:
-                QTimer.singleShot(0, lambda: _retire(page))
+                QTimer.singleShot(0, self, lambda p=page: _retire(p))
                 self._popups_blocked += 1
                 log.info("blocked pop-up to %s (%s)", url.toString()[:200], why)
                 return f"Blocked a pop-up to {_site(_host(url))} — {why}."
             self.allowed_sites.add(_site(_host(url)))
             ADBLOCK.add_allowed(_site(_host(url)))
-            QTimer.singleShot(0, lambda: self._show_tab(page, url))
+            QTimer.singleShot(0, self, lambda p=page, u=url: None if self.disposed else self._show_tab(p, u))
             return None
         if not ADBLOCK.enabled:
             return None
@@ -958,18 +990,26 @@ class BrowserDownloadDialog(OwnAppId, QDialog):
                           (" — answered No (pages cannot open message boxes here)." if asked else ""))
 
     def _close_tab(self, page) -> None:
-        """window.close() from a page: drop that tab (the first page stays). Not stopped: a page that sends itself
-        to a file and closes still gets its download."""
+        """window.close() from a page: drop that tab (the first page stays). Not stopped or freed on a timer: a page
+        that sends itself to a slow file host (>5 s) and closes still gets its download without freeing the page."""
         if page in self._pending:
             self._pending.remove(page)
-            _retire(page, stop=False)
+            page.closing = True
+            if page not in self._closing:
+                self._closing.append(page)
             return
         if page in self.tabs and len(self.tabs) > 1:
             showing = self.current is page
             self.tabs.remove(page)
             if showing:
                 self._switch_to(self.tabs[-1])
-            self._drop(page, stop=False)
+            v = self._views.get(page)
+            if v is not None:
+                self.stack.removeWidget(v)
+                v.hide()
+            page.closing = True
+            if page not in self._closing:
+                self._closing.append(page)
 
     def _page_crashed(self, page, status) -> None:
         if status == QWebEnginePage.NormalTerminationStatus:
@@ -1087,6 +1127,7 @@ class BrowserDownloadDialog(OwnAppId, QDialog):
         open_url(self.current.url().toString() or self.start_url)
         self.actions.toasts.show("Opened in your browser", "When the file has downloaded, use “Import downloaded "
                                  "file…” on the game page.", "info")
+        self.close()
 
     def _show_notice(self, text: str, action: str | None = None, fn=None) -> None:
         self.notice.set_text(text, "warning")
@@ -1111,23 +1152,26 @@ class BrowserDownloadDialog(OwnAppId, QDialog):
             else:
                 self.actions.toasts.show("Download started", f"{d.name} — see the Downloads page.", "success")
             # hidden, not destroyed: the page stays alive until its downloads are done
-            QTimer.singleShot(600, self.hide)
+            QTimer.singleShot(600, self, self.hide)
 
     def downloads_settled(self) -> None:
         if not self.isVisible():
             self._dispose()
 
     def _dispose(self) -> None:
-        """Closed for good: every tab is retired now, the window deleted after them (its pages are its children)."""
+        """Closed for good: detach and delete views first, retire every tab into _RETIRED, then delete the dialog."""
         if self.disposed:
             return
         self.disposed = True
         self._watch.stop()
         self._shield_timer.stop()
-        for tab in self.tabs + self._pending + self._closed:
-            _retire(tab, self._views.get(tab))
-        self._pending, self._closed = [], []
-        QTimer.singleShot(int(RETIRE_SECONDS * 1000) + 500, self, self.deleteLater)
+        tabs = list(dict.fromkeys(self.tabs + self._pending + self._closed + self._closing))
+        for tab in list(self._views):
+            self._detach_view(tab)
+        for tab in tabs:
+            _retire(tab)
+        self._pending, self._closed, self._closing = [], [], []
+        QTimer.singleShot(500, self, self.deleteLater)
 
     def hideEvent(self, ev) -> None:
         super().hideEvent(ev)
@@ -1190,30 +1234,36 @@ def active_count() -> int:
 
 
 def _retire(page, view=None, stop: bool = True) -> None:
-    """Take a tab out of use now, and delete it (with its view) a few seconds later — never at once.
+    """Take a tab out of use now: delete any view first, stop and blank the page, and keep the page object alive in
+    _RETIRED rather than freeing it on a short timer.
 
-    Qt WebEngine (6.12) hands a new download over in a posted event that holds a bare pointer to the page it came
-    from. A page deleted in between — its window closed, or hidden with its downloads done, a pop-up thrown away —
-    turned that into a call through freed memory: SIGSEGV in QWebEngineProfilePrivate::downloadRequested, inside
-    whatever event loop ran (the game page's exec(): EZGD-SEGV-F117EA, 2026-11-15; the same crash made
-    test_the_game_page_has_the_focus_when_the_browser_hides_after_a_download fail now and then, and a page that keeps
-    starting downloads crashed 10 times in 10 when its window was disposed). A retired page goes nowhere any more and
-    opens nothing; stopped, a navigation still waiting for its host becomes no download. Its window waits for it."""
+    Qt WebEngine (6.12) hands a new download over in a posted C++ event that holds a bare pointer to the page it came
+    from. Deleting a page on a 5 s timer still raced slow file hosts or delayed Chromium callbacks, turning into a call
+    through freed memory: SIGSEGV in QWebEngineProfilePrivate::downloadRequested inside GameDetailsDialog.exec()
+    (EZGD-SEGV-F117EA). Keeping retired pages parked on about:blank in _RETIRED until shutdown (or eviction past
+    MAX_RETIRED_PAGES) guarantees no queued C++ callback ever dereferences a freed QWebEnginePage."""
     import shiboken6
+    if view is not None and shiboken6.isValid(view):
+        view.hide()
+        view.deleteLater()
     if page is None or not shiboken6.isValid(page) or getattr(page, "retired", True):
         return
     page.retired = True
+    page.closing = True
+    page.owner = None
     if stop:
         try:
             page.triggerAction(QWebEnginePage.Stop)
+            page.scripts().clear()
+            page.setUrl(QUrl("about:blank"))
         except RuntimeError:
             pass
-
-    def delete() -> None:
-        for obj in (page, view):
-            if obj is not None and shiboken6.isValid(obj):
-                obj.deleteLater()
-    QTimer.singleShot(int(RETIRE_SECONDS * 1000), delete)
+    _RETIRED.append(page)
+    while len(_RETIRED) > MAX_RETIRED_PAGES:
+        old = _RETIRED.popleft()
+        _LIVE_PAGES.discard(old)
+        if shiboken6.isValid(old):
+            old.deleteLater()
 
 
 def _release_gl() -> None:
@@ -1239,12 +1289,16 @@ def shutdown() -> None:
     if _MANAGER is not None:
         _MANAGER.cancel_all()
         _MANAGER = None
+    _RETIRED.clear()
+    pages = list(_LIVE_PAGES) + [p for p in (_PAGES or ()) if p not in _LIVE_PAGES]
+    _LIVE_PAGES.clear()
     _release_gl()
-    for page in list(_PAGES or ()):
+    for page in pages:
         if shiboken6.isValid(page):
             view = QWebEngineView.forPage(page)
             if view is not None and shiboken6.isValid(view):
-                view.setPage(None)
+                shiboken6.delete(view)
+                _release_gl()
             shiboken6.delete(page)
             _release_gl()
     if shiboken6.isValid(_PROFILE):

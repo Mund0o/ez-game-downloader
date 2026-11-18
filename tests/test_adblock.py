@@ -99,3 +99,32 @@ def test_filter_engine_is_built_only_when_the_browser_needs_it(monkeypatch):
     assert not built and filterlists._ENGINE is None
     assert filterlists.engine() is not None and built == [1]      # the browser's first request builds it
     assert filterlists.info()["rules"] == info["rules"]
+
+
+def test_filter_engine_warm_up_never_blocks_gui_main_thread(monkeypatch):
+    """Opening the browser spawns warm_up() on a worker thread; the main thread's first navigation must not block
+    waiting on _LOCK while the 150k-rule engine compiles (preventing the 1.1 s Wayland UI stall)."""
+    import threading
+    import time
+    from ezgd.net import filterlists
+    monkeypatch.setattr(filterlists, "_ENGINE", None)
+    started = threading.Event()
+    release = threading.Event()
+    fake_eng = object()
+
+    def slow_build():
+        started.set()
+        release.wait(timeout=5.0)
+        return fake_eng, {"available": True, "rules": 42, "lists": {}}
+
+    monkeypatch.setattr(filterlists, "build_engine", slow_build)
+    worker = threading.Thread(target=filterlists.warm_up, daemon=True)
+    worker.start()
+    assert started.wait(timeout=2.0)
+    t0 = time.monotonic()
+    assert filterlists.engine() is None
+    assert filterlists.cosmetic("https://example.com/") == ([], set(), True)
+    assert time.monotonic() - t0 < 0.05
+    release.set()
+    worker.join(timeout=2.0)
+    assert filterlists.engine() is fake_eng

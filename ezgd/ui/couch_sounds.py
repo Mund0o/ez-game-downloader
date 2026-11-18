@@ -146,12 +146,22 @@ class CouchSounds(QObject):
         self._voices: dict[str, list] = {}   # (fallback) QSoundEffect players per sound
         self._next: dict[str, int] = {}
         self._stopped = False
+        self._opener = None
         mm = _multimedia()
         if mm is None:
             return
         from PySide6.QtCore import QTimer                # (opening a stream takes ~70 ms: not while couch opens)
-        QTimer.singleShot(200, self, lambda: None if self._stopped else
-                          (self._open_stream(mm) or self._open_effects(mm)))
+        self._opener = QTimer(self)
+        self._opener.setSingleShot(True)
+        self._opener.timeout.connect(lambda: None if self._stopped else
+                                     (self._open_stream(mm) or self._open_effects(mm)))
+        self._opener.start(200)
+
+    def defer(self, ms: int) -> None:
+        """Open the audio stream ``ms`` from now instead (not yet open): the quick menu over a desktop-started game
+        slides in during the first quarter second, and opening the stream then held up its frames."""
+        if self._opener is not None and self._opener.isActive():
+            self._opener.start(ms)
 
     def _open_stream(self, mm) -> bool:
         try:

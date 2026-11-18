@@ -66,6 +66,7 @@ _CHECK_PATH = re.compile(r"^https://www\.google\.com/recaptcha/", re.I)
 
 _LOCK = threading.Lock()
 _ENGINE = None                              # adblock.Engine, replaced as a whole when lists change
+_WARMING = False                            # True while warm_up() is compiling on a background thread
 _INFO: dict = {}
 _DATA_DIR: Path | None = None
 
@@ -136,6 +137,8 @@ def build_engine():
 def engine():
     global _ENGINE, _INFO
     if _ENGINE is None and AVAILABLE:
+        if _WARMING and threading.current_thread() is threading.main_thread():
+            return None                     # never stall the Wayland GUI thread for ~1 s while warm_up() compiles
         with _LOCK:
             if _ENGINE is None:
                 t = time.monotonic()
@@ -173,10 +176,14 @@ def info() -> dict:
 
 def warm_up() -> None:
     """Build the engine now (the in-app browser is opening; call from a worker thread)."""
+    global _WARMING
+    _WARMING = True
     try:
         engine()
     except Exception:
         log.exception("the filter lists could not be compiled")
+    finally:
+        _WARMING = False
 
 
 def _is_check(url: str) -> bool:

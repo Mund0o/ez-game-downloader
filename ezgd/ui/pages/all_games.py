@@ -34,7 +34,7 @@ class AllGamesPage(QWidget):
         self.enabled_sources: list[str] = list(theme.SOURCE_NAMES)
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(28, 24, 28, 12)
+        lay.setContentsMargins(28, 6, 28, 12)
         lay.setSpacing(12)
         head = QHBoxLayout()
         title_col = QVBoxLayout()

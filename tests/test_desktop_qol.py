@@ -173,3 +173,40 @@ def test_quitting_from_the_tray_ends_the_app(ui, qtbot, monkeypatch):  # noqa: F
     monkeypatch.setattr(QApplication.instance(), "quit", lambda: quits.append(1))
     win.force_quit()
     assert quits == [1]
+
+
+def test_blended_frameless_titlebar_and_resize_edges(ui, qtbot, monkeypatch):  # noqa: F811
+    """The desktop window uses its own blended frameless top bar (sidebar + page canvas run to y = 0), with caption
+    buttons, double-click maximize/restore, 8-edge/corner resize detection, and KWin keeping noBorder on restore."""
+    from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from ezgd.ui import window_control as wc
+    win, _core, _ = ui
+    assert bool(win.windowFlags() & Qt.FramelessWindowHint)
+    win.showNormal()
+    win.resize(1200, 800)
+    qtbot.wait(30)
+
+    rf = win._resize_filter
+    assert rf.edges_at(QPoint(2, 2)) == (Qt.TopEdge | Qt.LeftEdge)
+    assert rf.edges_at(QPoint(1198, 798)) == (Qt.BottomEdge | Qt.RightEdge)
+    assert rf.edges_at(QPoint(600, 2)) == Qt.TopEdge
+    assert rf.edges_at(QPoint(2, 400)) == Qt.LeftEdge
+    assert rf.edges_at(QPoint(600, 400)) == Qt.Edges(0)
+    # center of the close button is clickable (not swallowed by the 4px corner resize rim)
+    assert rf.edges_at(QPoint(1200 - 22, 16)) == Qt.Edges(0)
+
+    toggled = []
+    monkeypatch.setattr(win, "showMaximized", lambda: toggled.append("max"))
+    monkeypatch.setattr(win, "showNormal", lambda: toggled.append("norm"))
+    win.titlebar.mouseDoubleClickEvent(QMouseEvent(QEvent.MouseButtonDblClick, QPointF(100, 16), QPointF(100, 16),
+                                                   Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+    assert toggled == ["max"]
+    monkeypatch.setattr(win, "isMaximized", lambda: True)
+    win._sync_frame_state()
+    assert win._root_layout.contentsMargins().left() == 0 and rf.edges_at(QPoint(2, 2)) == Qt.Edges(0)
+    assert win.titlebar.max_btn.toolTip() == "Restore"
+    win.titlebar.max_btn.click()
+    assert toggled == ["max", "norm"]
+    assert "w.noBorder = true" in wc.DESKTOP_RESTORE_SCRIPT
+    monkeypatch.undo()

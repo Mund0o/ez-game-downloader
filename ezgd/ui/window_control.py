@@ -123,7 +123,7 @@ DESKTOP_RESTORE_SCRIPT = """
         var w = list[i];
         if (w.pid !== pid || String(w.caption) !== title) continue;
         if (w.fullScreen) w.fullScreen = false;
-        if (w.noBorder) w.noBorder = false;
+        if (!w.noBorder) w.noBorder = true;
         if (max) { w.setMaximize(true, true); continue; }
         if (w.maximizeMode !== undefined && w.maximizeMode !== 0) w.setMaximize(false, false);
         var a = area(w);
@@ -159,14 +159,7 @@ _guards: list[str] = []                 # the running guard_steam scripts (by na
 def release_steam_guard() -> None:
     """Call off guard_steam: a Steam window is wanted now (a friend's chat opened from the quick menu)."""
     names, _guards[:] = list(_guards), []
-    for name in names:
-        try:
-            from PySide6.QtDBus import QDBus, QDBusConnection, QDBusMessage
-            msg = QDBusMessage.createMethodCall("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "unloadScript")
-            msg.setArguments([name])
-            QDBusConnection.sessionBus().call(msg, QDBus.Block, 1500)
-        except Exception:
-            pass
+    _unload_scripts(names)
 
 
 def show_steam_window(hint: str = "", main: bool = False) -> bool:
@@ -208,6 +201,130 @@ def bring_game_forward(pids: list[int]) -> bool:
         return False
     import json
     return _run_kwin(GAME_SCRIPT % {"pids": json.dumps(sorted(int(p) for p in pids))}, "game")
+
+
+GAME_WATCH_SCRIPT = """
+(function () {
+    var pids = %(pids)s, token = %(token)d, best = null;
+    function send(state) { callDBus(%(svc)s, %(path)s, %(iface)s, "GameWindow", token, state); }
+    var list = workspace.windowList ? workspace.windowList() : workspace.clientList();
+    for (var i = 0; i < list.length; i++) {
+        var w = list[i];
+        if (pids.indexOf(w.pid) === -1 || !w.normalWindow) continue;
+        if (best === null || w.fullScreen || (w.width * w.height > best.width * best.height && !best.fullScreen))
+            best = w;
+    }
+    if (best === null) { send(-1); return; }
+    var game = best;
+    function now() { send(game.minimized ? 0 : 1); }
+    if (game.minimizedChanged !== undefined) game.minimizedChanged.connect(now);       // KWin 6
+    if (workspace.clientMinimized !== undefined) {                                     // KWin 5
+        workspace.clientMinimized.connect(function (w) { if (w === game) send(0); });
+        workspace.clientUnminimized.connect(function (w) { if (w === game) send(1); });
+    }
+    var removed = workspace.windowRemoved !== undefined ? workspace.windowRemoved : workspace.clientRemoved;
+    if (removed !== undefined) removed.connect(function (w) { if (w === game) send(0); });
+    now();
+})();
+"""
+
+WATCH_PATH = "/EzgdQuickMenuGame"
+WATCH_IFACE = "org.ezgd.QuickMenuGame"
+
+
+class GameWatch:
+    """A game's window watched by KWin while the quick menu is over it (``watch_game_window``); ``stop`` ends it."""
+
+    def __init__(self, token: int, names: list[str]):
+        self.token = token
+        self.names = names
+
+    def stop(self) -> None:
+        _reports_listeners.pop(self.token, None)
+        names = list(self.names)
+        self.names.clear()                      # (in place: _run_kwin's own unload, an hour later, finds nothing)
+        _unload_scripts(names)
+
+
+_reports_listeners: dict[int, object] = {}
+_reports_obj = None
+
+
+def _reports():
+    """The object KWin's watch scripts report to (on the session bus, at WATCH_PATH); None when it cannot be."""
+    global _reports_obj
+    if _reports_obj is not None:
+        return _reports_obj or None
+    try:
+        from PySide6.QtCore import ClassInfo, QObject, Slot
+        from PySide6.QtDBus import QDBusConnection
+
+        @ClassInfo({"D-Bus Interface": WATCH_IFACE})
+        class GameWindowReports(QObject):
+            @Slot(int, int)
+            def GameWindow(self, token: int, state: int) -> None:      # noqa: N802 (called by KWin's script)
+                fn = _reports_listeners.get(int(token))
+                if fn is not None:
+                    fn(int(token), int(state))
+        obj = GameWindowReports()
+        if not QDBusConnection.sessionBus().registerObject(WATCH_PATH, obj, QDBusConnection.ExportAllSlots):
+            log.info("quick menu: the game window watch could not be registered on D-Bus")
+            _reports_obj = False
+            return None
+        _reports_obj = obj
+        return obj
+    except Exception:
+        log.info("quick menu: no game window watch", exc_info=True)
+        _reports_obj = False
+        return None
+
+
+_kwin_seen = False
+
+
+def can_watch_windows() -> bool:
+    """KWin can tell the app when a game's window goes away (KDE Plasma; never from the tests). Once KWin has
+    answered it is not asked again (asking waits for D-Bus, and the quick menu asks as it opens)."""
+    global _kwin_seen
+    if os.environ.get("EZGD_HIDDEN", "1") == "0":
+        return False
+    if not _kwin_seen:
+        _kwin_seen = WindowControl._kwin_available()
+    return _kwin_seen
+
+
+def watch_game_window(pids: list[int], token: int, report) -> GameWatch | None:
+    """Until ``stop``: KWin reports the game's window — its biggest (or full-screen) window among ``pids`` — as
+    ``report(token, state)``: 1 shown, 0 minimized or gone, -1 no window of it found. Right away, then on every
+    change. (Some games minimize themselves the moment another window takes the focus: the quick menu then draws
+    the game's picture behind it instead of the desktop.) None without KWin."""
+    if not pids or not can_watch_windows():
+        return None
+    obj = _reports()
+    if obj is None:
+        return None
+    import json
+    from PySide6.QtDBus import QDBusConnection
+    _reports_listeners[int(token)] = report
+    names: list[str] = []
+    script = GAME_WATCH_SCRIPT % {"pids": json.dumps(sorted(int(p) for p in pids)), "token": int(token),
+                                  "svc": json.dumps(QDBusConnection.sessionBus().baseService()),
+                                  "path": json.dumps(WATCH_PATH), "iface": json.dumps(WATCH_IFACE)}
+    if not _run_kwin(script, "watch the game's window", keep_ms=60 * 60_000, names=names):
+        _reports_listeners.pop(int(token), None)
+        return None
+    return GameWatch(int(token), names)
+
+
+def _unload_scripts(names: list[str]) -> None:
+    for name in names:
+        try:
+            from PySide6.QtDBus import QDBus, QDBusConnection, QDBusMessage
+            msg = QDBusMessage.createMethodCall("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "unloadScript")
+            msg.setArguments([name])
+            QDBusConnection.sessionBus().call(msg, QDBus.Block, 1500)
+        except Exception:
+            pass
 
 
 def real_scale(screen, first=None) -> float:
@@ -337,14 +454,25 @@ class WindowControl:
             if handle is not None:
                 handle.setFlag(Qt.WindowStaysOnTopHint, on)
 
+    ACTIVATE = "if (workspace.activeWindow !== undefined) workspace.activeWindow = w; else workspace.activeClient = w;"
+
     def activate(self) -> None:
         """Bring the window to the front and give it the keyboard (also when Wayland would refuse the app)."""
         if self.kwin:
-            self._kwin("if (workspace.activeWindow !== undefined) workspace.activeWindow = w; "
-                       "else workspace.activeClient = w;")
+            self._kwin(self.ACTIVATE)
         else:
             self.widget.raise_()
             self.widget.activateWindow()
+
+    def keep_above_and_activate(self) -> None:
+        """``keep_above(True)`` and ``activate()`` as one request to KWin (one script instead of two: the quick menu
+        asks for both the moment it opens over a game, while the UI waits for KWin's answers)."""
+        if not self.kwin:
+            self.keep_above(True)
+            self.activate()
+            return
+        self._above = True
+        self._kwin("w.keepAbove = true; " + self.ACTIVATE)
 
     def place(self, x: int, y: int, w: int, h: int) -> None:
         """A borderless window at exactly this spot (Wayland apps cannot position their own windows)."""

@@ -64,6 +64,15 @@ def _draw(name: str, p: QPainter, c: str) -> None:
         p.setBrush(QColor(c)); p.drawPath(path)
     elif name == "close":
         p.drawLine(QPointF(6.5, 6.5), QPointF(17.5, 17.5)); p.drawLine(QPointF(17.5, 6.5), QPointF(6.5, 17.5))
+    elif name == "minimize":
+        p.drawLine(QPointF(6.5, 12.5), QPointF(17.5, 12.5))
+    elif name == "maximize":
+        p.drawRoundedRect(QRectF(6.5, 6.5, 11, 11), 1.8, 1.8)
+    elif name == "restore":
+        p.drawRoundedRect(QRectF(5.8, 8.7, 9.5, 9.5), 1.6, 1.6)
+        path = QPainterPath(QPointF(8.8, 8.7))
+        path.lineTo(8.8, 6.0); path.lineTo(18.0, 6.0); path.lineTo(18.0, 15.2); path.lineTo(15.3, 15.2)
+        p.drawPath(path)
     elif name == "retry":
         p.drawArc(QRectF(5, 5, 14, 14), 60 * 16, 290 * 16)
         path = QPainterPath(QPointF(15.5, 3.8)); path.lineTo(18.6, 6.6); path.lineTo(15, 8.6)

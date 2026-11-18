@@ -518,9 +518,25 @@ focused game's artwork fills the background, with its playtime, a big **Play** a
   steps aside while you play and comes back when the game ends ("Welcome back"). It never restarts Steam.
 * **Quit from the controller:** with *Our overlay* on, hold the PS / Xbox / Steam button while playing to open the
   quick menu; its *Quit* (press twice) stops the game completely, like the ✕. Only games the app runs are touched.
-* **The game behind the quick menu:** some games minimize themselves when another window takes the focus (Dark Souls III
-  in full screen), and the see-through menu showed the desktop. On KDE the screen is photographed (KWin, ~30 ms) just
-  before the menu opens and stays behind it; *Back to the game* brings the game itself to the front again.
+* **The game behind the quick menu** stays live — it goes on moving behind the see-through menu (until 0.6.15 a
+  picture of the screen, taken as the menu opened, lay over it: the game looked frozen while the menu was open). Some
+  games minimize themselves when another window takes the focus (Dark Souls III in full screen), which would leave the
+  desktop showing: on KDE, KWin tells the app when the game's window goes, and such a game gets its artwork behind
+  the menu the first time and, from then on, its picture (taken just before the menu opens — only for those games).
+  *Back to the game* brings the game itself to the front again.
+* **Keyboard and mouse in the quick menu:** arrows, Enter / Space, Esc / Backspace, Home / End, Page Up / Down,
+  Tab (wrapping through lists and every row of the game grid), `M` (mute / unmute the game), `/` or Ctrl+F (find a
+  friend), direct typing and Ctrl+V paste in chat and friend search (plus Ctrl+Backspace / Ctrl+U on the keyboard
+  popup); Shift+Tab opens it with the mouse pointer ready and closes it again, and the prompts and notes match the
+  keyboard. One notch of the mouse wheel moves once (high-resolution wheels send a notch in several parts, and it
+  moved 3–5 rows) — or steps the game's volume by 5 % over the volume slider, scrolls older chat messages while
+  keeping *Write a message* in view, and moves row by row in a multi-row game grid; the header's `←` and `✕`, the
+  bottom prompts, the draggable volume slider (snapping at 100 %) and speaker mute icon, the friend search's clear
+  `✕`, and scrollbars all work with the mouse; clicking the live game beside the panel goes straight back to the game
+  and a right click (or mouse Back button) steps back; a double click counts once (it quit a game without asking).
+  The key or button that closes the menu is let go before the game gets the focus back, so the game never sees a
+  fresh Esc or Enter. The panel slides in about three times as fast to draw, and moving the selection redraws only
+  the panel.
 * **Organise:** X (Manage) on a game: ★ favourite (favourites come first), hide it, and the Library's order.
 * **The ✕** (top right; B on the home shelf jumps to it): leaves couch mode and brings the normal window back. If a
   game you started from couch mode is still running it asks *Quit <game>?* first, then closes that game

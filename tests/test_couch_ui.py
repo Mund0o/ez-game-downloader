@@ -172,6 +172,7 @@ def test_library_shows_update_saves_and_storage(ui, qtbot, tmp_path, monkeypatch
     qtbot.waitUntil(lambda: page.list.count() == 1, timeout=5000)
     page.list.setCurrentRow(0)
     qtbot.waitUntil(lambda: bool(_buttons(page, "Update to 1.1")), timeout=5000)
+    _buttons(page, "Saves && Files")[0].click()
     qtbot.waitUntil(lambda: bool(_buttons(page, "Back up now")), timeout=5000)
     _buttons(page, "Back up now")[0].click()
     qtbot.waitUntil(lambda: bool(_buttons(page, "Restore…")), timeout=5000)

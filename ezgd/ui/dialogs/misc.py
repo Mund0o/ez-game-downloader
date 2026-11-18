@@ -206,9 +206,27 @@ class EventsDialog(QDialog):
         lay.addWidget(bb)
 
 
+def _open_host(target: str) -> bool:
+    """In a Linux PyInstaller bundle, launch xdg-open with the host's LD_LIBRARY_PATH so KDE/Qt helpers (kde-open,
+    kioclient) and system browsers never inherit the app's bundled Qt libraries and fail to start."""
+    import shutil
+    import subprocess
+    import sys
+    if sys.platform.startswith("linux") and getattr(sys, "frozen", False) and shutil.which("xdg-open"):
+        from ezgd.platform.hostenv import host_env
+        try:
+            subprocess.Popen(["xdg-open", target], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True, env=host_env())
+            return True
+        except OSError:
+            pass
+    return False
+
+
 def open_url(url: str) -> None:
     if url and url.startswith(("http://", "https://")):
-        QDesktopServices.openUrl(QUrl(url))
+        if not _open_host(url):
+            QDesktopServices.openUrl(QUrl(url))
 
 
 def open_folder(path: str | Path) -> None:
@@ -216,7 +234,8 @@ def open_folder(path: str | Path) -> None:
     if not p.is_dir():
         p = p.parent
     if p.exists():
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
+        if not _open_host(str(p)):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
 
 
 class NotificationsDialog(QDialog):

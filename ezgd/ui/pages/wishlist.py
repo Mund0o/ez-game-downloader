@@ -79,7 +79,7 @@ class WishlistPage(QWidget):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         body = QWidget()
         self.lay = QVBoxLayout(body)
-        self.lay.setContentsMargins(28, 24, 28, 28)
+        self.lay.setContentsMargins(28, 6, 28, 28)
         self.lay.setSpacing(14)
         scroll.setWidget(body)
         outer.addWidget(scroll)

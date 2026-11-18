@@ -11,6 +11,22 @@ Steam itself is not the app's and never shows up here.
 
 The menu is its own see-through window kept above the game by the compositor (see window_control), drawn with
 QPainter like couch mode, using couch mode's images, fonts and button prompts.
+
+Behind it the game goes on, live. (0.6.1 to 0.6.15 laid a picture of the game, taken as the menu opened, over the
+whole screen: the game looked frozen for as long as the menu was open — "it freezes the game, which feels weird",
+the user, 2026-11-05.) The picture is only for games that minimize themselves the moment the menu takes the focus
+(Dark Souls III in full screen), which would leave the desktop showing: KWin tells the app when the game's window
+goes (window_control.watch_game_window); such a game gets its artwork behind the menu the first time and its
+picture from then on.
+
+Keyboard and mouse: arrows, Enter / Space, Esc / Backspace, Home / End, Page Up / Down, Tab, M (mute), / or Ctrl+F
+(search friends), direct typing and Ctrl+V paste in chat and friend search; Shift+Tab opens and closes it (showing
+the mouse pointer right away). One notch of the mouse wheel moves once (wheel_steps) — or steps volume over the
+slider, scrolls chat history, and moves row by row in a multi-row game grid; the header's ← and ✕, the footer's
+prompts, the volume slider + mute icon, friend-search clear ✕, and scrollbars all work with the mouse; a click on
+the live game beside the panel returns to the game, and a right click (or Back mouse button) steps back. A key or
+button still held as the menu closes is let go before the game gets the focus back — KWin hands a newly focused
+window the keys being held, and the game then saw a fresh Esc (its own pause menu) or Enter.
 """
 
 from __future__ import annotations
@@ -23,20 +39,30 @@ from typing import Callable
 
 import shiboken6
 from PySide6.QtCore import QEasingCurve, QPointF, QRectF, Qt, QTimer, QVariantAnimation
-from PySide6.QtGui import QColor, QFontMetrics, QLinearGradient, QPainter, QPainterPath, QPen
+from PySide6.QtGui import (QBrush, QColor, QFontMetrics, QImage, QLinearGradient, QPainter, QPainterPath, QPen,
+                           QTransform)
 from PySide6.QtWidgets import QApplication, QWidget
 
 from ezgd.ui import theme
+from ezgd.ui.wheel_steps import WheelSteps
 from ezgd.ui.window_control import OwnAppId, WindowControl
 
 log = logging.getLogger(__name__)
 
 TITLE = "EZ Games — Quick menu"
 VOLUME_STEP = 10
+PAGE = 5                         # Page Up / Down (and a controller's triggers): rows at a time
 SPACEWAR = "480"                 # the app OnlineFix games sign in to Steam as (their invites are all "480")
+HIDE_GRACE = 1.0                 # a game known to minimize: its picture stays this long unless KWin says it did not
+RELEASE_WAIT = 1500              # ms the closing menu waits at most for the key / button that closed it to be let go
+
+# games seen minimizing themselves as the menu took the focus (this run): their picture is taken before it opens
+_MINIMIZERS: set[int] = set()
+_watch_n = 0
 
 
-ICONS = ("resume", "switch", "couch", "friends", "steamoverlay", "volume", "mangohud", "settings", "quit")
+ICONS = ("resume", "switch", "couch", "friends", "steamoverlay", "volume", "volume_low", "volume_muted",
+         "mangohud", "settings", "quit")
 
 
 def draw_icon(p: QPainter, key: str, r: QRectF, color: QColor, s: float) -> None:
@@ -75,7 +101,7 @@ def draw_icon(p: QPainter, key: str, r: QRectF, color: QColor, s: float) -> None
         p.setBrush(color)
         p.drawRoundedRect(QRectF(x + w * 0.38, y + h * 0.38, w * 0.6, h * 0.52), 3 * s, 3 * s)
         p.setBrush(Qt.NoBrush)
-    elif key == "volume":                                  # a speaker and two waves
+    elif key in ("volume", "volume_low", "volume_muted"):  # a speaker and waves (or ✕ when muted)
         path = QPainterPath()
         path.moveTo(x + w * 0.05, y + h * 0.36)
         path.lineTo(x + w * 0.25, y + h * 0.36)
@@ -87,8 +113,13 @@ def draw_icon(p: QPainter, key: str, r: QRectF, color: QColor, s: float) -> None
         p.setBrush(color)
         p.drawPath(path)
         p.setBrush(Qt.NoBrush)
-        p.drawArc(QRectF(x + w * 0.42, y + h * 0.3, w * 0.3, h * 0.4), -50 * 16, 100 * 16)
-        p.drawArc(QRectF(x + w * 0.42, y + h * 0.1, w * 0.56, h * 0.8), -50 * 16, 100 * 16)
+        if key == "volume_muted":
+            p.drawLine(x + w * 0.63, y + h * 0.34, x + w * 0.91, y + h * 0.66)
+            p.drawLine(x + w * 0.91, y + h * 0.34, x + w * 0.63, y + h * 0.66)
+        else:
+            p.drawArc(QRectF(x + w * 0.42, y + h * 0.3, w * 0.3, h * 0.4), -50 * 16, 100 * 16)
+            if key == "volume":
+                p.drawArc(QRectF(x + w * 0.42, y + h * 0.1, w * 0.56, h * 0.8), -50 * 16, 100 * 16)
     elif key == "mangohud":                                # a frame-time graph in a screen
         p.drawRoundedRect(QRectF(x + w * 0.04, y + h * 0.12, w * 0.92, h * 0.76), 3 * s, 3 * s)
         path = QPainterPath()
@@ -178,14 +209,37 @@ class QuickMenu(OwnAppId, QWidget):
         self.flash = ""                    # a short note at the bottom ("Invite sent")
         self._flash_until = 0.0
         self._row_top = 0                  # long lists: the first row shown
+        self._grid_top = 0                 # switch grid: the first row of tiles shown
+        self._chat_top: int | None = None  # chat history: first message shown (None = pinned to newest)
         self._confirm_quit = 0.0           # Quit pressed once: press again before this time
         self._hits: list[tuple[QRectF, str, int]] = []
+        self._hovered: tuple[str, int] | None = None
+        self._hint_actions: list[str] = []
+        self._saved_volume = 100           # volume before muting, restored when unmuted
+        self._vol_track: QRectF | None = None
+        self._dragging_vol = False
+        self._vol_inflight = False
+        self._vol_pending: int | None = None
+        self._scroll_geom: tuple[float, float, float, int, str] | None = None
+        self._dragging_scroll = False
         self._shown = 0.0                  # 0 → 1: sliding in (and back out when closing)
         self._wide = 0.0                   # 0 → 1: the panel widening for the game grid
         self._closing_then: Callable[[], None] | None = None
         self._pending_art = False
         self.opened_at = 0.0
-        self._still = None                 # the game's picture taken just before the menu opened (a QPixmap)
+        self._still = None                 # a game known to minimize: its picture, taken just before (a QPixmap)
+        self._expect_hidden = False        # … such a game: it is expected to go as the menu opens
+        self._watch = None                 # KWin watching the game's window (window_control.GameWatch)
+        self._watch_token = 0
+        self._game_report: int | None = None   # what KWin last said of it: 1 shown, 0 gone, -1 not found
+        self._wheel = WheelSteps()         # mouse wheel → one step per notch
+        self._keys_down: set[int] = set()  # keys pressed in the menu and not let go yet
+        self._buttons_down = False         # … a mouse button
+        self._release_wait = False         # closing: waiting for them before the game gets the focus back
+        self._shades: dict = {}            # one line of the backdrop's shade per (width, t)
+        self._layer: QImage | None = None  # sliding in / out: the panel drawn once, moved for every frame
+        self._layer_hits: list = []
+        self._layer_pending = False
         self._holding = False              # asking Steam to keep the game's controller layout (the menu opens next)
         self._layout_token = 0             # … what to hand back to Steam when the menu goes (see steaminput)
         self._anim = QVariantAnimation(self)
@@ -198,7 +252,7 @@ class QuickMenu(OwnAppId, QWidget):
         self._wide_anim.valueChanged.connect(self._wide_step)
         self._art = QTimer(self)                         # pictures still on their way: look again
         self._art.setInterval(120)
-        self._art.timeout.connect(lambda: self.update() if self._pending_art else None)
+        self._art.timeout.connect(self._art_tick)
         self._tick = QTimer(self)                        # the clock and the session time
         self._tick.setInterval(15_000)
         self._tick.timeout.connect(self._refresh)
@@ -211,7 +265,7 @@ class QuickMenu(OwnAppId, QWidget):
                                            and self.isVisible() else self._friends_tick.stop())
 
     # ================================================================= open / close
-    def open_for(self, game) -> None:
+    def open_for(self, game, by_key: bool = False) -> None:
         """Show the menu for ``game`` (a library entry the app is running; None when every game is suspended).
 
         Over a game, Steam is first asked to keep the game's controller layout while the menu is open (see
@@ -221,7 +275,7 @@ class QuickMenu(OwnAppId, QWidget):
         if self._holding:
             return                                       # (waiting for Steam: the same press reported twice)
         if self.isVisible() or game is None or game.id in self.couch.suspended:
-            self._open(game)
+            self._open(game, by_key=by_key)
             return
         self._holding = True
         b = self.couch.bridge
@@ -232,7 +286,7 @@ class QuickMenu(OwnAppId, QWidget):
                 return
             shown[0] = True
             self._holding = False
-            self._open(game)
+            self._open(game, by_key=by_key)
 
         def held(token) -> None:
             token = int(token or 0)
@@ -252,17 +306,25 @@ class QuickMenu(OwnAppId, QWidget):
         """Asked for, not shown yet (Steam is switching): the menu is on its way — its couch mode must stay."""
         return self._holding
 
-    def _open(self, game) -> None:
+    def _open(self, game, by_key: bool = False) -> None:
         self.game = game
         self.opened_at = time.monotonic()
         self.view = "main"
         self._wide = 0.0
+        self._wide_anim.stop()
+        self._release_wait = False                       # (opened again while it waited to close)
         self.busy = ""
         self._confirm_quit = 0.0
         self.volume = None
         self.session = None
         self.friend = None
         self._row_top = 0
+        self._grid_top = 0
+        self._chat_top = None
+        self._hovered = None
+        self._dragging_vol = False
+        self._dragging_scroll = False
+        self._vol_pending = None
         self._build()
         self.focus = self._first()
         self._refresh()
@@ -273,20 +335,29 @@ class QuickMenu(OwnAppId, QWidget):
             self._chat_tick.start()
         screen = self.couch._target_screen or self.couch.screen() or QApplication.primaryScreen()
         if not self.isVisible():
-            self._still = self._picture_of_game(screen) if game is not None else None
+            self._wheel.reset()
+            self._keys_down.clear()
+            self._buttons_down = False
+            self._release_wait = False
+            playing = game is not None and not self._suspended(game)
+            # the game stays live behind the menu; a game seen minimizing itself: its picture, taken now — before
+            # the menu takes the focus and it goes
+            self._expect_hidden = playing and game.id in _MINIMIZERS
+            self._still = self._picture_of_game(screen) if self._expect_hidden else None
+            self._game_report = None
+            self._watch_game(game if playing else None)
         if self.windowHandle() is None:
             self.create()
         if self.windowHandle() is not None and screen is not None:
             self.windowHandle().setScreen(screen)
         if screen is not None:
             self.setGeometry(screen.geometry())
-        self.pointer(False)                       # (opened by a guide button or Shift+Tab, never the mouse)
+        self.pointer(bool(by_key and not self.couch.pads.steam_as_keys()))   # Shift+Tab on keyboard: show pointer
         self.showFullScreen()
         self.couch.pads.hold_virtual(game is not None)    # the game's pad answers the menu alone (gamepad.py)
         self.raise_()
         self.activateWindow()
-        self.wc.keep_above(True)
-        self.wc.activate()
+        self.wc.keep_above_and_activate()
         QTimer.singleShot(250, self, self.wc.activate)    # Wayland: once more, after the game let go of the focus
         self._closing_then = None
         self._anim.stop()
@@ -299,10 +370,64 @@ class QuickMenu(OwnAppId, QWidget):
         self.couch.sounds.play("select")
         log.info("quick menu opened for %s", game.title if game else "the suspended games")
 
+    def _watch_game(self, game) -> None:
+        """KWin tells the menu when the game's window goes from behind it (``_game_window``) — for as long as the
+        menu is open. Nothing without KWin: the game is simply what is behind the menu."""
+        global _watch_n
+        self._stop_watch()
+        if game is None:
+            return
+        from ezgd.ui import window_control
+        if not window_control.can_watch_windows():
+            return
+        _watch_n += 1
+        token = self._watch_token = _watch_n
+        b = self.couch.bridge
+
+        def got(pids) -> None:
+            if token != self._watch_token or not shiboken6.isValid(self):
+                return                                   # (closed again meanwhile)
+            self._watch = window_control.watch_game_window(list(pids or []), token, self._game_window)
+        b.call(b.core.library_call("game_processes", game.id), got, lambda _e: None, owner=self)
+
+    def _stop_watch(self) -> None:
+        self._watch_token = 0
+        watch, self._watch = self._watch, None
+        if watch is not None:
+            watch.stop()
+
+    def _game_window(self, token: int, state: int) -> None:
+        """KWin about the game's window: 1 shown, 0 minimized (or gone), -1 none of its windows found."""
+        if token != self._watch_token or not shiboken6.isValid(self):
+            return
+        before = self._game_hidden()
+        self._game_report = state
+        g = self.game
+        if state == 0 and g is not None and g.id not in _MINIMIZERS:
+            _MINIMIZERS.add(g.id)
+            log.info("quick menu: %s minimized itself as the menu opened — its picture stays behind the menu "
+                     "from now on", g.title)
+        elif state == 1 and self._expect_hidden:
+            left = HIDE_GRACE - (time.monotonic() - self.opened_at)
+            if left > 0:                                 # (it may still go: look again when the grace is over)
+                QTimer.singleShot(int(left * 1000) + 20, self, self.update)
+        if self._game_hidden() != before:
+            self.update()
+
+    def _game_hidden(self) -> bool:
+        """The game's window is not behind the menu (it minimized itself): its picture, or its artwork, is drawn
+        there instead of the desktop."""
+        if self._game_report == 0:
+            return True
+        if self._expect_hidden:                          # seen minimizing before: hidden until KWin says it stayed
+            return not (self._game_report == 1 and time.monotonic() - self.opened_at >= HIDE_GRACE)
+        return False
+
     def _picture_of_game(self, screen):
         """The screen as it is right before the menu opens — the game. Some games minimize themselves the moment
         another window takes the focus (Dark Souls III in full screen): the see-through menu then showed the desktop
-        (a friend, 2026-10-23). The picture stays behind the menu instead. None: not possible here (not KDE)."""
+        (a friend, 2026-10-23). For such a game the picture stays behind the menu instead (only for them: over any
+        other game it hid the live game, which looked frozen). None: not possible here (not KDE)."""
         from PySide6.QtGui import QPixmap
         from ezgd.platform import hidden
         try:
@@ -323,6 +448,9 @@ class QuickMenu(OwnAppId, QWidget):
     # Steam gives the focused menu its desktop layout (keys) and the game its own back when it has the focus again.
     def hideEvent(self, event) -> None:
         self._still = None
+        self._stop_watch()
+        self._keys_down.clear()
+        self._buttons_down = False
         try:
             self.couch.pads.hold_virtual(False)           # the game reads its pad again
         except RuntimeError:
@@ -358,8 +486,28 @@ class QuickMenu(OwnAppId, QWidget):
         self._anim.start()
 
     def _anim_done(self) -> None:
+        self._layer = None                               # (slid in or out: drawn directly again)
         if self._shown > 0.01:
             return
+        if (self._keys_down or self._buttons_down) and self.isVisible() and self.isActiveWindow():
+            # the key (or button) that closed the menu is still down: the game gets the focus once it is let go —
+            # KWin hands a newly focused window the keys being held, and the game saw a fresh Esc or Enter
+            if not self._release_wait:
+                self._release_wait = True
+                QTimer.singleShot(RELEASE_WAIT, self, self._released)
+            return
+        self._finish_close()
+
+    def _released(self) -> None:
+        """Closing, and the keys / buttons are let go (or waited for long enough): now the menu goes."""
+        if not self._release_wait:
+            return
+        self._release_wait = False
+        if self._shown <= 0.01 and self.isVisible():
+            self._finish_close()
+
+    def _finish_close(self) -> None:
+        self._release_wait = False
         self._art.stop()
         self._tick.stop()
         self._friends_tick.stop()
@@ -374,11 +522,27 @@ class QuickMenu(OwnAppId, QWidget):
             except Exception:
                 log.exception("quick menu: the chosen action failed")
 
+    def _art_tick(self) -> None:
+        """Pictures still on their way: look again — the panel only (that is where they are), and for the first
+        15 s only: a game with no picture at all kept the menu redrawing the whole 4K screen 8 times a second for
+        as long as it was open. (A picture that comes later shows with the next change.)"""
+        if not self._pending_art or time.monotonic() - self.opened_at > 15:
+            return
+        if self._game_hidden() and self._still is None:
+            self.update()                                # (the game's artwork behind the menu)
+        else:
+            self._redraw()
+
+    def update(self, *args) -> None:
+        """The menu's content changed (every caller in here): a panel kept for sliding is drawn again."""
+        self._layer = None
+        super().update(*args)
+
     def _shown_step(self, v) -> None:
         self._shown = float(v)
         if self._shown <= 0.0 and self._closing_then is not None and self._anim.duration() == 0:
             QTimer.singleShot(0, self, self._anim_done)
-        self.update()
+        QWidget.update(self)                             # (a frame of the slide: the content is the same)
 
     def _wide_step(self, v) -> None:
         self._wide = float(v)
@@ -395,10 +559,18 @@ class QuickMenu(OwnAppId, QWidget):
                owner=self)
 
     def _got(self, what: str, value) -> None:
+        if what == "volume" and (self._dragging_vol or self._vol_inflight):
+            return
+        if what == "volume" and isinstance(value, int) and value > 0:
+            self._saved_volume = value
         setattr(self, what, value)
         if what == "volume":
             self._build()
         self.update()
+
+    def _key_mode(self) -> bool:
+        """Driven by a real keyboard / mouse (no controller prompts active)."""
+        return self.couch.pad_family == "" and not self.couch.pads.steam_as_keys()
 
     # ================================================================= model
     def _suspended(self, e) -> bool:
@@ -439,7 +611,8 @@ class QuickMenu(OwnAppId, QWidget):
             rows.append(Row("steamoverlay", "Steam overlay", "Steam's own over the game — its Steam button closes it",
                             action=self._steam_overlay))
             if self.volume is not None:
-                rows.append(Row("volume", "Game volume", "", "choice", f"{self.volume} %",
+                val = "Muted" if self.volume == 0 else f"{self.volume} %"
+                rows.append(Row("volume", "Game volume", "", "choice", val,
                                 action=lambda: self._step_volume(VOLUME_STEP),
                                 left=lambda: self._step_volume(-VOLUME_STEP),
                                 right=lambda: self._step_volume(VOLUME_STEP)))
@@ -544,7 +717,8 @@ class QuickMenu(OwnAppId, QWidget):
             name = self._name_of(c["accountid"])
             from ezgd.platform.steamfriends import to_steamid64
             url = steambridge.join_url(inv, to_steamid64(c["accountid"]))
-            out.append(Row(f"inv-{c['accountid']}", f"Join {name}", f"{name} invited you to play — A joins",
+            act = "Enter or click" if self._key_mode() else self.couch._pad_labels().get("a", "A")
+            out.append(Row(f"inv-{c['accountid']}", f"Join {name}", f"{name} invited you to play — {act} joins",
                            "primary", action=lambda u=url, n=name, a=inv["appid"]: self._join(u, n, a)))
         return out
 
@@ -587,6 +761,7 @@ class QuickMenu(OwnAppId, QWidget):
         self.view = "chat"
         self.chat_msgs = []
         self._row_top = 0
+        self._chat_top = None
         self._build()
         self.focus = len(self.rows) - 1
         self._load_history()
@@ -629,8 +804,9 @@ class QuickMenu(OwnAppId, QWidget):
                 rows.append(Row(f"join-{k}", "Join their game", "Steam joins you up", "primary",
                                 action=lambda u=url, n=f.get("name", ""), a=m["invite"]["appid"]:
                                 self._join(u, n, a)))
-        rows.append(Row("write", "Write a message", "The on-screen keyboard — Start sends it", "primary",
-                        action=self._write))
+        write_note = "Type a message — Enter sends it" if self._key_mode() else \
+            "The on-screen keyboard — Start sends it"
+        rows.append(Row("write", "Write a message", write_note, "primary", action=self._write))
         return rows
 
     def _write(self) -> None:
@@ -645,6 +821,7 @@ class QuickMenu(OwnAppId, QWidget):
         if not text or f is None:
             return
         b = self.couch.bridge
+        self._chat_top = None
         self.chat_msgs = self.chat_msgs + [{"mine": True, "time": int(time.time()), "text": text, "invite": None}]
         self._build()
         self.focus = len(self.rows) - 1
@@ -719,10 +896,12 @@ class QuickMenu(OwnAppId, QWidget):
         from ezgd.ui.couch_friends import matching, search_note
         found = matching(d.get("friends") or [], self.friend_query)
         if self.friend_query:
-            rows.append(Row("f-search", search_note(self.friend_query, len(found)), "A searches again · B shows "
-                            "everyone", action=self.find_friend))
+            s_note = "Enter searches again · Esc or ✕ shows everyone" if self._key_mode() else \
+                "A searches again · B shows everyone"
+            rows.append(Row("f-search", search_note(self.friend_query, len(found)), s_note, action=self.find_friend))
         elif d.get("friends"):
-            rows.append(Row("f-search", "Find a friend", "Search your friends by name", action=self.find_friend))
+            s_note = "Type a name or press / to search" if self._key_mode() else "Search your friends by name"
+            rows.append(Row("f-search", "Find a friend", s_note, action=self.find_friend))
         for k, f in enumerate(found):
             note = f.get("status") or ""
             c = self._chat_of(f) if self._bridged() else None
@@ -876,6 +1055,7 @@ class QuickMenu(OwnAppId, QWidget):
             return
         self.view = "switch"
         self.grid_focus = 0
+        self._grid_top = 0
         self._wide_anim.stop()
         self._wide_anim.setDuration(0 if self.couch.reduce_motion else 220)
         self._wide_anim.setStartValue(self._wide)
@@ -993,8 +1173,10 @@ class QuickMenu(OwnAppId, QWidget):
             else:
                 self.couch._come_back()
             if g is not None:
-                self.couch.toasts.show(f"{g.title} is suspended", "A on it continues it right where you were — or "
-                                       "hold the guide button.")
+                how = ("Enter or click on it continues it right where you were — or press Shift+Tab."
+                       if self._key_mode() else
+                       "A on it continues it right where you were — or hold the guide button.")
+                self.couch.toasts.show(f"{g.title} is suspended", how)
         self._then_suspend(lambda: self.close_menu(go))
 
     def game_settings(self) -> None:
@@ -1078,15 +1260,49 @@ class QuickMenu(OwnAppId, QWidget):
     def _step_volume(self, d: int) -> None:
         if self.game is None or self.volume is None:
             return
-        new = max(0, min(150, self.volume + d))
+        self._set_volume(self.volume + d, snap=False)
+
+    def _set_volume(self, value: int, snap: bool = False) -> None:
+        if self.game is None or self.volume is None:
+            return
+        new = max(0, min(150, int(round(value))))
+        if snap and abs(new - 100) <= 3:
+            new = 100
         if new == self.volume:
             return
+        if new > 0:
+            self._saved_volume = new
         self.volume = new
         self._build()
-        self.update()
+        self._redraw()
+        if self._vol_inflight:
+            self._vol_pending = new
+            return
+        self._send_volume(self.game.id, new)
+
+    def _send_volume(self, gid: int, val: int) -> None:
+        self._vol_inflight = True
         b = self.couch.bridge
-        b.call(b.core.library_call("set_game_volume", self.game.id, new), lambda _v: None, lambda _e: None,
-               owner=self)
+
+        def done(_v=None) -> None:
+            self._vol_inflight = False
+            nxt, self._vol_pending = self._vol_pending, None
+            if nxt is not None and self.game is not None and self.game.id == gid:
+                self._send_volume(gid, nxt)
+        b.call(b.core.library_call("set_game_volume", gid, val), done, lambda _e: done(), owner=self)
+
+    def _toggle_mute(self) -> None:
+        if self.game is None or self.volume is None:
+            return
+        self.couch.sounds.play("select")
+        self._set_volume(0 if self.volume > 0 else (self._saved_volume or 100), snap=False)
+
+    def _volume_from_x(self, x: float) -> None:
+        tr = self._vol_track
+        if tr is None or tr.width() <= 0:
+            return
+        t = max(0.0, min(1.0, (x - tr.left()) / tr.width()))
+        self._set_volume(round(t * 150), snap=True)
 
     # ================================================================= input
     def command(self, name: str) -> None:
@@ -1100,7 +1316,7 @@ class QuickMenu(OwnAppId, QWidget):
             self.keyboard.command(name)
             self.update()
             return
-        before = (self.view, self.focus, self.grid_focus)
+        before = (self.view, self.focus, self.grid_focus, self._chat_top)
         if self.view == "switch":
             self._grid_command(name)
         elif self.view == "friends" and name == "x":
@@ -1116,19 +1332,86 @@ class QuickMenu(OwnAppId, QWidget):
                 self.resume() if self.game is not None else self.close_menu()
         else:
             self._main_command(name)
-        if (self.view, self.focus, self.grid_focus) != before and name not in ("a", "b"):
+        if (self.view, self.focus, self.grid_focus, self._chat_top) != before and name not in ("a", "b"):
             self.couch.sounds.play("move")
-        self.update()
+        self._redraw()
+
+    def _redraw(self) -> None:
+        """Draw again what a press changed. Only the panel when nothing else moved: the game around it stays as it
+        is — a full frame repainted (and handed to the compositor) the whole 4K screen for every step."""
+        if self.keyboard is not None or self._shown < 1.0 or self._anim.state() == QVariantAnimation.Running or \
+                self._wide_anim.state() == QVariantAnimation.Running:
+            self.update()
+            return
+        r = self._panel_rect(1.0).toAlignedRect()
+        self.update(r.adjusted(-2, 0, 0, 0))
+
+    def _step_rows(self, d: int, count: int = 1) -> None:
+        """The selection ``count`` rows on (``d`` 1) or back (-1), over headings; as far as it goes."""
+        n, j = len(self.rows), self.focus
+        for _ in range(count):
+            k = j + d
+            while 0 <= k < n and not self.rows[k].focusable:
+                k += d
+            if not 0 <= k < n:
+                break
+            j = k
+        self.focus = j
+
+    def _chat_bounds(self, y: float | None = None, bottom: float | None = None) -> tuple[list[float], float, int]:
+        """(row heights, bottom y of the message area, earliest start index that still fits above Write)."""
+        s = self._s()
+        y = 184 * s if y is None else y
+        bottom = self.height() - 96 * s + 0.5 if bottom is None else bottom
+        heights = [self._row_height(row) for row in self.rows]
+        if len(self.rows) < 2 or self.rows[-1].key != "write" or y + sum(heights) - 10 * s <= bottom:
+            return heights, bottom, 0
+        wh = heights[-1] - 10 * s
+        msg_bottom = bottom - wh - 12 * s
+        mh = heights[:-1]
+        max_top = len(mh)
+        while max_top > 0 and y + sum(mh[max_top - 1:]) - 10 * s <= msg_bottom:
+            max_top -= 1
+        return heights, msg_bottom, min(max_top, max(0, len(mh) - 1))
+
+    def _scroll_chat(self, delta: int) -> bool:
+        """Scroll chat history by ``delta`` messages; True when the visible slice moved."""
+        _heights, _mb, max_top = self._chat_bounds()
+        if max_top <= 0:
+            self._chat_top = None
+            return False
+        cur = max_top if self._chat_top is None else min(self._chat_top, max_top)
+        new_top = max(0, min(max_top, cur + delta))
+        self._chat_top = None if new_top >= max_top else new_top
+        return new_top != cur
 
     def _main_command(self, name: str) -> None:
         n = len(self.rows)
+        if self.view == "chat":
+            if name in ("up", "down"):
+                prev = self.focus
+                self._step_rows(-1 if name == "up" else 1)
+                if self.focus == prev:
+                    self._scroll_chat(-1 if name == "up" else 1)
+                return
+            if name in ("lt", "rt"):
+                self._scroll_chat(-PAGE if name == "lt" else PAGE)
+                return
+            if name == "first":
+                self._scroll_chat(-10_000)
+                return
+            if name == "last" and n:
+                self._chat_top = None
+                self.focus = n - 1
+                return
         if name in ("up", "down"):
-            d = -1 if name == "up" else 1
-            j = self.focus + d
-            while 0 <= j < n and not self.rows[j].focusable:
-                j += d
-            if 0 <= j < n:
-                self.focus = j
+            self._step_rows(-1 if name == "up" else 1)
+        elif name in ("lt", "rt"):                       # Page Up / Down, a controller's triggers
+            self._step_rows(-1 if name == "lt" else 1, PAGE)
+        elif name in ("first", "last") and n:            # Home / End
+            ends = [k for k, r in enumerate(self.rows) if r.focusable]
+            if ends:
+                self.focus = ends[0] if name == "first" else ends[-1]
         elif name in ("left", "right") and 0 <= self.focus < n:
             fn = self.rows[self.focus].left if name == "left" else self.rows[self.focus].right
             if fn:
@@ -1155,20 +1438,31 @@ class QuickMenu(OwnAppId, QWidget):
             self.grid_focus = i + cols
         elif name == "down" and i // cols < (n - 1) // cols:
             self.grid_focus = n - 1
+        elif name in ("first", "last") and n:
+            self.grid_focus = 0 if name == "first" else n - 1
+        elif name in ("lt", "rt") and n:                 # a row up / down, as far as it goes
+            self.grid_focus = max(0, i - cols) if name == "lt" else min(n - 1, i + cols)
         elif name == "a" and 0 <= i < n:
             self.switch_to(self.grid[i])
         elif name == "b":
             self.close_switch()
 
+    KEYS = {Qt.Key_Up: "up", Qt.Key_Down: "down", Qt.Key_Left: "left", Qt.Key_Right: "right",
+            Qt.Key_Return: "a", Qt.Key_Enter: "a", Qt.Key_Space: "a", Qt.Key_Escape: "b", Qt.Key_Backspace: "b",
+            Qt.Key_Home: "first", Qt.Key_End: "last", Qt.Key_PageUp: "lt", Qt.Key_PageDown: "rt", Qt.Key_Back: "b"}
+
     def keyPressEvent(self, e) -> None:                       # noqa: N802
+        if e.spontaneous() and not e.isAutoRepeat():
+            self._keys_down.add(e.key())                 # (let go before the game gets the focus back)
         self.pointer(False)
         kb = self.keyboard
         steam = self.couch.key_action(e.key())          # (a Steam controller's buttons, sent as keys by Steam)
+        self._prompts_for_keys(e.key(), steam)
         if kb is not None:
             # the same typing as couch mode's keyboard: a Steam controller's A arrives as Enter, which finished
-            # (sent) the message at once, so nothing could be typed with it
-            from_pad = self.couch.pads.steam_as_keys() or not kb.typed
-            done = kb.key(e.key(), e.text(), steam, from_pad, e.isAutoRepeat())
+            # (sent) the message at once, so nothing could be typed with it; on a real keyboard Enter submits at once
+            from_pad = self.couch.pads.steam_as_keys() or (not kb.typed and bool(self.couch.pad_family))
+            done = kb.key(e.key(), e.text(), steam, from_pad, e.isAutoRepeat(), e.modifiers())
             if done == "a":
                 self.couch.sounds.play("select")
             elif done in ("up", "down", "left", "right"):
@@ -1178,81 +1472,325 @@ class QuickMenu(OwnAppId, QWidget):
         if e.key() == Qt.Key_Backtab and not e.isAutoRepeat():
             self.command("home")                         # Shift+Tab opened it from the game: it closes it too
             return
-        name = steam or {
-            Qt.Key_Up: "up", Qt.Key_Down: "down", Qt.Key_Left: "left", Qt.Key_Right: "right",
-            Qt.Key_Return: "a", Qt.Key_Enter: "a", Qt.Key_Space: "a", Qt.Key_Escape: "b",
-            Qt.Key_Backspace: "b"}.get(e.key())
-        if name is None and self.view == "friends" and e.text().strip() and e.text().isprintable():
-            self.find_friend()                           # a name typed on a real keyboard: the search
-            self.keyboard.typed = True
-            self.keyboard.type(e.text())
-            self.update()
-            return
-        if name and e.isAutoRepeat() and name not in ("up", "down", "left", "right"):
+        ctrl = bool(e.modifiers() & Qt.ControlModifier)
+        alt = bool(e.modifiers() & Qt.AltModifier)
+        if steam is None:
+            if e.key() == Qt.Key_Tab and not (ctrl or alt):
+                self._step_tab()
+                return
+            if self.view == "friends" and not alt and ((ctrl and e.key() == Qt.Key_F) or
+                                                       (not ctrl and e.key() == Qt.Key_Slash)):
+                self.find_friend()
+                self.keyboard.typed = True
+                self.update()
+                return
+            if self.view == "friends" and e.key() == Qt.Key_Delete and self.friend_query and not (ctrl or alt):
+                self._found("")
+                return
+            if self.view in ("friends", "chat") and ((ctrl and e.key() == Qt.Key_V) or
+                                                     (bool(e.modifiers() & Qt.ShiftModifier) and
+                                                      e.key() == Qt.Key_Insert)):
+                clip = QApplication.clipboard()
+                pasted = " ".join((clip.text() if clip is not None else "").splitlines())
+                if pasted:
+                    self.find_friend() if self.view == "friends" else self._write()
+                    self.keyboard.typed = True
+                    self.keyboard.type(pasted)
+                    self.update()
+                return
+            if self.view == "main" and e.key() == Qt.Key_M and not (ctrl or alt) and not e.isAutoRepeat() and \
+                    self.volume is not None:
+                self._toggle_mute()
+                return
+        name = steam or self.KEYS.get(e.key())
+        if name is None and not (ctrl or alt) and e.text().strip() and e.text().isprintable():
+            if self.view == "friends":
+                self.find_friend()                       # a name typed on a real keyboard: the search
+                self.keyboard.typed = True
+                self.keyboard.type(e.text())
+                self.update()
+                return
+            if self.view == "chat":
+                self._write()                            # a message typed on a real keyboard: straight into chat
+                self.keyboard.typed = True
+                self.keyboard.type(e.text())
+                self.update()
+                return
+        if name and e.isAutoRepeat() and name not in ("up", "down", "left", "right", "lt", "rt"):
             return                                       # a held button presses once (it sent 230 invites)
         if name:
             self.command(name)
 
+    def _step_tab(self) -> None:
+        """Tab cycles through every tile in Switch game and wraps around at the bottom of a list."""
+        if self.busy or (self._shown < 0.3 and self._closing_then is not None):
+            return
+        if self.view == "switch":
+            if len(self.grid) > 1:
+                self.grid_focus = (self.grid_focus + 1) % len(self.grid)
+                self.couch.sounds.play("move")
+                self._redraw()
+            return
+        focusable = [k for k, r in enumerate(self.rows) if r.focusable]
+        if len(focusable) > 1:
+            pos = next((i for i, k in enumerate(focusable) if k > self.focus), 0)
+            self.focus = focusable[pos]
+            self.couch.sounds.play("move")
+            self._redraw()
+
+    def _prompts_for_keys(self, key: int, steam: str | None) -> None:
+        """The button prompts follow what is used: a real keyboard's keys show Enter / Esc, a Steam controller sent
+        as keys its own buttons (as in couch mode). Enter, Esc and Backspace alone do not switch: Steam's desktop
+        layout sends them for the A / B of other controllers."""
+        c = self.couch
+        before = c.pad_family
+        if steam is not None:
+            c.pad_family = "steam"
+        elif c.pad_family and (key in self.KEYS or key in (Qt.Key_Tab, Qt.Key_Slash, Qt.Key_M, Qt.Key_Delete)) and \
+                key not in (Qt.Key_Escape, Qt.Key_Backspace, Qt.Key_Return, Qt.Key_Enter) and \
+                not c.pads.steam_as_keys():
+            c.pad_family = ""
+        if c.pad_family != before and self.view in ("main", "friends", "friend", "chat"):
+            self._build()
+
+    def keyReleaseEvent(self, e) -> None:                     # noqa: N802
+        if not e.isAutoRepeat():
+            self._keys_down.discard(e.key())
+            self._maybe_released()
+
+    def _maybe_released(self) -> None:
+        if self._release_wait and not self._keys_down and not self._buttons_down:
+            self._released()
+
+    def changeEvent(self, e) -> None:                         # noqa: N802
+        from PySide6.QtCore import QEvent
+        if e.type() == QEvent.ActivationChange and not self.isActiveWindow():
+            self._keys_down.clear()                      # (their release goes elsewhere now)
+            self._buttons_down = False
+            self._maybe_released()
+        super().changeEvent(e)
+
     def wheelEvent(self, e) -> None:                          # noqa: N802
         """A mouse wheel — and a Steam controller's left trackpad, a scroll wheel in Steam's desktop layout — moves
-        the selection."""
-        d = e.angleDelta().y() or e.angleDelta().x()
-        if not d:
+        the selection: once per notch (wheel_steps), however many parts the mouse sends a notch in."""
+        step = self._wheel.steps(e)
+        if not step or self.keyboard is not None:
             return
-        if self.view == "switch":                       # the grid: one game at a time, row after row
-            i = max(0, min(len(self.grid) - 1, self.grid_focus + (-1 if d > 0 else 1)))
+        if self.cursor().shape() == Qt.ArrowCursor:
+            h = self._hit_at(e.position())
+            if h and h[0] in ("vol_bar", "dec", "inc", "mute") and self.volume is not None:
+                self._set_volume(self.volume + (5 if step > 0 else -5), snap=False)
+                return
+        if self.view == "chat":
+            if self._scroll_chat(-step):
+                self.couch.sounds.play("move")
+                self._redraw()
+            return
+        if self.view == "switch":
+            n, cols = len(self.grid), self.GRID_COLS
+            if n > cols and self.cursor().shape() == Qt.ArrowCursor:
+                i = self.grid_focus
+                if step > 0 and i >= cols:
+                    i -= cols
+                elif step < 0 and i // cols < (n - 1) // cols:
+                    i = min(n - 1, i + cols)
+            else:
+                i = max(0, min(n - 1, self.grid_focus - step))
             if i != self.grid_focus:
                 self.grid_focus = i
                 self.couch.sounds.play("move")
-                self.update()
+                self._redraw()
         else:
-            self.command("up" if d > 0 else "down")
+            self.command("up" if step > 0 else "down")
 
-    def _hit_at(self, pos) -> tuple[str, int] | None:
+    def _hit_at(self, pos, kb_only: bool = False) -> tuple[str, int] | None:
         for r, kind, idx in reversed(self._hits):
+            if kb_only and kind not in ("key", "kb_close", "kb_panel"):
+                continue
             if r.contains(pos):
                 return kind, idx
         return None
 
     def mouseMoveEvent(self, e) -> None:                      # noqa: N802
         self.pointer(True)
-        h = self._hit_at(e.position())
-        if h is None:
+        pos = e.position()
+        if self.keyboard is not None:
+            h = self._hit_at(pos, kb_only=True)
+            moved = False
+            if h and h[0] == "key" and (self.keyboard.row, self.keyboard.col) != divmod(h[1], 100):
+                self.keyboard.hit(h[1], False)
+                self.couch.sounds.play("move")
+                moved = True
+            if h != self._hovered:
+                self._hovered = h
+                moved = True
+            if moved:
+                self.update()
             return
-        kind, idx = h
-        if kind == "row" and idx != self.focus and self.view in ("main", "friends", "friend", "chat", "confirm",
-                                                                 "starting"):
-            self.focus = idx
-            self.couch.sounds.play("move")
-            self.update()
-        elif kind == "tile" and idx != self.grid_focus and self.view == "switch":
-            self.grid_focus = idx
-            self.couch.sounds.play("move")
-            self.update()
+        if self._dragging_vol and e.buttons() & Qt.LeftButton:
+            self._volume_from_x(pos.x())
+            return
+        if self._dragging_scroll and e.buttons() & Qt.LeftButton:
+            self._scroll_from_y(pos.y())
+            return
+        h = self._hit_at(pos)
+        dirty = False
+        if h != self._hovered:
+            self._hovered = h
+            dirty = True
+        if h is not None:
+            kind, idx = h
+            if kind in ("row", "dec", "inc", "vol_bar", "mute", "clear") and idx != self.focus and \
+                    self.view in ("main", "friends", "friend", "chat", "confirm", "starting"):
+                self.focus = idx
+                self.couch.sounds.play("move")
+                dirty = True
+            elif kind == "tile" and idx != self.grid_focus and self.view == "switch":
+                self.grid_focus = idx
+                self.couch.sounds.play("move")
+                dirty = True
+        if dirty:
+            self._redraw()
+
+    def leaveEvent(self, e) -> None:                          # noqa: N802
+        if self._hovered is not None:
+            self._hovered = None
+            self._redraw()
+        super().leaveEvent(e)
 
     def mousePressEvent(self, e) -> None:                     # noqa: N802
-        if e.button() == Qt.RightButton or e.button() == Qt.BackButton:
+        self._buttons_down = True                        # (let go before the game gets the focus back)
+        if e.button() in (Qt.RightButton, Qt.BackButton):
+            if self.keyboard is not None and not self.couch.pads.steam_as_keys():
+                self.keyboard.cancel()
+                self.update()
+                return
             self.command("b")
             return
-        h = self._hit_at(e.position())
+        if e.button() != Qt.LeftButton:
+            return
+        pos = e.position()
+        if not self.couch.pads.steam_as_keys() and self.couch.pad_family:
+            self.couch.pad_family = ""
+            if self.view in ("main", "friends", "friend", "chat"):
+                self._build()
+        if self.keyboard is not None:
+            h = self._hit_at(pos, kb_only=True)
+            if h and h[0] == "key":
+                self.keyboard.typed = not self.couch.pads.steam_as_keys()
+                self.couch.sounds.play("select")
+                self.keyboard.hit(h[1], True)
+            elif h is None or h[0] == "kb_close":
+                self.keyboard.cancel()
+            self.update()
+            return
+        h = self._hit_at(pos)
         if h is None:
-            if self.view == "switch":
-                self.command("b")
-            elif e.position().x() < self.width() * 0.5:   # a click on the game: back to it
-                self.command("b")
+            if pos.x() < self._panel_rect(1.0).left():
+                # a click on the live game beside the panel: straight back to the game
+                self.resume() if self.game is not None else self.close_menu(self.couch._come_back)
             return
         kind, idx = h
-        if kind == "key" and self.keyboard is not None:
-            self.keyboard.hit(idx, True)
-            self.update()
+        if kind == "close":
+            self.resume() if self.game is not None else self.close_menu(self.couch._come_back)
+        elif kind == "back":
+            self.command("b")
+        elif kind == "hint":
+            self._activate_hint(idx)
+        elif kind == "vol_bar":
+            self.focus = idx
+            self._dragging_vol = True
+            self._volume_from_x(pos.x())
+        elif kind == "mute":
+            self.focus = idx
+            self._toggle_mute()
+        elif kind == "clear":
+            self.couch.sounds.play("select")
+            self._found("")
+        elif kind == "scrollbar":
+            self._dragging_scroll = True
+            self._scroll_from_y(pos.y())
         elif kind == "row":
             self.focus = idx
             self.command("a")
+            if self.keyboard is not None and not self.couch.pads.steam_as_keys():
+                self.keyboard.typed = True
+        elif kind in ("dec", "inc"):                     # the ◂ ▸ of a choice (the game's volume)
+            self.focus = idx
+            self.command("left" if kind == "dec" else "right")
         elif kind == "tile":
             self.grid_focus = idx
             self.command("a")
-        elif kind == "back":
-            self.command("b")
+
+    def _activate_hint(self, idx: int) -> None:
+        if not 0 <= idx < len(self._hint_actions):
+            return
+        act = self._hint_actions[idx]
+        if act in ("x", "/"):
+            self.couch.sounds.play("select")
+            self.find_friend()
+            if self.keyboard is not None and not self.couch.pads.steam_as_keys():
+                self.keyboard.typed = True
+            self.update()
+        elif act == "M":
+            self._toggle_mute()
+        elif act in ("a", "b", "start"):
+            self.command(act)
+
+    def _scroll_from_y(self, y: float) -> None:
+        geom = self._scroll_geom
+        if geom is None:
+            return
+        top_y, track_h, bh, max_top, mode = geom
+        if max_top <= 0:
+            return
+        frac = max(0.0, min(1.0, (y - top_y - bh / 2) / max(1.0, track_h - bh)))
+        new_top = round(frac * max_top)
+        if mode == "chat":
+            self._chat_top = None if new_top >= max_top else new_top
+        elif mode == "rows":
+            self._row_top = new_top
+            if self.focus < new_top:
+                nxt = next((k for k in range(new_top, len(self.rows)) if self.rows[k].focusable), None)
+                if nxt is not None:
+                    self.focus = nxt
+            else:
+                s = self._s()
+                bottom = self.height() - 96 * s + 0.5
+                heights = [self._row_height(r) for r in self.rows]
+                last = new_top
+                while last + 1 < len(self.rows) and sum(heights[new_top:last + 2]) <= bottom - top_y + 10 * s:
+                    last += 1
+                if self.focus > last:
+                    prv = next((k for k in range(last, new_top - 1, -1) if self.rows[k].focusable), None)
+                    if prv is not None:
+                        self.focus = prv
+        elif mode == "grid":
+            cols = self.GRID_COLS
+            self._grid_top = new_top
+            frow = self.grid_focus // cols
+            col = self.grid_focus % cols
+            if frow < new_top:
+                self.grid_focus = min(len(self.grid) - 1, new_top * cols + col)
+            else:
+                s = self._s()
+                tw = (self._content_rect(1.0).width() - 88 * s - 22 * s * (cols - 1)) / cols
+                vis = max(1, int(((self.height() - 100 * s) - top_y + 22 * s) // (tw * 1.5 + 22 * s)))
+                if frow >= new_top + vis:
+                    self.grid_focus = min(len(self.grid) - 1, (new_top + vis - 1) * cols + col)
+        self._redraw()
+
+    def mouseDoubleClickEvent(self, e) -> None:               # noqa: N802
+        """A double click is one click: its second press did the row's action again (Quit pressed twice — the game
+        quit without its question; a switch flipped on and back off)."""
+        self._buttons_down = True
+
+    def mouseReleaseEvent(self, e) -> None:                   # noqa: N802
+        if e.button() == Qt.LeftButton:
+            self._dragging_vol = False
+            self._dragging_scroll = False
+        self._buttons_down = bool(e.buttons())
+        self._maybe_released()
 
     # ================================================================= painting
     def _s(self) -> float:
@@ -1265,60 +1803,172 @@ class QuickMenu(OwnAppId, QWidget):
         p = QPainter(self)
         try:
             p.setRenderHint(QPainter.Antialiasing)
-            p.setRenderHint(QPainter.SmoothPixmapTransform)
             p.setRenderHint(QPainter.TextAntialiasing)
-            p.setCompositionMode(QPainter.CompositionMode_Source)
-            p.fillRect(self.rect(), Qt.transparent)
-            p.setCompositionMode(QPainter.CompositionMode_SourceOver)
-            if self._still is not None:                 # the game as it was (it may have minimized): from frame one
-                p.drawPixmap(self.rect(), self._still)
+            if self._game_hidden():                     # the game went (minimized itself): what stands in for it
+                self._paint_game_stand_in(p)
+                if t > 0.001:
+                    self._paint_backdrop(p, t, over=True)
+            elif t > 0.001:
+                self._paint_backdrop(p, t, over=False)  # (also clears what was drawn before)
+            else:
+                p.setCompositionMode(QPainter.CompositionMode_Source)
+                p.fillRect(self.rect(), Qt.transparent)
+                p.setCompositionMode(QPainter.CompositionMode_SourceOver)
             if t <= 0.001:
                 return
-            self._paint_backdrop(p, t)
-            self._paint_panel(p, t)
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            if self._sliding():
+                self._paint_slid(p, t)
+            else:
+                self._paint_panel(p, t)
         except Exception:
             log.exception("quick menu: drawing failed")
         finally:
             p.end()
 
-    def _panel_rect(self, t: float) -> QRectF:
+    def _sliding(self) -> bool:
+        return self._anim.state() == QVariantAnimation.Running and self.keyboard is None and \
+            self._wide_anim.state() != QVariantAnimation.Running
+
+    def _paint_slid(self, p: QPainter, t: float) -> None:
+        """A frame of the slide in or out: the panel, drawn once as it is at rest, moved into place (the whole panel
+        drawn again for every frame held the slide to ~35 frames a second on a 4K screen)."""
+        margin = 6 * self._s()                            # (the accent line's left half)
+        if self._layer is None:
+            rest = self._panel_rect(1.0)
+            dpr = self.devicePixelRatioF()
+            img = QImage(max(1, round((rest.width() + margin) * dpr)), max(1, round(self.height() * dpr)),
+                         QImage.Format_ARGB32_Premultiplied)
+            img.setDevicePixelRatio(dpr)
+            img.fill(Qt.transparent)
+            lp = QPainter(img)
+            lp.setRenderHint(QPainter.Antialiasing)
+            lp.setRenderHint(QPainter.TextAntialiasing)
+            lp.setRenderHint(QPainter.SmoothPixmapTransform)
+            lp.translate(margin - rest.left(), 0)
+            self._paint_panel(lp, 1.0)
+            lp.end()
+            self._layer = img
+            self._layer_hits = list(self._hits)           # (where things are once it is in place)
+            self._layer_pending = self._pending_art
+        self._hits = list(self._layer_hits)
+        self._pending_art = self._layer_pending
+        p.save()
+        p.setOpacity(min(1.0, t * 1.4))
+        p.drawImage(QPointF(self._panel_rect(t).left() - margin, 0), self._layer)
+        p.restore()
+
+    def _widths(self) -> tuple[float, float]:
+        """The panel's width over the game (narrow) and for the game grid (wide)."""
+        s, W = self._s(), self.width()
+        return min(620 * s, W * 0.44), min(1180 * s, W * 0.72)
+
+    def _slid(self, pw: float, t: float) -> QRectF:
         s, W, H = self._s(), self.width(), self.height()
-        narrow = min(620 * s, W * 0.44)
-        wide = min(1180 * s, W * 0.72)
-        pw = narrow + (wide - narrow) * self._wide
         x = W - pw * (0.35 + 0.65 * t) if t < 1 else W - pw
         return QRectF(x + (1 - t) * 60 * s, 0, pw, H)
 
-    def _paint_backdrop(self, p: QPainter, t: float) -> None:
-        W = self.width()
-        p.fillRect(self.rect(), QColor(4, 6, 12, int(120 * t)))          # the game stays visible behind
-        g = QLinearGradient(W * 0.25, 0, W, 0)
-        g.setColorAt(0.0, QColor(4, 6, 12, 0))
-        g.setColorAt(1.0, QColor(4, 6, 12, int(150 * t)))
-        p.fillRect(self.rect(), g)
+    def _panel_rect(self, t: float) -> QRectF:
+        narrow, wide = self._widths()
+        return self._slid(narrow + (wide - narrow) * self._wide, t)
+
+    def _content_rect(self, t: float) -> QRectF:
+        """Where the panel's content goes: laid out for the width the panel is heading for (the grid's, as it widens
+        for it), so nothing is laid out again, nor its pictures scaled again, for every frame of the widening."""
+        narrow, wide = self._widths()
+        return self._slid(wide if self.view == "switch" else narrow, t)
+
+    def _paint_game_stand_in(self, p: QPainter) -> None:
+        """Behind the menu when the game minimized itself: its picture from just before (a game seen doing it), or
+        its artwork (the first time), else the theme's dark background — never the desktop."""
+        p.setCompositionMode(QPainter.CompositionMode_Source)
+        g = self.game
+        if self._still is not None:
+            p.drawPixmap(self.rect(), self._still)
+        else:
+            url = self.couch.hero_url(g) if g is not None else None
+            img = self.couch.images.fill(url, self.width(), self.height()) if url else None
+            if img is not None:
+                p.drawImage(QRectF(self.rect()), img, QRectF(img.rect()))
+            else:
+                self._pending_art = bool(url)
+                p.fillRect(self.rect(), QColor(theme.CURRENT.bg0))
+        p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+
+    def _paint_backdrop(self, p: QPainter, t: float, over: bool) -> None:
+        """The game behind stays visible, darkened — more towards the panel. One pass over the screen (a pass over
+        a 4K screen costs milliseconds): the plain shade on the left quarter, and one line of the shade with its
+        gradient, made once, repeated down the rest. ``over`` False also replaces what the window showed before
+        (no clearing first)."""
+        W, H = self.width(), self.height()
+        gx = W * 0.25
+        p.save()
+        if not over:
+            p.setCompositionMode(QPainter.CompositionMode_Source)
+        p.fillRect(QRectF(0, 0, gx, H), QColor(4, 6, 12, int(120 * t)))
+        brush = QBrush(self._shade_line(t, gx))
+        brush.setTransform(QTransform.fromTranslate(gx, 0))
+        p.fillRect(QRectF(gx, 0, W - gx, H), brush)
+        p.restore()
+
+    def _shade_line(self, t: float, gx: float) -> QImage:
+        """One line of the shade from ``gx`` to the right edge, at the screen's real pixels (kept for the few
+        values of ``t`` an animation goes through)."""
+        dpr = self.devicePixelRatioF()
+        key = (round((self.width() - gx) * dpr), round(t * 100), dpr)
+        line = self._shades.get(key)
+        if line is None:
+            line = QImage(max(1, key[0]), 1, QImage.Format_ARGB32_Premultiplied)
+            line.fill(QColor(4, 6, 12, int(120 * t)))
+            lp = QPainter(line)
+            g = QLinearGradient(0, 0, line.width(), 0)          # (from a quarter of the screen to its edge)
+            g.setColorAt(0.0, QColor(4, 6, 12, 0))
+            g.setColorAt(1.0, QColor(4, 6, 12, int(150 * t)))
+            lp.fillRect(line.rect(), g)
+            lp.end()
+            line.setDevicePixelRatio(dpr)
+            if len(self._shades) > 40:
+                self._shades.clear()
+            self._shades[key] = line
+        return line
+
+    def _panel_back(self, panel: QRectF) -> QRectF:
+        """The panel's background on screen: from its left edge to the screen's right, top to bottom (its rounded
+        corners lie off-screen, so plain rectangles draw it — a rounded path over a third of a 4K screen, twice,
+        was the dearest part of every frame)."""
+        return QRectF(panel.left(), 0, max(0.0, self.width() - panel.left()), self.height())
 
     def _paint_panel(self, p: QPainter, t: float) -> None:
+        self._vol_track = None
+        self._scroll_geom = None
+        self._hint_actions = []
         s, H = self._s(), self.height()
         panel = self._panel_rect(t)
+        back = self._panel_back(panel)
         p.save()
         p.setOpacity(min(1.0, t * 1.4))
-        path = QPainterPath()
-        path.addRoundedRect(panel.adjusted(0, -40 * s, 40 * s, 40 * s), 34 * s, 34 * s)
         bg = QColor(theme.CURRENT.bg0)
         bg.setAlpha(242)
-        p.fillPath(path, bg)
+        p.fillRect(back, bg)
         glow = QLinearGradient(panel.left(), 0, panel.left() + 220 * s, 0)    # a soft accent light on its edge
         acc = QColor(theme.CURRENT.accent)
         acc.setAlpha(46)
         glow.setColorAt(0.0, acc)
         glow.setColorAt(1.0, QColor(0, 0, 0, 0))
-        p.fillPath(path, glow)
+        p.fillRect(QRectF(back.left(), 0, min(back.width(), 220 * s), H), glow)
         edge = QColor(theme.CURRENT.accent)
         edge.setAlpha(150)
         p.setPen(QPen(edge, 2 * s))
         p.drawLine(panel.left(), 30 * s, panel.left(), H - 30 * s)
         pad = 44 * s
-        inner = panel.adjusted(pad, 0, -pad, 0)
+        content = self._content_rect(t)
+        inner = content.adjusted(pad, 0, -pad, 0)
+        if self._wide_anim.state() == QVariantAnimation.Running:
+            # widening for the grid (or back): the content already where it ends up, shown as the panel uncovers
+            # it, fading in
+            p.setClipRect(back.adjusted(2 * s, 0, 0, 0), Qt.IntersectClip)
+            k = self._wide if self.view == "switch" else 1.0 - self._wide
+            p.setOpacity(p.opacity() * max(0.0, min(1.0, (k - 0.25) / 0.75)))
         y = self._paint_header(p, inner, 34 * s)
         if self.view == "switch":
             self._paint_switch(p, inner, y)
@@ -1358,14 +2008,50 @@ class QuickMenu(OwnAppId, QWidget):
         p.setPen(QColor("white"))
         p.drawText(QRectF(r.left() + fm.horizontalAdvance("EZ "), y, 200 * s, 30 * s), Qt.AlignLeft | Qt.AlignVCenter,
                    "GAMES")
+        cd = 30 * s
+        cr = QRectF(r.right() - cd, y, cd, cd)
+        hot_close = self._hovered == ("close", 0)
+        p.setPen(QPen(QColor(255, 255, 255, 220 if hot_close else 75), 1.4 * s))
+        p.setBrush(QColor(theme.CURRENT.danger) if hot_close else QColor(255, 255, 255, 22))
+        p.drawEllipse(cr)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor("white"), 2.2 * s, Qt.SolidLine, Qt.RoundCap))
+        xk = cd * 0.23
+        cc = cr.center()
+        p.drawLine(QPointF(cc.x() - xk, cc.y() - xk), QPointF(cc.x() + xk, cc.y() + xk))
+        p.drawLine(QPointF(cc.x() + xk, cc.y() - xk), QPointF(cc.x() - xk, cc.y() + xk))
+        self._hits.append((cr.adjusted(-6 * s, -6 * s, 6 * s, 6 * s), "close", 0))
         p.setFont(self.couch._font(20 * s, 700))
         p.setPen(QColor(255, 255, 255, 200))
-        p.drawText(QRectF(r.left(), y, r.width(), 30 * s), Qt.AlignRight | Qt.AlignVCenter, clock_text())
+        p.drawText(QRectF(r.left(), y, r.width() - cd - 14 * s, 30 * s), Qt.AlignRight | Qt.AlignVCenter, clock_text())
+        sec = {"switch": "SWITCH GAME", "confirm": "SWITCH GAME", "starting": "STARTING", "friends": "FRIENDS",
+               "friend": "FRIEND", "chat": "CHAT"}.get(self.view, "QUICK MENU")
+        sy = y + 38 * s
         p.setFont(self.couch._font(15 * s, 800))
-        p.setPen(QColor(255, 255, 255, 120))
-        p.drawText(QRectF(r.left(), y + 38 * s, r.width(), 22 * s), Qt.AlignLeft | Qt.AlignVCenter,
-                   {"switch": "SWITCH GAME", "confirm": "SWITCH GAME", "starting": "STARTING", "friends": "FRIENDS",
-                    "friend": "FRIENDS"}.get(self.view, "QUICK MENU"))
+        if self.view in ("switch", "confirm", "friends", "friend", "chat"):
+            hot_back = self._hovered == ("back", 0)
+            tw = QFontMetrics(p.font()).horizontalAdvance(sec)
+            br = QRectF(r.left() - 8 * s, sy - 3 * s, tw + 38 * s, 28 * s)
+            if hot_back:
+                bp = QPainterPath()
+                bp.addRoundedRect(br, 8 * s, 8 * s)
+                p.fillPath(bp, QColor(255, 255, 255, 32))
+            fg = QColor("white") if hot_back else QColor(255, 255, 255, 175)
+            p.setPen(QPen(fg, 2.0 * s, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            ax, ay = r.left() + 3 * s, sy + 11 * s
+            p.drawLine(QPointF(ax + 12 * s, ay), QPointF(ax, ay))
+            p.drawLine(QPointF(ax + 5 * s, ay - 4.5 * s), QPointF(ax, ay))
+            p.drawLine(QPointF(ax + 5 * s, ay + 4.5 * s), QPointF(ax, ay))
+            p.setPen(fg)
+            p.drawText(QRectF(r.left() + 22 * s, sy, r.width() - 22 * s, 22 * s), Qt.AlignLeft | Qt.AlignVCenter, sec)
+            self._hits.append((br.adjusted(-4 * s, -4 * s, 6 * s, 4 * s), "back", 0))
+        else:
+            p.setPen(QColor(255, 255, 255, 120))
+            p.drawText(QRectF(r.left(), sy, r.width(), 22 * s), Qt.AlignLeft | Qt.AlignVCenter, sec)
+            if self.view == "main" and self._key_mode():
+                p.setFont(self.couch._font(13 * s, 700))
+                p.setPen(QColor(255, 255, 255, 95))
+                p.drawText(QRectF(r.left(), sy, r.width(), 22 * s), Qt.AlignRight | Qt.AlignVCenter, "Shift+Tab")
         return y + 66 * s
 
     def _paint_target_text(self, p: QPainter, r: QRectF, y: float) -> None:
@@ -1397,7 +2083,7 @@ class QuickMenu(OwnAppId, QWidget):
                 g.id in self.couch.suspended else "It gets the screen as soon as it is up.")
         p.drawText(QRectF(r.left(), y + 50 * s, r.width(), 60 * s), Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap,
                    note)
-        QTimer.singleShot(60, self, self.update)
+        QTimer.singleShot(60, self, self._redraw)          # (the dots are in the panel: only it is drawn again)
 
     def _paint_now_playing(self, p: QPainter, r: QRectF, y: float, entry=None, height=None) -> float:
         s = self._s()
@@ -1492,13 +2178,56 @@ class QuickMenu(OwnAppId, QWidget):
 
     def _paint_rows(self, p: QPainter, r: QRectF, y: float) -> None:
         s = self._s()
+        y0 = y
         bottom = self.height() - 96 * s + 0.5              # (+ rounding)
-        # a list longer than the panel (friends): it starts at the row that keeps the focus in view
         heights = [self._row_height(row) for row in self.rows]
+        if getattr(self, "view", "main") == "chat" and len(self.rows) >= 2 and self.rows[-1].key == "write" and \
+                y + sum(heights) - 10 * s > bottom:
+            _h, msg_bottom, max_top = self._chat_bounds(y, bottom)
+            top = max_top if self._chat_top is None else max(0, min(self._chat_top, max_top))
+            if self.focus < len(self.rows) - 1:
+                if self.focus < top:
+                    top = self.focus
+                while top < self.focus and y + sum(heights[top:self.focus + 1]) - 10 * s > msg_bottom:
+                    top += 1
+            self._chat_top = None if top >= max_top else top
+            vis = 0
+            for k in range(top, len(self.rows) - 1):
+                row = self.rows[k]
+                h = heights[k] - 10 * s
+                if y + h > msg_bottom and vis > 0:
+                    break
+                vis += 1
+                if row.kind == "msg":
+                    self._bubble(p, row, QRectF(r.left(), y, r.width(), min(h, msg_bottom - y)))
+                elif row.kind == "header":
+                    p.setFont(self.couch._font(16 * s, 700))
+                    p.setPen(QColor(theme.CURRENT.accent).lighter(150) if row.extra.get("tip") else
+                             QColor(theme.CURRENT.warning))
+                    p.drawText(QRectF(r.left() + 4 * s, y + 4 * s, r.width(), 50 * s),
+                               Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap, row.label)
+                else:
+                    rect = QRectF(r.left(), y, r.width(), h)
+                    arrows = self._row(p, row, rect, k == self.focus)
+                    self._hits.append((rect, "row", k))
+                    for hr, kind in arrows or ():
+                        self._hits.append((hr, kind, k))
+                y += heights[k]
+            if max_top > 0:
+                self._draw_scrollbar(p, r.right() + 18 * s, y0, msg_bottom - y0, top, max_top, vis,
+                                     len(self.rows) - 1, "chat")
+            wh = heights[-1] - 10 * s
+            wrect = QRectF(r.left(), bottom - wh, r.width(), wh)
+            self._row(p, self.rows[-1], wrect, self.focus == len(self.rows) - 1)
+            self._hits.append((wrect, "row", len(self.rows) - 1))
+            return
+        # a list longer than the panel (friends): it starts at the row that keeps the focus in view
         top = min(getattr(self, "_row_top", 0), self.focus) if self.focus < len(self.rows) else 0
         while top < self.focus and y + sum(heights[top:self.focus + 1]) - 10 * s > bottom:
             top += 1
-        self._row_top = top if y + sum(heights) - 10 * s > bottom else 0
+        overflow = y + sum(heights) - 10 * s > bottom
+        self._row_top = top if overflow else 0
+        drawn = 0
         for k, row in enumerate(self.rows):
             if k < self._row_top:
                 continue
@@ -1508,6 +2237,7 @@ class QuickMenu(OwnAppId, QWidget):
                     break
                 self._bubble(p, row, QRectF(r.left(), y, r.width(), h))
                 y += h + 10 * s
+                drawn += 1
                 continue
             if row.kind == "header" and row.extra.get("note"):
                 p.setFont(self.couch._font(16 * s, 700))
@@ -1516,6 +2246,7 @@ class QuickMenu(OwnAppId, QWidget):
                 p.drawText(QRectF(r.left() + 4 * s, y + 4 * s, r.width(), 50 * s),
                            Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap, row.label)
                 y += self._row_height(row)
+                drawn += 1
                 continue
             if row.kind == "header":
                 nxt = self.rows[k + 1] if k + 1 < len(self.rows) else None
@@ -1526,17 +2257,51 @@ class QuickMenu(OwnAppId, QWidget):
                 p.drawText(QRectF(r.left() + 4 * s, y + 10 * s, r.width(), 28 * s), Qt.AlignLeft | Qt.AlignVCenter,
                            row.label.upper())
                 y += 44 * s
+                drawn += 1
                 continue
             h = self._row_height(row) - 10 * s
             if y + h > bottom:
                 break
             rect = QRectF(r.left(), y, r.width(), h)
-            self._row(p, row, rect, k == self.focus)
+            arrows = self._row(p, row, rect, k == self.focus)
             self._hits.append((rect, "row", k))
+            for hr, kind in arrows or ():              # (after the row: they are found first)
+                self._hits.append((hr, kind, k))
             y += h + 10 * s
+            drawn += 1
+        if overflow and hasattr(self, "_draw_scrollbar"):
+            max_top = len(self.rows)
+            while max_top > 0 and y0 + sum(heights[max_top - 1:]) - 10 * s <= bottom:
+                max_top -= 1
+            max_top = max(self._row_top, min(max_top, max(0, len(self.rows) - 1)))
+            if max_top > 0:
+                self._draw_scrollbar(p, r.right() + 18 * s, y0, bottom - y0, self._row_top, max_top, drawn,
+                                     len(self.rows), "rows")
 
-    def _row(self, p: QPainter, row: Row, r: QRectF, focused: bool) -> None:
+    def _draw_scrollbar(self, p: QPainter, x: float, top_y: float, track_h: float, cur_top: int, max_top: int,
+                        vis_n: int, total_n: int, mode: str) -> None:
         s = self._s()
+        if max_top <= 0 or track_h < 36 * s:
+            return
+        hot = getattr(self, "_dragging_scroll", False) or getattr(self, "_hovered", None) == ("scrollbar", 0)
+        bw = (8 if hot else 6) * s
+        bx = x - bw / 2
+        tp = QPainterPath()
+        tp.addRoundedRect(QRectF(bx, top_y, bw, track_h), bw / 2, bw / 2)
+        p.fillPath(tp, QColor(255, 255, 255, 34 if hot else 18))
+        frac = max(0.14, min(0.85, vis_n / max(1, total_n)))
+        bh = max(32 * s, track_h * frac)
+        by = top_y + (track_h - bh) * (min(cur_top, max_top) / max(1, max_top))
+        kp = QPainterPath()
+        kp.addRoundedRect(QRectF(bx, by, bw, bh), bw / 2, bw / 2)
+        p.fillPath(kp, QColor(255, 255, 255, 185 if hot else 95))
+        self._scroll_geom = (top_y, track_h, bh, max_top, mode)
+        self._hits.append((QRectF(x - 12 * s, top_y, 24 * s, track_h), "scrollbar", 0))
+
+    def _row(self, p: QPainter, row: Row, r: QRectF, focused: bool) -> list | None:
+        """One row; returns the click areas of a choice's ◂ ▸ (kind "dec" / "inc")."""
+        s = self._s()
+        arrows: list = []
         radius = 16 * s
         path = QPainterPath()
         path.addRoundedRect(r, radius, radius)
@@ -1558,6 +2323,7 @@ class QuickMenu(OwnAppId, QWidget):
         light = focused and kind_color is None
         fg = QColor(11, 13, 19) if light else QColor("white")
         sub = QColor(11, 13, 19, 165) if light else QColor(255, 255, 255, 150)
+        hot_sub = self._hovered[0] if focused and getattr(self, "_hovered", None) else None
         pad = 22 * s
         x = r.left() + pad
         if row.key in ICONS:
@@ -1565,8 +2331,14 @@ class QuickMenu(OwnAppId, QWidget):
             ir = QRectF(x - 4 * s, r.center().y() - d / 2, d, d)
             ip = QPainterPath()
             ip.addEllipse(ir)
-            p.fillPath(ip, QColor(0, 0, 0, 34) if light else QColor(255, 255, 255, 30 if kind_color is None else 44))
-            draw_icon(p, row.key, ir.adjusted(9 * s, 9 * s, -9 * s, -9 * s), fg, s)
+            hot_mute = row.key == "volume" and hot_sub == "mute"
+            p.fillPath(ip, QColor(0, 0, 0, 58 if hot_mute else 34) if light else
+                       QColor(255, 255, 255, 58 if hot_mute else (30 if kind_color is None else 44)))
+            ikey = ("volume_muted" if self.volume == 0 else "volume_low" if (self.volume or 0) < 60 else "volume") \
+                if row.key == "volume" else row.key
+            draw_icon(p, ikey, ir.adjusted(9 * s, 9 * s, -9 * s, -9 * s), fg, s)
+            if row.key == "volume" and self.volume is not None:
+                arrows.append((ir.adjusted(-4 * s, -4 * s, 4 * s, 4 * s), "mute"))
             x = ir.right() + 18 * s
         if row.kind == "friend":
             from ezgd.ui.couch_friends import paint_avatar
@@ -1604,22 +2376,88 @@ class QuickMenu(OwnAppId, QWidget):
             p.drawEllipse(QRectF(kx, track.top() + 4 * s, knob, knob))
             p.setBrush(Qt.NoBrush)
             right_w = tw + 12 * s
+        elif row.key == "f-search" and getattr(self, "friend_query", ""):
+            cd = 28 * s
+            cr = QRectF(r.right() - pad - cd, r.center().y() - cd / 2, cd, cd)
+            hot_clr = hot_sub == "clear"
+            cp = QPainterPath()
+            cp.addEllipse(cr)
+            p.fillPath(cp, QColor(theme.CURRENT.danger) if hot_clr else
+                       (QColor(0, 0, 0, 40) if light else QColor(255, 255, 255, 34)))
+            p.setPen(QPen(QColor("white") if hot_clr else fg, 2.0 * s, Qt.SolidLine, Qt.RoundCap))
+            xk = cd * 0.22
+            cc = cr.center()
+            p.drawLine(QPointF(cc.x() - xk, cc.y() - xk), QPointF(cc.x() + xk, cc.y() + xk))
+            p.drawLine(QPointF(cc.x() + xk, cc.y() - xk), QPointF(cc.x() - xk, cc.y() + xk))
+            arrows.append((cr.adjusted(-8 * s, -8 * s, 8 * s, 8 * s), "clear"))
+            right_w = cd + 14 * s
+        elif row.key == "volume" and self.volume is not None:
+            p.setFont(self.couch._font(18 * s, 800))
+            fm = QFontMetrics(p.font())
+            vw = max(fm.horizontalAdvance("150 %"), fm.horizontalAdvance("Muted")) + 6 * s
+            aw = 26 * s
+            label_room = fm.horizontalAdvance("Game volume") + 28 * s
+            bar_w = max(0.0, min(116 * s, r.right() - pad - x - label_room - vw - 2 * aw - 22 * s))
+            vx = r.right() - pad - vw
+            p.setPen(fg)
+            p.drawText(QRectF(vx, r.top(), vw, r.height()), Qt.AlignRight | Qt.AlignVCenter, row.value)
+            inc_r = QRectF(vx - aw - 4 * s, r.center().y() - 16 * s, aw, 32 * s)
+            if hot_sub == "inc":
+                hp = QPainterPath()
+                hp.addRoundedRect(inc_r, 8 * s, 8 * s)
+                p.fillPath(hp, QColor(0, 0, 0, 42) if light else QColor(255, 255, 255, 42))
+            p.setPen(fg)
+            p.drawText(inc_r, Qt.AlignCenter, "▸")
+            if bar_w >= 44 * s:
+                hot_vol = getattr(self, "_dragging_vol", False) or hot_sub == "vol_bar"
+                bh = (8 if hot_vol else 6) * s
+                track = QRectF(inc_r.left() - bar_w - 8 * s, r.center().y() - bh / 2, bar_w, bh)
+                tp = QPainterPath()
+                tp.addRoundedRect(track, bh / 2, bh / 2)
+                p.fillPath(tp, QColor(0, 0, 0, 55) if light else QColor(255, 255, 255, 42))
+                tx100 = track.left() + track.width() * (100 / 150)
+                p.setPen(QPen(QColor(0, 0, 0, 90) if light else QColor(255, 255, 255, 90), 1.4 * s))
+                p.drawLine(QPointF(tx100, track.top() - 3 * s), QPointF(tx100, track.bottom() + 3 * s))
+                frac = min(1.0, max(0.0, self.volume / 150))
+                if frac > 0:
+                    fill = QRectF(track.left(), track.top(), track.width() * frac, track.height())
+                    fp = QPainterPath()
+                    fp.addRoundedRect(fill, bh / 2, bh / 2)
+                    p.fillPath(fp, QColor(theme.CURRENT.accent))
+                kd = (16 if hot_vol else 13) * s
+                kx = track.left() + track.width() * frac
+                p.setPen(QPen(QColor(0, 0, 0, 70), 1.2 * s))
+                p.setBrush(QColor("white"))
+                p.drawEllipse(QPointF(kx, track.center().y()), kd / 2, kd / 2)
+                p.setBrush(Qt.NoBrush)
+                self._vol_track = track
+                dec_left = track.left() - aw - 8 * s
+                arrows.append((QRectF(track.left() - 4 * s, r.top(), track.width() + 8 * s, r.height()), "vol_bar"))
+            else:
+                dec_left = inc_r.left() - aw - 4 * s
+            dec_r = QRectF(dec_left, r.center().y() - 16 * s, aw, 32 * s)
+            if hot_sub == "dec":
+                hp = QPainterPath()
+                hp.addRoundedRect(dec_r, 8 * s, 8 * s)
+                p.fillPath(hp, QColor(0, 0, 0, 42) if light else QColor(255, 255, 255, 42))
+            p.setPen(fg)
+            p.drawText(dec_r, Qt.AlignCenter, "◂")
+            arrows.append((QRectF(dec_r.left() - 6 * s, r.top(), aw + 10 * s, r.height()), "dec"))
+            arrows.append((QRectF(inc_r.left() - 4 * s, r.top(), aw + 10 * s, r.height()), "inc"))
+            right_w = r.right() - pad - dec_r.left() + 10 * s
         elif row.value:
             p.setFont(self.couch._font(19 * s, 800))
             text = f"◂  {row.value}  ▸" if row.kind == "choice" else row.value
-            right_w = QFontMetrics(p.font()).horizontalAdvance(text) + 12 * s
+            fm = QFontMetrics(p.font())
+            right_w = fm.horizontalAdvance(text) + 12 * s
             p.setPen(fg)
             p.drawText(QRectF(r.right() - pad - right_w, r.top(), right_w, r.height()),
                        Qt.AlignRight | Qt.AlignVCenter, text)
-            if row.key == "volume" and self.volume is not None:      # a slim level bar under the value
-                bar = QRectF(r.right() - pad - right_w + 26 * s, r.bottom() - 16 * s, right_w - 52 * s, 4 * s)
-                bp = QPainterPath()
-                bp.addRoundedRect(bar, 2 * s, 2 * s)
-                p.fillPath(bp, QColor(0, 0, 0, 50) if light else QColor(255, 255, 255, 40))
-                fill = QRectF(bar.left(), bar.top(), bar.width() * min(1.0, self.volume / 150), bar.height())
-                fp = QPainterPath()
-                fp.addRoundedRect(fill, 2 * s, 2 * s)
-                p.fillPath(fp, QColor(theme.CURRENT.accent))
+            if row.kind == "choice" and (row.left or row.right):
+                x0 = r.right() - pad - fm.horizontalAdvance(text)          # where the ◂ starts
+                arrow = fm.horizontalAdvance("◂ ") + 12 * s
+                arrows = [(QRectF(x0 - 12 * s, r.top(), arrow + 12 * s, r.height()), "dec"),
+                          (QRectF(r.right() - pad - arrow, r.top(), arrow + pad, r.height()), "inc")]
         inner_w = r.right() - pad - right_w - x
         if row.note:
             p.setFont(self.couch._font(21 * s, 800))
@@ -1639,6 +2477,7 @@ class QuickMenu(OwnAppId, QWidget):
             p.setPen(fg)
             p.drawText(QRectF(x, r.top(), inner_w, r.height()), Qt.AlignLeft | Qt.AlignVCenter,
                        QFontMetrics(p.font()).elidedText(row.label, Qt.ElideRight, int(inner_w)))
+        return arrows
 
     def _paint_switch(self, p: QPainter, r: QRectF, y: float) -> None:
         s = self._s()
@@ -1668,9 +2507,16 @@ class QuickMenu(OwnAppId, QWidget):
         top = y + 100 * s
         bottom = self.height() - 100 * s
         row_h = th + gap
+        total_rows = max(1, (len(self.grid) + cols - 1) // cols)
         focus_row = self.grid_focus // cols
         visible_rows = max(1, int((bottom - top + gap) // row_h))
-        first_row = max(0, focus_row - visible_rows + 1)
+        max_top = max(0, total_rows - visible_rows)
+        first_row = max(0, min(self._grid_top, max_top))
+        if focus_row < first_row:
+            first_row = focus_row
+        elif focus_row >= first_row + visible_rows:
+            first_row = focus_row - visible_rows + 1
+        self._grid_top = first_row
         p.save()
         p.setClipRect(QRectF(r.left() - 30 * s, top - 20 * s, r.width() + 60 * s, bottom - top + 40 * s),
                       Qt.IntersectClip)
@@ -1682,6 +2528,9 @@ class QuickMenu(OwnAppId, QWidget):
             self._tile(p, e, tr, k == self.grid_focus)
             self._hits.append((tr, "tile", k))
         p.restore()
+        if max_top > 0:
+            self._draw_scrollbar(p, r.right() + 26 * s, top, bottom - top, first_row, max_top, visible_rows,
+                                 total_rows, "grid")
 
     def _tile(self, p: QPainter, e, r: QRectF, focused: bool) -> None:
         s = self._s()
@@ -1738,6 +2587,7 @@ class QuickMenu(OwnAppId, QWidget):
         line = QColor(255, 255, 255, 30)
         p.setPen(QPen(line, 1 * s))
         p.drawLine(r.left(), y - 34 * s, r.right(), y - 34 * s)
+        km = self._key_mode()
         if self.keyboard is not None:
             hints = [("a", "Type"), ("b", "Backspace"), ("x", "Space"), ("start", self.keyboard.done_label)]
         elif self.view == "switch":
@@ -1750,22 +2600,43 @@ class QuickMenu(OwnAppId, QWidget):
             hints = [("a", "Select"), ("b", "Back")]
         elif self.view == "friends":
             hints = ([("a", "Options")] if any(r.kind == "friend" for r in self.rows) else []) + \
-                [("x", "Search"), ("b", "Show everyone" if self.friend_query else "Back")]
+                [("/" if km else "x", "Search"), ("b", "Show everyone" if self.friend_query else "Back")]
         elif self.view == "friend":
             hints = [("a", "Select"), ("b", "Back")]
         else:
             row = self.rows[self.focus] if 0 <= self.focus < len(self.rows) else None
             hints = [("a", "Select")]
             if row is not None and row.kind == "choice":
-                hints = [("lr", "Change")]
+                hints = [("lr", "Change")] + ([("M", "Mute")] if km and row.key == "volume" else [])
             hints.append(("b", "Back to the game" if self.game is not None else "Close"))
+        usable = self.couch.usable_hints(hints)
+        gap = (12 if len(usable) >= 3 else 26) * s
         x = r.left()
-        for action, text in self.couch.usable_hints(hints):
-            x = self.couch._glyph(p, x, y, action, text) + 26 * s
+        self._hint_actions = []
+        for action, text in usable:
+            clickable = action in ("a", "b", "x", "/", "start", "M") and self.keyboard is None
+            idx = len(self._hint_actions)
+            if clickable and self._hovered == ("hint", idx):
+                # measure without drawing on screen, highlight, then draw the prompt over it
+                f_lbl = self.couch._font(13.5 * s, 800)
+                lbl = self.couch._pad_labels().get(action, action)
+                gw = 32 * s if (action in ("a", "b", "x") and self.couch.pad_family != "") else \
+                    max(40 * s, QFontMetrics(f_lbl).horizontalAdvance(lbl) + 18 * s)
+                tw = QFontMetrics(self.couch._font(18 * s, 600)).horizontalAdvance(text) if text else 0
+                hr = QRectF(x - 8 * s, y - 20 * s, gw + (10 * s + tw if text else 0) + 16 * s, 40 * s)
+                hp = QPainterPath()
+                hp.addRoundedRect(hr, 10 * s, 10 * s)
+                p.fillPath(hp, QColor(255, 255, 255, 28))
+            x_end = self.couch._glyph(p, x, y, action, text)
+            if clickable:
+                span = max(32 * s, x_end - 34 * s - x)
+                self._hits.append((QRectF(x - 6 * s, y - 22 * s, span + 12 * s, 44 * s), "hint", idx))
+                self._hint_actions.append(action)
+            x = x_end + gap
 
     def _bubble_width(self) -> float:
         s = self._s()
-        return (self._panel_rect(1.0).width() - 88 * s) * 0.8
+        return (self._content_rect(1.0).width() - 88 * s) * 0.8
 
     def _bubble(self, p: QPainter, row: Row, r: QRectF) -> None:
         """A chat message: yours on the right in the accent colour, theirs on the left."""
@@ -1817,9 +2688,7 @@ class QuickMenu(OwnAppId, QWidget):
 
     def _paint_busy(self, p: QPainter, panel: QRectF) -> None:
         s = self._s()
-        path = QPainterPath()
-        path.addRoundedRect(panel.adjusted(0, -40 * s, 40 * s, 40 * s), 34 * s, 34 * s)
-        p.fillPath(path, QColor(0, 0, 0, 150))
+        p.fillRect(self._panel_back(panel), QColor(0, 0, 0, 150))
         p.setFont(self.couch._font(22 * s, 800))
         p.setPen(QColor("white"))
         p.drawText(panel, Qt.AlignCenter, self.busy)

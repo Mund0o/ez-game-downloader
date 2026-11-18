@@ -319,11 +319,30 @@ class Keyboard:
 
     NAV_KEYS = {Qt.Key_Up: "up", Qt.Key_Down: "down", Qt.Key_Left: "left", Qt.Key_Right: "right"}
 
-    def key(self, key: int, text: str, steam: str | None, from_pad: bool, repeat: bool = False) -> str | None:
+    def key(self, key: int, text: str, steam: str | None, from_pad: bool, repeat: bool = False,
+            modifiers: Qt.KeyboardModifiers = Qt.NoModifier) -> str | None:
         """A key pressed while the keyboard is up (the windows that show it send every key here). ``steam``: the
         Steam controller button the key stands for (Steam sends its controller as keys outside games — its A is
         Enter, B Esc); ``from_pad``: the keys come from a controller. A held key repeats only moving and deleting.
         Returns the controller action it was (for the sounds), None when it typed or did nothing."""
+        ctrl = bool(modifiers & Qt.ControlModifier)
+        if (ctrl and key == Qt.Key_V) or (bool(modifiers & Qt.ShiftModifier) and key == Qt.Key_Insert):
+            from PySide6.QtWidgets import QApplication
+            clip = QApplication.clipboard()
+            pasted = " ".join((clip.text() if clip is not None else "").splitlines())
+            if pasted:
+                self.typed = True
+                self.type(pasted)
+            return None
+        if ctrl and key == Qt.Key_Backspace:
+            import re
+            self.typed = True
+            self.text = re.sub(r"\S*\s*$", "", self.text)
+            return None
+        if ctrl and key in (Qt.Key_U, Qt.Key_Delete):
+            self.typed = True
+            self.text = ""
+            return None
         nav = self.NAV_KEYS.get(key)
         name = nav or steam
         if name is None and from_pad and key in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Escape):
@@ -344,9 +363,10 @@ class Keyboard:
         elif key == Qt.Key_Escape:
             if not repeat:
                 self.cancel()
-        elif key == Qt.Key_Backspace:
+        elif key in (Qt.Key_Backspace, Qt.Key_Delete):
+            self.typed = True
             self.text = self.text[:-1]
-        elif text and text.isprintable():
+        elif text and text.isprintable() and not (modifiers & (Qt.ControlModifier | Qt.AltModifier)):
             self.typed = True                            # letters from a real keyboard
             self.type(text)
         return None
@@ -385,7 +405,7 @@ class Keyboard:
 
     def type(self, ch: str) -> None:
         if len(self.text) < self.limit:
-            self.text += ch
+            self.text = (self.text + ch)[:self.limit]
 
     def done(self) -> None:
         self.w.keyboard = None
@@ -409,6 +429,7 @@ class Keyboard:
         pw = 10 * unit + 80 * s
         ph = nrows * unit + 290 * s                          # (40 of it: the controller's shortcuts)
         panel = QRectF((W - pw) / 2, max(100 * ws, H - 76 * ws - ph - 20 * s), pw, ph)
+        w._hit.append((panel, "kb_panel", 0))
         path = QPainterPath()
         path.addRoundedRect(panel, 26 * s, 26 * s)
         p.fillPath(path, QColor(theme.CURRENT.bg2))
@@ -417,9 +438,23 @@ class Keyboard:
         p.drawPath(path)
         x0 = panel.left() + 40 * s
         y = panel.top() + 30 * s
+        cd = 36 * s
+        cr = QRectF(panel.right() - 40 * s - cd, y, cd, cd)
+        hot_close = getattr(w, "_hovered", None) == ("kb_close", 0)
+        p.setPen(QPen(QColor(255, 255, 255, 220 if hot_close else 80), 1.5 * s))
+        p.setBrush(QColor(theme.CURRENT.danger) if hot_close else QColor(255, 255, 255, 24))
+        p.drawEllipse(cr)
+        p.setBrush(Qt.NoBrush)
+        xpen = QPen(QColor("white"), 2.4 * s, Qt.SolidLine, Qt.RoundCap)
+        p.setPen(xpen)
+        xk = cd * 0.24
+        cc = cr.center()
+        p.drawLine(QPointF(cc.x() - xk, cc.y() - xk), QPointF(cc.x() + xk, cc.y() + xk))
+        p.drawLine(QPointF(cc.x() + xk, cc.y() - xk), QPointF(cc.x() - xk, cc.y() + xk))
+        w._hit.append((cr.adjusted(-6 * s, -6 * s, 6 * s, 6 * s), "kb_close", 0))
         p.setFont(w._font(24 * s, 800))
         p.setPen(QColor("white"))
-        p.drawText(QRectF(x0, y, pw - 80 * s, 36 * s), Qt.AlignLeft | Qt.AlignVCenter, self.title)
+        p.drawText(QRectF(x0, y, pw - 80 * s - cd - 16 * s, 36 * s), Qt.AlignLeft | Qt.AlignVCenter, self.title)
         y += 48 * s
         field = QRectF(x0, y, pw - 80 * s, 64 * s)
         fp = QPainterPath()
@@ -430,10 +465,18 @@ class Keyboard:
         p.setFont(w._font(28 * s, 600))
         fm = QFontMetrics(p.font())
         shown = fm.elidedText(self.text, Qt.ElideLeft, int(field.width() - 60 * s))
-        p.setPen(QColor("white"))
-        p.drawText(field.adjusted(22 * s, 0, -22 * s, 0), Qt.AlignLeft | Qt.AlignVCenter, shown)
+        if self.text:
+            p.setPen(QColor("white"))
+            p.drawText(field.adjusted(22 * s, 0, -22 * s, 0), Qt.AlignLeft | Qt.AlignVCenter, shown)
+        else:
+            couch = w if hasattr(w, "pad_family") else getattr(w, "couch", None)
+            if couch is not None and not getattr(couch, "pad_family", ""):
+                p.setFont(w._font(20 * s, 500))
+                p.setPen(QColor(255, 255, 255, 95))
+                p.drawText(field.adjusted(30 * s, 0, -22 * s, 0), Qt.AlignLeft | Qt.AlignVCenter,
+                           "Type on your keyboard or click keys…")
         if int(time.monotonic() * 2) % 2 == 0:                    # caret
-            cx = field.left() + 22 * s + fm.horizontalAdvance(shown) + 3 * s
+            cx = field.left() + 22 * s + (fm.horizontalAdvance(shown) + 3 * s if self.text else 0)
             p.fillRect(QRectF(cx, field.top() + 16 * s, 3 * s, field.height() - 32 * s), QColor(theme.CURRENT.accent))
         w._schedule_frame(250)
         y += 64 * s + 26 * s
@@ -456,13 +499,17 @@ class Keyboard:
 
     def _paint_shortcuts(self, p: QPainter, x: float, y: float, width: float) -> None:
         """Along the bottom: the controller's buttons for Backspace, Space and Enter, drawn the way the controller in
-        use shows them (○ △ Options on a PlayStation pad, B X Menu on an Xbox one, a Steam controller's own)."""
+        use shows them (○ △ Options on a PlayStation pad, B X Menu on an Xbox one, a Steam controller's own) — or the
+        keyboard's own Enter / Esc / Ctrl+V when driven by keyboard and mouse."""
         couch = self.w if hasattr(self.w, "pad_family") else getattr(self.w, "couch", None)
-        if couch is None or not getattr(couch, "pad_family", ""):
-            return                                      # a real keyboard: its own keys do it
-        hints = [*self.SHORTCUTS, ("start", "Enter" if self.done_label.lower() in ("search", "enter") else
-                                   f"Enter ({self.done_label})")]
-        hints = couch.usable_hints(hints)
+        if couch is None or not hasattr(couch, "_glyph"):
+            return
+        if not getattr(couch, "pad_family", ""):
+            hints = [("a", self.done_label), ("b", "Cancel"), ("Ctrl+V", "Paste")]
+        else:
+            hints = [*self.SHORTCUTS, ("start", "Enter" if self.done_label.lower() in ("search", "enter") else
+                                       f"Enter ({self.done_label})")]
+            hints = couch.usable_hints(hints)
         p.save()
         p.setClipRect(QRectF(x, y - 30 * couch._s(), width, 60 * couch._s()))
         for action, text in hints:

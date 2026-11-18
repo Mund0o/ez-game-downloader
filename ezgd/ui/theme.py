@@ -78,7 +78,15 @@ def stylesheet(p: Palette) -> str:
     return f"""
 * {{ outline: 0; }}
 QWidget {{ background: {p.bg0}; color: {p.text}; font-size: 10pt; }}
+QWidget#windowRoot {{ background: {p.border}; }}
+QWidget#rightPane {{ background: {p.bg0}; }}
+QWidget#windowBar, QWidget#sidebarLogo {{ background: transparent; }}
 QWidget#sidebar {{ background: {p.bg1}; border-right: 1px solid {p.border}; }}
+QPushButton#winBtn, QPushButton#winClose {{ background: transparent; border: none; border-radius: 0px; padding: 0px; }}
+QPushButton#winBtn:hover {{ background: rgba(255,255,255,0.08); }}
+QPushButton#winBtn:pressed {{ background: rgba(255,255,255,0.13); }}
+QPushButton#winClose:hover {{ background: {p.danger}; }}
+QPushButton#winClose:pressed {{ background: {_shift(p.danger, 0.85)}; }}
 QLabel {{ background: transparent; }}
 QLabel[role="title"] {{ font-size: 20pt; font-weight: 700; }}
 QLabel[role="h2"] {{ font-size: 13pt; font-weight: 650; }}

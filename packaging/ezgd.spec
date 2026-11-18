@@ -35,6 +35,9 @@ a = Analysis(
     excludes=excludes,
     noarchive=False,
 )
+if not WINDOWS:
+    # Mesa's libEGL / libdrm come from the host GPU driver; never ship a mismatched libgbm alongside them.
+    a.binaries = [b for b in a.binaries if not Path(b[0]).name.startswith("libgbm.so")]
 pyz = PYZ(a.pure)
 icon = ASSETS / ("ezgd.ico" if WINDOWS else "ezgd.png")
 exe = EXE(

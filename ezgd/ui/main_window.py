@@ -26,6 +26,7 @@ from ezgd.ui.widgets.common import ToastHost, label
 from ezgd.ui.widgets.covers import CoverCache
 from ezgd.ui.dialogs import browser as _browser    # loaded up front: quitting must not import
 from ezgd.ui import dropin, taskbar
+from ezgd.ui.titlebar import DragStrip, FramelessResizeFilter, WindowBar
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ class MainWindow(QMainWindow):
         self._quitting = False
         self.setWindowTitle(APP_DISPLAY_NAME)
         self.setWindowIcon(app_icon())
+        self.setWindowFlag(Qt.FramelessWindowHint, True)
         QTimer.singleShot(2000, self, self._register_launcher)     # (pinnable to the taskbar, same icon closed)
         self.resize(1360, 860)
         self.setMinimumSize(1020, 640)
@@ -90,13 +92,25 @@ class MainWindow(QMainWindow):
         bridge.error.connect(lambda msg: self.toasts.show("Something went wrong", msg, "error"))
 
         root = QWidget()
+        root.setObjectName("windowRoot")
         rl = QHBoxLayout(root)
-        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setContentsMargins(1, 1, 1, 1)
         rl.setSpacing(0)
+        self._root_layout = rl
         rl.addWidget(self._sidebar())
+        right = QWidget()
+        right.setObjectName("rightPane")
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(0, 0, 0, 0)
+        right_lay.setSpacing(0)
+        self.titlebar = WindowBar(self, right)
+        right_lay.addWidget(self.titlebar)
         self.stack = QStackedWidget()
-        rl.addWidget(self.stack, 1)
+        right_lay.addWidget(self.stack, 1)
+        rl.addWidget(right, 1)
         self.setCentralWidget(root)
+        self._resize_filter = FramelessResizeFilter(self)
+        self._sync_frame_state()
         self._drop_hint = dropin.DropHint(self)
 
         try:                                      # user-added sites need names/colours before pages exist
@@ -153,15 +167,23 @@ class MainWindow(QMainWindow):
         side.setObjectName("sidebar")
         side.setFixedWidth(232)
         lay = QVBoxLayout(side)
-        lay.setContentsMargins(14, 18, 14, 14)
+        lay.setContentsMargins(14, 10, 14, 14)
         lay.setSpacing(4)
-        logo = QHBoxLayout()
+        logo_bar = DragStrip(self, side)
+        logo_bar.setObjectName("sidebarLogo")
+        logo = QHBoxLayout(logo_bar)
+        logo.setContentsMargins(2, 6, 2, 6)
+        logo.setSpacing(10)
         ic = label()
         ic.setPixmap(app_icon().pixmap(30, 30))
+        ic.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._sidebar_icon = ic
+        title_lbl = label("EZ Games", "logo")
+        title_lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         logo.addWidget(ic)
-        logo.addWidget(label("EZ Games", "logo"), 1)
-        lay.addLayout(logo)
-        lay.addSpacing(18)
+        logo.addWidget(title_lbl, 1)
+        lay.addWidget(logo_bar)
+        lay.addSpacing(12)
         self.nav_group = QButtonGroup(self)
         self.nav_buttons: dict[str, QPushButton] = {}
         for key, text, ic_name in NAV:
@@ -198,10 +220,20 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.side_status)
         return side
 
+    def _sync_frame_state(self) -> None:
+        flush = self.isMaximized() or self.isFullScreen()
+        m = 0 if flush else 1
+        if hasattr(self, "_root_layout"):
+            self._root_layout.setContentsMargins(m, m, m, m)
+        if hasattr(self, "titlebar"):
+            self.titlebar.sync_maximized(self.isMaximized())
+
     def changeEvent(self, e) -> None:
         """Back in the app: re-check the system tools (something may have been installed meanwhile)."""
         from PySide6.QtCore import QEvent
         import time as _t
+        if e.type() == QEvent.WindowStateChange:
+            self._sync_frame_state()
         if e.type() == QEvent.ActivationChange and self.isActiveWindow() and \
                 _t.monotonic() - getattr(self, "_last_syscheck", 0) > 20:
             self._last_syscheck = _t.monotonic()
@@ -534,6 +566,10 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(app_icon())                    # (drawn in the accent colour)
             if getattr(self, "tray", None) is not None:
                 self.tray.setIcon(app_icon())
+            if hasattr(self, "titlebar"):
+                self.titlebar.refresh_icons()
+            if hasattr(self, "_sidebar_icon"):
+                self._sidebar_icon.setPixmap(app_icon().pixmap(30, 30))
             self._register_launcher()
             self.navigate(next(k for k, b in self.nav_buttons.items() if b.isChecked()))
             self.toasts.show("Theme updated", "Some colours update fully after a restart.")
@@ -626,9 +662,10 @@ class MainWindow(QMainWindow):
             from PySide6.QtGui import QKeyEvent
             QApplication.sendEvent(self.couch.quick, QKeyEvent(QEvent.KeyPress, Qt.Key_Backtab, Qt.ShiftModifier))
         elif self.couch is not None:
-            self.couch._home_held()                      # (couch mode, or the menu's own background one)
+            self.couch.pad_family = ""                   # opened from the keyboard: its keys as the prompts
+            self.couch._home_held(by_key=True)           # (couch mode, or the menu's own background one)
         elif self.pages["library"].running:
-            self._quick_menu_from_desktop()
+            self._quick_menu_from_desktop(by_key=True)
 
     def force_quit(self) -> None:
         self._quitting = True
@@ -725,10 +762,10 @@ class MainWindow(QMainWindow):
             for ms in (1800, 3300):                   # after Steam's desktop window came and went again
                 QTimer.singleShot(ms, self, lambda: self.couch._regain_screen() if self.couch is not None else None)
 
-    def _quick_menu_from_desktop(self) -> None:
-        """The guide button over a game started from the desktop (couch mode closed): the quick menu, with couch
-        mode made in the background behind it — shown only if the menu asks for it (couch mode, switch game, …).
-        Only with our overlay (Settings)."""
+    def _quick_menu_from_desktop(self, by_key: bool = False) -> None:
+        """The guide button (or Shift+Tab: ``by_key``) over a game started from the desktop (couch mode closed): the
+        quick menu, with couch mode made in the background behind it — shown only if the menu asks for it (couch
+        mode, switch game, …). Only with our overlay (Settings)."""
         if self.couch is not None or not self.pages["library"].running or not self.settings.get("own_overlay", False):
             return
         from ezgd.ui.couch import make_couch
@@ -751,8 +788,12 @@ class MainWindow(QMainWindow):
         self._quit_before_bg = QApplication.instance().quitOnLastWindowClosed()
         QApplication.instance().setQuitOnLastWindowClosed(False)    # (the menu closing must not end the app)
         self._watch_quick_button()                        # couch mode's own controllers take over
-        couch.guide_pressed()                            # (Steam may answer the same press with its window)
-        couch._home_held()
+        couch.sounds.defer(600)                          # (its sound stream: after the menu has slid in)
+        if by_key:
+            couch.pad_family = ""                        # opened from the keyboard: its keys as the prompts
+        else:
+            couch.guide_pressed()                        # (Steam may answer the same press with its window)
+        couch._home_held(by_key=by_key)
 
     def _background_couch_shown(self) -> None:
         """The quick menu opened couch mode for real: it replaces this window, as when opened from here."""
@@ -942,6 +983,8 @@ class MainWindow(QMainWindow):
                     e.ignore()
                     return
         self._quitting = True
+        if hasattr(self, "_resize_filter"):
+            self._resize_filter.cleanup()
         if self.couch is not None:
             try:
                 self.couch.force_close()

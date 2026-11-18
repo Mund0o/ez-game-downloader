@@ -71,16 +71,24 @@ def test_navigation_and_home(ui, qtbot):
     for key in ("games", "picks", "downloads", "library", "settings", "home"):
         win.navigate(key)
         assert win.stack.currentWidget() is win.pages[key]
-    qtbot.waitUntil(lambda: win.pages["home"].popular.model_.rowCount() > 0, timeout=10000)
-    qtbot.waitUntil(lambda: win.pages["home"].recent.model_.rowCount() > 0, timeout=10000)
+    home = win.pages["home"]
+    assert not hasattr(home, "popular")
+    qtbot.waitUntil(lambda: home.recent.model_.rowCount() > 0, timeout=10000)
 
 
 def test_picks_page_shows_real_sections(ui, qtbot):
+    from PySide6.QtWidgets import QScrollBar
     win, *_ = ui
     win.navigate("picks")
     page = win.pages["picks"]
     qtbot.waitUntil(lambda: len(page.grids) == 2, timeout=10000)
     assert page.grids[0].model_.groups[0].title == "How to Fish"
+    assert not page.grids[0].findChildren(QScrollBar)
+    assert page.grids[0].auto_timer.isActive()
+    assert not page.grids[1].auto_timer.isActive()
+    page._select_section(1)
+    assert not page.grids[0].auto_timer.isActive()
+    assert page.grids[1].auto_timer.isActive()
 
 
 def test_debounced_search_and_responsiveness(ui, qtbot):
@@ -1249,3 +1257,206 @@ def test_download_progress_updates_rows_in_place(ui, qtbot, monkeypatch, tmp_pat
     monkeypatch.setattr(home, "_render_active", lambda: rendered.append(1))
     home.download_updated(task.snapshot())
     assert not rendered
+
+
+def test_home_recent_showcase_auto_rotates_without_scrollbars(ui, qtbot, monkeypatch):
+    from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QScrollBar
+    win, _core, _ = ui
+    win.navigate("home")
+    home = win.pages["home"]
+    qtbot.waitUntil(lambda: home.recent.model_.rowCount() > 1, timeout=10000)
+    showcase = home.recent
+    # No scrollbars inside the Recently Added game showcase, faster 3.0s cadence
+    assert not showcase.findChildren(QScrollBar)
+    assert showcase.auto_timer.isActive()
+    assert showcase.auto_timer.interval() == 3000
+    first_key = showcase.visible_items()[showcase.index].key
+    showcase._auto_step()
+    assert showcase.index == 1
+    assert showcase.visible_items()[showcase.index].key != first_key
+
+    # Hovering over another card in the shelf NEVER changes the highlighted game
+    slots = showcase.shelf._slot_rects()
+    assert len(slots) >= 2
+    other_idx, other_rect = next((gidx, r) for gidx, r in slots if gidx != showcase.index)
+    pt = other_rect.center()
+    move = QMouseEvent(QEvent.MouseMove, pt, showcase.shelf.mapToGlobal(pt.toPoint()),
+                       Qt.NoButton, Qt.NoButton, Qt.NoModifier)
+    showcase.shelf.mouseMoveEvent(move)
+    qtbot.wait(150)
+    assert showcase.index == 1
+
+    # Clicking another card highlights it without opening details; clicking it again opens details
+    from ezgd.ui.dialogs.game_details import GameDetailsDialog
+    monkeypatch.setattr(GameDetailsDialog, "exec", lambda self: 0)
+    opened = []
+    showcase.activated_group.connect(opened.append)
+    qtbot.mouseClick(showcase.shelf, Qt.LeftButton, pos=pt.toPoint())
+    assert showcase.index == other_idx and not opened
+    same_rect = next(r for gidx, r in showcase.shelf._slot_rects() if gidx == other_idx)
+    qtbot.mouseClick(showcase.shelf, Qt.LeftButton, pos=same_rect.center().toPoint())
+    assert len(opened) == 1 and opened[0].key == showcase.visible_items()[other_idx].key
+
+    # Switching away from Home stops the background rotation timer; returning restarts it
+    win.navigate("library")
+    assert not showcase.auto_timer.isActive()
+    win.navigate("home")
+    assert showcase.auto_timer.isActive()
+
+    # Card sizes, installed state, and withdrawn game hiding all apply cleanly
+    home.apply_card_size("compact")
+    home.apply_card_size("large")
+    home.apply_card_size("comfortable")
+    drop_id = showcase.model_.groups[0].entries[0].id
+    before = showcase.model_.rowCount()
+    home.hide_ids({drop_id})
+    assert showcase.model_.rowCount() == before - 1
+
+
+def test_library_setup_studio_one_click_finish_and_tabs(ui, qtbot, tmp_path):
+    win, core, _ = ui
+    folder = tmp_path / "games" / "QuickSetupGame"
+    folder.mkdir(parents=True)
+    exe = folder / "QuickSetupGame.exe"
+    exe.write_bytes(b"MZ" + b"\0" * 256)
+    entry = win.bridge.run_sync(core.library_call("import_folder", "Quick Setup Game", str(folder)))
+    win.navigate("library")
+    page = win.pages["library"]
+    qtbot.waitUntil(lambda: page.list.count() == 1, timeout=5000)
+    page.select(entry.id)
+
+    # Setup Studio opens automatically and surfaces the 1-click Select & Finish button
+    qtbot.waitUntil(lambda: bool(_buttons(page, "Select && Finish")), timeout=5000)
+    assert page._tab_pages["setup"].isVisible()
+    _buttons(page, "Select && Finish")[0].click()
+
+    # One click configures executable + marks ready + transitions cleanly to Overview + Play
+    qtbot.waitUntil(lambda: bool(_buttons(page, "Play")) and page._tab_pages["overview"].isVisible(), timeout=5000)
+    saved = core.library.get(entry.id)
+    assert saved.executable == str(exe) and saved.status.value == "installed"
+
+    # Switching segmented tabs shows only the active detail tab
+    page._switch_detail_tab("files")
+    assert page._tab_pages["files"].isVisible() and not page._tab_pages["overview"].isVisible()
+    page._switch_detail_tab("setup")
+    assert page._tab_pages["setup"].isVisible() and not page._tab_pages["files"].isVisible()
+
+
+def test_slow_popup_download_that_closes_itself_past_5s_succeeds_without_crashing(ui, qtbot):
+    """EZGD-SEGV-F117EA (0.6.16 follow-up): file hosts open a pop-up tab that starts an archive download and calls
+    window.close(). Deleting that closed tab's QWebEnginePage after 5 s destroyed the page (and its active
+    QWebEngineDownloadRequest) mid-transfer on any download lasting >5 s, crashing or aborting inside exec()."""
+    import http.server
+    import io
+    import socketserver
+    import threading
+    import zipfile
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QDialog
+    from ezgd.ui.dialogs import browser
+    if not browser.AVAILABLE:
+        pytest.skip("Qt WebEngine not installed")
+    win, core, _ = ui
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("SlowGame/SlowGame.exe", b"MZ" + b"\0" * 512)
+    payload = buf.getvalue()
+
+    class SlowHost(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_a):
+            pass
+
+        def do_GET(self):
+            if self.path.startswith("/slow.zip"):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", 'attachment; filename="SlowGame.zip"')
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                half = len(payload) // 2
+                try:
+                    self.wfile.write(payload[:half])
+                    self.wfile.flush()
+                    time.sleep(5.5)              # stream past the old 5.0 s RETIRE_SECONDS window after window.close()
+                    self.wfile.write(payload[half:])
+                    self.wfile.flush()
+                except BrokenPipeError:
+                    pass
+                return
+            if self.path.startswith("/dl-tab"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(
+                    b"<html><body><script>"
+                    b"location.href='/slow.zip';"
+                    b"setTimeout(function(){ window.close(); }, 150);"
+                    b"</script></body></html>"
+                )
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                b"<html><body><a id='go' style='display:block;width:300px;height:60px' "
+                b"href='/dl-tab' target='_blank'>Download</a></body></html>"
+            )
+
+    srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), SlowHost)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        g = Game("steamrip", "991", "Slow Host Game", f"http://127.0.0.1:{port}/")
+        core.games.save(g)
+        details = QDialog(win)
+        got = {}
+
+        def open_from_details():
+            dlg = browser.open_browser_download(win.actions, g, f"http://127.0.0.1:{port}/", "SlowHost", details)
+            dlg.resize(900, 650)
+            got["dlg"] = dlg
+            dlg.page.loadFinished.connect(lambda _ok: QTimer.singleShot(100, dlg, lambda: _click_element(qtbot, dlg, "go")))
+            dlg.went_away.connect(lambda: QTimer.singleShot(150, details, details.accept))
+
+        QTimer.singleShot(50, open_from_details)
+        QTimer.singleShot(15000, details.reject)
+        assert details.exec() == QDialog.Accepted
+        assert got["dlg"].started and got["dlg"].started[0].name == "SlowGame.zip"
+        qtbot.waitUntil(lambda: any(e.game_id == g.id for e in core.library.all()), timeout=12000)
+        qtbot.waitUntil(lambda: got["dlg"].disposed, timeout=5000)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_frozen_linux_open_url_uses_host_env_and_external_button_closes_browser(ui, qtbot, server, monkeypatch):
+    import shutil
+    import subprocess
+    import sys
+    from ezgd.ui.dialogs import browser, misc
+    win, core, _ = ui
+
+    calls = []
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/pyinstaller/_internal")
+    monkeypatch.setenv("LD_LIBRARY_PATH_ORIG", "/usr/local/lib")
+    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/xdg-open" if cmd == "xdg-open" else None)
+    monkeypatch.setattr(subprocess, "Popen", lambda argv, **kw: calls.append((argv, kw.get("env", {}))))
+
+    misc.open_url("https://buzzheavier.com/f/abc")
+    assert len(calls) == 1
+    assert calls[0][0] == ["xdg-open", "https://buzzheavier.com/f/abc"]
+    assert calls[0][1].get("LD_LIBRARY_PATH") == "/usr/local/lib"
+
+    if browser.AVAILABLE:
+        server.add("/ext", data=b"<html><body>Host</body></html>", content_type="text/html")
+        g = Game("steamrip", "992", "External Host Game", server.url("/ext"))
+        core.games.save(g)
+        dlg = browser.open_browser_download(win.actions, g, server.url("/ext"), "Buzzheavier", win)
+        _buttons(dlg, "Open in my browser")[0].click()
+        assert len(calls) == 2
+        qtbot.waitUntil(lambda: dlg.disposed, timeout=3000)

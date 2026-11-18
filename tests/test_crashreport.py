@@ -61,6 +61,52 @@ def test_hard_crash_is_reported_on_next_start(tmp_path, restore_hooks):
     assert crashreport.install(tmp_path / "logs").code == rep.code
 
 
+def test_hard_crash_report_has_the_native_trace(tmp_path, restore_hooks, monkeypatch):
+    """The Python trace ends where Qt's C++ starts (EZGD-SEGV-F117EA named only the game page's exec()): the core
+    dump systemd kept names the library and function. Matched by pid and time; the error code does not change."""
+    assert run_child(tmp_path, "segv") != 0
+    plain = crashreport.install(tmp_path / "logs").code
+    crashreport.mark_clean_exit()
+    assert run_child(tmp_path, "segv") != 0
+    import json
+    info = json.loads((tmp_path / "logs" / "session.json").read_text())
+    at = int((tmp_path / "logs" / "faulthandler.log").stat().st_mtime * 1e6)
+    stack = ("Process {pid} (ezgd) of user 1000 dumped core.\n\nModule libQt6Core.so.6 without build-id.\n"
+             "Stack trace of thread {pid}:\n#0  0x0000000000000000 n/a (n/a + 0x0)\n"
+             "#1  0x00007efc6e047ace _ZN24QWebEngineProfilePrivate17downloadRequestedERKN15QtWebEngineCore"
+             " (libQt6WebEngineCore.so.6 + 0x5447ace)\n#2  0x00007efc659eb7f4 _ZN7QObject5eventEP6QEvent "
+             "(libQt6Core.so.6 + 0x1eb7f4)\n\nStack trace of thread 99:\n#0  0x1 futex_wait (libc.so.6 + 0x1)\n")
+    asked = []
+
+    def journal(args):
+        asked.append(args)
+        if "-k" in args:
+            return [{"MESSAGE": f"ezgd[{info['pid']}]: segfault at 0 ip 0 sp 7ffc error 14 likely on CPU 3"}]
+        return [
+            {"COREDUMP_PID": str(info["pid"]), "COREDUMP_TIMESTAMP": str(at - 400_000_000),     # same pid, a reboot
+             "MESSAGE": "Process (someone else) dumped core.\nStack trace of thread 1:\n#0 0x1 n/a (other.so + 0x1)"},
+            {"COREDUMP_PID": str(info["pid"]), "COREDUMP_TIMESTAMP": str(at), "COREDUMP_SIGNAL_NAME": "SIGSEGV",
+             "COREDUMP_THREAD_NAME": "ezgd", "MESSAGE": list(stack.format(pid=info["pid"]).encode())}]
+    monkeypatch.setenv("EZGD_SYSLOG", "1")
+    monkeypatch.setattr(crashreport, "_journal", journal)
+    rep = crashreport.install(tmp_path / "logs")
+    assert rep.code == plain                                              # same crash, same code
+    assert rep.summary.endswith(", in libQt6WebEngineCore.so.6.")
+    native = rep.text.split("--- Native trace (systemd-coredump) ---\n", 1)[1]
+    assert native.startswith("SIGSEGV in thread “ezgd”\nStack trace of thread")
+    assert "downloadRequested" in native and "QObject5event" in native
+    assert "other.so" not in native and "futex_wait" not in native       # only the crashing thread, only ours
+    assert "kernel: ezgd[" in native and "segfault at 0" in native
+    assert any(f"COREDUMP_PID={info['pid']}" in a for a in asked)
+    # nothing in the journal (no systemd-coredump, no access): the report says so and still works
+    crashreport.mark_clean_exit()
+    assert run_child(tmp_path, "segv") != 0
+    monkeypatch.setattr(crashreport, "_journal", lambda args: [])
+    rep = crashreport.install(tmp_path / "logs")
+    assert rep.code == plain and rep.summary.endswith("load_game_list.")
+    assert "(none: the system kept no core dump record of it)" in rep.text
+
+
 def test_clean_exit_and_killed_process(tmp_path, restore_hooks):
     run_child(tmp_path, "clean")
     assert crashreport.install(tmp_path / "logs") is None

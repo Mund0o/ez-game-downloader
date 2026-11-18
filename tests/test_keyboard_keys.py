@@ -61,3 +61,23 @@ def test_a_pad_without_steam_mapping_and_a_real_keyboard():
     assert kb.text == "q"
     kb.key(Qt.Key_Return, "\r", None, False)                      # its Enter: done
     assert done == ["q"]
+
+
+def test_real_keyboard_paste_word_delete_and_clear(qtbot):
+    from PySide6.QtWidgets import QApplication
+    kb, host, done = _kb()
+    kb.limit = 20
+    QApplication.clipboard().setText("join\nlobby 4242")
+    kb.key(Qt.Key_V, "", None, False, modifiers=Qt.ControlModifier)
+    assert kb.typed and kb.text == "join lobby 4242"
+    kb.key(Qt.Key_Backspace, "\b", None, False, modifiers=Qt.ControlModifier)   # Ctrl+Backspace: last word
+    assert kb.text == "join lobby "
+    kb.key(Qt.Key_Backspace, "\b", None, False, modifiers=Qt.ControlModifier)
+    assert kb.text == "join "
+    kb.key(Qt.Key_U, "", None, False, modifiers=Qt.ControlModifier)             # Ctrl+U: clear all
+    assert kb.text == ""
+    QApplication.clipboard().setText("abcdefghijklmnopqrstuvwxyz")
+    kb.key(Qt.Key_Insert, "", None, False, modifiers=Qt.ShiftModifier)          # Shift+Insert, capped at limit
+    assert kb.text == "abcdefghijklmnopqrst" and len(kb.text) == 20
+    kb.key(Qt.Key_Delete, "", None, False)
+    assert kb.text == "abcdefghijklmnopqrs"

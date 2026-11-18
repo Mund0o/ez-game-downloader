@@ -31,7 +31,7 @@ class SettingsPage(QWidget):
         scroll.setWidgetResizable(True)
         body = QWidget()
         self.lay = QVBoxLayout(body)
-        self.lay.setContentsMargins(28, 24, 28, 28)
+        self.lay.setContentsMargins(28, 6, 28, 28)
         self.lay.setSpacing(16)
         self.lay.addWidget(label("Settings", "title"))
         self.lay.addWidget(label("Changes are saved immediately.", "muted"))

@@ -33,6 +33,8 @@ os.environ["EZGD_NO_SOUNDS"] = "1"         # couch mode's sounds are only counte
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:                    # Qt WebEngine (in-app browser) must be loaded before the QApplication exists
+    from PySide6.QtCore import QCoreApplication, Qt
+    QCoreApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
     import PySide6.QtWebEngineWidgets  # noqa: F401
 except ImportError:
     pass

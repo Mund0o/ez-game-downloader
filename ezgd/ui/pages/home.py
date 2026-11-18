@@ -1,23 +1,22 @@
-"""Home: quick search, active downloads, recent additions, OnlineFix popular and source status."""
+"""Home: sleek search bar, centered auto-rotating Recently Added showcase, active/recent downloads & source health."""
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, QSize, Qt
 from PySide6.QtWidgets import (QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QProgressBar, QScrollArea,
-                               QVBoxLayout, QWidget)
+                               QSizePolicy, QVBoxLayout, QWidget)
 
-from ezgd.catalog.models import GameGroup
 from ezgd.catalog.search import group_duplicates
 from ezgd.core.fsutil import format_bytes, format_speed
 from ezgd.ui import theme
 from ezgd.ui.dialogs.misc import open_url
 from ezgd.ui.icons import icon
-from ezgd.ui.widgets.common import Banner, button, card, chip, clear_layout, label
-from ezgd.ui.widgets.game_grid import GameGridView
+from ezgd.ui.widgets.common import Banner, button, card, chip, label, set_chip, tool
+from ezgd.ui.widgets.showcase import ElidedLabel, GameShowcase, clear_now
 
-STATE_TEXT = {"ok": ("Online", "#22c55e"), "offline-cache": ("Offline — cached", "#f59e0b"),
+STATE_TEXT = {"ok": ("Online", "#22c55e"), "offline-cache": ("Cached", "#f59e0b"),
               "unavailable": ("Unavailable", "#ef4444"), "layout-changed": ("Layout changed", "#ef4444"),
-              "error": ("Error", "#ef4444"), "unknown": ("Not checked yet", "#8c95ab")}
+              "error": ("Error", "#ef4444"), "unknown": ("Unchecked", "#8c95ab")}
 
 
 class HomePage(QWidget):
@@ -29,40 +28,57 @@ class HomePage(QWidget):
         self._active_ids: list[int] | None = None                       # the downloads the rows show now
         self._active_rows: dict[int, tuple[QLabel, QProgressBar, QLabel]] = {}
         self._statuses: dict[int, str] = {}                            # each download's last status
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        body = QWidget()
-        lay = QVBoxLayout(body)
-        lay.setContentsMargins(28, 24, 28, 28)
-        lay.setSpacing(22)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
+        wrap = QWidget()
+        wrap_lay = QHBoxLayout(wrap)
+        wrap_lay.setContentsMargins(24, 6, 24, 20)
+        wrap_lay.setSpacing(0)
+        wrap_lay.addStretch(1)
+
+        canvas = QWidget()
+        canvas.setMaximumWidth(1320)
+        canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        lay = QVBoxLayout(canvas)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(14)
+        wrap_lay.addWidget(canvas, 100)
+        wrap_lay.addStretch(1)
+
+        # Compact search & quick-navigation command bar
         hero = QFrame()
         hero.setObjectName("hero")
         hl = QVBoxLayout(hero)
-        hl.setContentsMargins(28, 26, 28, 26)
+        hl.setContentsMargins(20, 15, 20, 13)
         hl.setSpacing(10)
-        hl.addWidget(label("Find your next game", "title"))
-        hl.addWidget(label("Search every enabled source at once, download with the built-in torrent and HTTP "
-                           "engines, and keep your games organised in one library.", "muted", wrap=True))
+
         row = QHBoxLayout()
+        row.setSpacing(10)
         self.search = QLineEdit()
         self.search.setObjectName("search")
-        self.search.setPlaceholderText("Search games…")
+        self.search.setPlaceholderText("Search games across every enabled source…")
         self.search.returnPressed.connect(self._search)
-        search_icon = QLabel(self.search)
-        search_icon.setPixmap(icon("search", theme.CURRENT.muted, 18).pixmap(18, 18))
-        search_icon.move(12, 12)
+        self._search_icon = QLabel(self.search)
+        self._search_icon.setPixmap(icon("search", theme.CURRENT.muted, 18).pixmap(18, 18))
+        self._search_icon.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.search.installEventFilter(self)
         row.addWidget(self.search, 1)
         row.addWidget(button("Search", "search", "primary", on_click=self._search))
         hl.addLayout(row)
+
         quick = QHBoxLayout()
+        quick.setSpacing(8)
         quick.addWidget(button("Browse all games", "grid", on_click=lambda: self.actions.navigate.emit("games")))
         quick.addWidget(button("OnlineFix Picks", "star", on_click=lambda: self.actions.navigate.emit("picks")))
         quick.addWidget(button("Library", "library", on_click=lambda: self.actions.navigate.emit("library")))
         quick.addWidget(button("Add download", "plus", on_click=lambda: self.actions.add_download_dialog(self)))
         quick.addStretch(1)
+        quick.addWidget(label("Ctrl+F search  ·  F11 Couch mode", "small"))
         hl.addLayout(quick)
         lay.addWidget(hero)
 
@@ -71,8 +87,8 @@ class HomePage(QWidget):
         self.system_banner.hide()
         lay.addWidget(self.system_banner)
 
-        # active downloads
-        self.active_card, al = card()
+        # Active downloads (shown automatically while transfers are running/queued)
+        self.active_card, al = card(margins=(16, 12, 16, 12), spacing=8)
         head = QHBoxLayout()
         head.addWidget(label("Active downloads", "h2"), 1)
         head.addWidget(button("Open Downloads", "download", "ghost",
@@ -83,31 +99,63 @@ class HomePage(QWidget):
         al.addLayout(self.active_list)
         lay.addWidget(self.active_card)
 
-        lay.addWidget(label("Recently added", "h2"))
-        self.recent_note = label("", "small")
-        lay.addWidget(self.recent_note)
-        self.recent = GameGridView(actions.covers, horizontal=True)
+        # Vertical centering springs keep Recently Added poised right at the center on tall displays
+        lay.addStretch(1)
+        self.recent = GameShowcase(
+            actions,
+            title_text="Recently added",
+            trailing_button=("Browse all", "grid", lambda: self.actions.navigate.emit("games")),
+            parent=self,
+        )
+        self.recent_note = self.recent.note_label
         self.recent.activated_group.connect(self._open)
         lay.addWidget(self.recent)
-
-        lay.addWidget(label("Popular on OnlineFix", "h2"))
-        self.popular = GameGridView(actions.covers, horizontal=True)
-        self.popular.activated_group.connect(self._open)
-        lay.addWidget(self.popular)
-
-        lay.addWidget(label("Recently downloaded", "h2"))
-        self.downloaded = QVBoxLayout()
-        lay.addLayout(self.downloaded)
-
-        lay.addWidget(label("Sources", "h2"))
-        self.sources = QGridLayout()
-        self.sources.setHorizontalSpacing(14)
-        self.sources.setVerticalSpacing(14)
-        lay.addLayout(self.sources)
         lay.addStretch(1)
-        scroll.setWidget(body)
+
+        # Compact bottom dashboard: Sources status + Recently downloaded side-by-side
+        bottom = QHBoxLayout()
+        bottom.setSpacing(16)
+
+        src_card, sl = card(margins=(16, 12, 16, 12), spacing=8)
+        src_head = QHBoxLayout()
+        src_head.addWidget(label("Sources", "h2"), 1)
+        self._sources_chip = chip("Checking…", "#8c95ab")
+        src_head.addWidget(self._sources_chip)
+        sl.addLayout(src_head)
+        self.sources = QGridLayout()
+        self.sources.setHorizontalSpacing(10)
+        self.sources.setVerticalSpacing(8)
+        sl.addLayout(self.sources)
+        sl.addStretch(1)
+        bottom.addWidget(src_card, 7)
+
+        dl_card, dl = card(margins=(16, 12, 16, 12), spacing=8)
+        dl_head = QHBoxLayout()
+        dl_head.addWidget(label("Recently downloaded", "h2"), 1)
+        dl_head.addWidget(button("Downloads", "download", "ghost",
+                                 on_click=lambda: self.actions.navigate.emit("downloads")))
+        dl.addLayout(dl_head)
+        self.downloaded = QVBoxLayout()
+        self.downloaded.setSpacing(6)
+        dl.addLayout(self.downloaded)
+        dl.addStretch(1)
+        bottom.addWidget(dl_card, 5)
+
+        lay.addLayout(bottom)
+
+        scroll.setWidget(wrap)
         outer.addWidget(scroll)
+        self._place_search_icon()
         self._render_active()
+
+    def _place_search_icon(self) -> None:
+        y = max(8, (self.search.height() - 18) // 2)
+        self._search_icon.move(12, y)
+
+    def eventFilter(self, obj, e) -> bool:
+        if obj is self.search and e.type() == QEvent.Resize:
+            self._place_search_icon()
+        return super().eventFilter(obj, e)
 
     # ---------------------------------------------------------------- data
     def load(self) -> None:
@@ -121,8 +169,7 @@ class HomePage(QWidget):
         for sid in list(theme.SOURCE_NAMES):
             self.bridge.call(core.latest(1, [sid]), lambda res, g=self._live_gen, s=sid: self._recent_live(res, g, s),
                              owner=self)
-        self.bridge.call(core.featured(), self._featured, owner=self)
-        self.bridge.call(core.recently_downloaded(6), self._downloaded, owner=self)
+        self.bridge.call(core.recently_downloaded(5), self._downloaded, owner=self)
         self.load_sources()
         self.check_system()
 
@@ -164,55 +211,98 @@ class HomePage(QWidget):
                        reverse=True)
         if games:
             self.recent.set_groups(group_duplicates(games))
-        errs = "; ".join(f"{theme.source_name(k)}: {v}" for k, v in self._live_errors.items())
         pending = len(set(theme.SOURCE_NAMES) - self._live_sources)
-        self.recent_note.setText("Newest listings from the enabled sources." + (f" Problems: {errs}" if errs else "")
-                                 + (" Still loading some sources…" if pending else ""))
+        if not self._live_errors:
+            err_summary, err_tip = "", ""
+        elif len(self._live_errors) == 1:
+            k, v = next(iter(self._live_errors.items()))
+            err_summary = f"  ·  {theme.source_name(k)}: {v}"
+            err_tip = f"{theme.source_name(k)}: {v}"
+        else:
+            err_summary = f"  ·  {len(self._live_errors)} sources unreachable"
+            err_tip = "\n".join(f"{theme.source_name(k)}: {v}" for k, v in self._live_errors.items())
+        self.recent_note.setToolTip(err_tip)
+        self.recent_note.setText("Auto-rotating newest releases"
+                                 + err_summary
+                                 + ("  ·  Refreshing…" if pending else ""))
         if not pending:
             self.load_sources()
 
-    def _featured(self, result) -> None:
-        sections, _at, error = result
-        popular = next((s for s in sections if s.key == "popular"), sections[0] if sections else None)
-        if popular:
-            self.popular.set_groups([GameGroup(g.dedup_key, [g]) for g in popular.games])
-        self.load_sources()
-
     def _downloaded(self, snaps: list[dict]) -> None:
-        clear_layout(self.downloaded)
+        clear_now(self.downloaded)
         if not snaps:
             self.downloaded.addWidget(label("Nothing downloaded yet.", "muted"))
             return
-        for s in snaps:
-            row = QHBoxLayout()
-            row.addWidget(label(s["title"]), 1)
+        for s in snaps[:4]:
+            w = QWidget()
+            row = QHBoxLayout(w)
+            row.setContentsMargins(0, 2, 0, 2)
+            row.setSpacing(8)
+            t = ElidedLabel(s["title"], parent=w)
+            t.setToolTip(s["title"])
+            row.addWidget(t, 1)
             row.addWidget(label(format_bytes(s["total_bytes"]), "small"))
             row.addWidget(chip("Complete", theme.CURRENT.success))
-            w = QWidget()
-            w.setLayout(row)
             self.downloaded.addWidget(w)
 
     def _sources(self, sources: list[dict]) -> None:
-        clear_layout(self.sources)
+        clear_now(self.sources)
+        enabled = [s for s in sources if s["enabled"]]
+        online = sum(1 for s in enabled if s["status"] == "ok")
+        issues = sum(1 for s in enabled if s["status"] in ("unavailable", "layout-changed", "error"))
+        if not enabled:
+            summary_txt, summary_col = "All disabled", "#8c95ab"
+        elif issues:
+            summary_txt, summary_col = f"{online}/{len(enabled)} online · {issues} issue", "#f59e0b"
+        elif online:
+            summary_txt, summary_col = f"{online}/{len(enabled)} online", "#22c55e"
+        else:
+            summary_txt, summary_col = f"{len(enabled)} enabled", "#8c95ab"
+        set_chip(self._sources_chip, summary_txt, summary_col)
+
+        pal = theme.CURRENT
+        cols = 3 if len(sources) >= 3 else 2
+        for c in range(cols):
+            self.sources.setColumnStretch(c, 1)
         for i, s in enumerate(sources):
-            c, cl = card()
+            tile = QFrame()
+            tile.setStyleSheet(f"QFrame {{ background: {pal.bg1}; border: 1px solid {pal.border}; border-radius: 9px; }}"
+                               "QFrame QLabel, QFrame QToolButton { border: none; background: transparent; }")
+            tl = QVBoxLayout(tile)
+            tl.setContentsMargins(10, 6, 6, 6)
+            tl.setSpacing(2)
+
             top = QHBoxLayout()
-            top.addWidget(label(s["name"], "h2"), 1)
+            top.setSpacing(6)
+            dot = QFrame()
+            dot.setFixedSize(8, 8)
+            sc = theme.SOURCE_COLORS.get(s["id"], pal.accent)
+            dot.setStyleSheet(f"background: {sc}; border-radius: 4px; border: none;")
+            top.addWidget(dot, 0, Qt.AlignVCenter)
+
+            short_name = theme.SOURCE_NAMES.get(s["id"], s["name"])
+            name_lbl = ElidedLabel(short_name, parent=tile)
+            name_lbl.setStyleSheet("font-weight: 650;")
+            top.addWidget(name_lbl, 1)
+
             text, color = STATE_TEXT.get(s["status"], (s["status"], "#8c95ab"))
             if not s["enabled"]:
                 text, color = "Disabled", "#8c95ab"
             top.addWidget(chip(text, color))
-            cl.addLayout(top)
-            cl.addWidget(label(s["description"], "muted", wrap=True))
+            visit = tool("external", f"Visit {s['name']}",
+                         on_click=lambda u=s["homepage"]: open_url(u), color=pal.muted)
+            visit.setFixedSize(24, 24)
+            visit.setIconSize(QSize(14, 14))
+            top.addWidget(visit)
+            tl.addLayout(top)
+
+            tip_lines = [s["name"], s["description"]]
             if s.get("message") and s["status"] != "ok":
-                cl.addWidget(label(s["message"], "small", wrap=True))
-            for note in s["notes"]:
-                cl.addWidget(label("• " + note, "small", wrap=True))
-            btns = QHBoxLayout()
-            btns.addWidget(button("Visit site", "external", "ghost", on_click=lambda _=False, u=s["homepage"]: open_url(u)))
-            btns.addStretch(1)
-            cl.addLayout(btns)
-            self.sources.addWidget(c, i // 2, i % 2)
+                tip_lines.append(f"Status: {s['message']}")
+            for note in s.get("notes") or ():
+                tip_lines.append(f"• {note}")
+            tile.setToolTip("\n".join(x for x in tip_lines if x))
+            self.sources.addWidget(tile, i // cols, i % cols)
 
     # ------------------------------------------------------------ downloads
     def download_updated(self, snap: dict) -> None:
@@ -224,7 +314,7 @@ class HomePage(QWidget):
         elif self.active.pop(tid, None) is None and status == before:
             return                     # (a paused or seeding torrent says so every second: nothing here changes)
         if status == "completed" and before != "completed":
-            self.bridge.call(self.bridge.core.recently_downloaded(6), self._downloaded, owner=self)
+            self.bridge.call(self.bridge.core.recently_downloaded(5), self._downloaded, owner=self)
         self._render_active()
 
     def download_removed(self, tid: int) -> None:
@@ -235,14 +325,13 @@ class HomePage(QWidget):
     def _render_active(self) -> None:
         items = sorted(self.active.values(), key=lambda s: s["id"])[:5]
         ids = [s["id"] for s in items]
+        self.active_card.setVisible(bool(items))
         if ids != self._active_ids:
             # rows only when downloads come or go — every progress update built them all again (2.5× a second per
             # download, with the page out of sight too: in couch mode, in the tray, during a game)
             self._active_ids = ids
-            clear_layout(self.active_list)
+            clear_now(self.active_list)
             self._active_rows = {}
-            if not items:
-                self.active_list.addWidget(label("No active downloads.", "muted"))
             for s in items:
                 w = QWidget()
                 row = QHBoxLayout(w)
@@ -270,15 +359,12 @@ class HomePage(QWidget):
 
     def apply_card_size(self, key: str) -> None:
         self.recent.set_card_size(key)
-        self.popular.set_card_size(key)
 
     def hide_ids(self, ids: set[str]) -> None:
         self.recent.hide_ids(ids)
-        self.popular.hide_ids(ids)
 
     def refresh_installed(self) -> None:
         self.recent.set_installed(self.actions.installed_keys)
-        self.popular.set_installed(self.actions.installed_keys)
 
     def _open(self, group) -> None:
         from ezgd.ui.dialogs.game_details import GameDetailsDialog

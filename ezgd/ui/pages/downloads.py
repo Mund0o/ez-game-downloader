@@ -260,7 +260,7 @@ class DownloadsPage(QWidget):
         self.filter_key = "all"
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(28, 24, 28, 16)
+        lay.setContentsMargins(28, 6, 28, 16)
         lay.setSpacing(12)
         head = QHBoxLayout()
         col = QVBoxLayout()

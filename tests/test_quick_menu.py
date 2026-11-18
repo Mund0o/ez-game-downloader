@@ -619,6 +619,8 @@ def test_with_our_overlay_a_steam_tap_is_the_quick_menu(ui, qtbot, tmp_path, mon
     monkeypatch.setitem(couch.actions.settings, "own_overlay", True)
     from PySide6.QtGui import QColor, QImage
     from ezgd.platform import hidden
+    from ezgd.ui import couch_quick
+    monkeypatch.setattr(couch_quick, "_MINIMIZERS", set())          # (games seen minimizing: this test's own)
     shot = QImage(1600, 1600, QImage.Format_RGB32)
     shot.fill(QColor("red"))
     monkeypatch.setattr(hidden, "capture_screen", lambda name=None, timeout=1.0: shot)   # the game, just before
@@ -629,12 +631,31 @@ def test_with_our_overlay_a_steam_tap_is_the_quick_menu(ui, qtbot, tmp_path, mon
     q = couch.quick
     assert q.rows[0].key == "resume"
     assert "friends, chat and invites" in couch._starting_text()
-    assert q._still is not None                    # a game that minimizes itself: its picture stays behind the menu
-    img = q.grab().toImage()
-    assert img.pixelColor(5, img.height() // 2).red() > 60          # (dimmed red at the far left, not the desktop)
+    # the game stays live behind the menu — no picture of it laid over the screen (it looked frozen, 2026-11-05)
+    assert q._still is None and not q._game_hidden()
+    left = q.grab().toImage()
+    assert left.pixelColor(5, left.height() // 2).alpha() < 200     # (the shade only: the game shows through)
+    q._watch_token = 99
+    q._game_window(99, 0)                         # KWin: the game minimized itself as the menu took the focus
+    assert q._game_hidden() and a.id in couch_quick._MINIMIZERS
+    left = q.grab().toImage()
+    assert left.pixelColor(5, left.height() // 2).alpha() == 255    # its stand-in, never the desktop
     q.command("b")
     qtbot.waitUntil(lambda: not q.isVisible(), timeout=3000)
     assert q._still is None and asked == []          # (the game keeps its controller: see steaminput)
+    assert q._watch_token == 0
+    q.opened_at -= 5
+    couch.pads._steam_guide(False)                   # again: a game seen minimizing gets its picture from frame one
+    qtbot.waitUntil(lambda: q.isVisible() and q._shown >= 1.0, timeout=5000)
+    assert q._still is not None and q._game_hidden()
+    img = q.grab().toImage()
+    assert img.pixelColor(5, img.height() // 2).red() > 60          # (dimmed red at the far left, not the desktop)
+    q._watch_token = 100
+    q._game_window(100, 1)                           # KWin: this time it stayed — the live game once the grace is over
+    q.opened_at -= 5
+    assert not q._game_hidden()
+    q.command("b")
+    qtbot.waitUntil(lambda: not q.isVisible(), timeout=3000)
     page = win.pages["settings"]
     own, steam_ov = page.widgets["own_overlay"], page.widgets["steam_overlay"]
     page._loading = True                                             # (shown, not saved)
@@ -708,3 +729,503 @@ def test_the_core_says_when_the_steam_button_is_steams(monkeypatch):
     assert busy(4) is False and len(asked) == 5                      # no overlay known in that game: not asked
     core.settings.settings.own_overlay = False
     assert busy(3) is False and len(asked) == 5
+
+
+# ------------------------------------------------------------------- keyboard, mouse and wheel (2026-11-05)
+def _wheel_event(dy=0, pixels=0, phase=None):
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QWheelEvent
+    return QWheelEvent(QPointF(10, 10), QPointF(10, 10), QPoint(0, pixels), QPoint(0, dy), Qt.NoButton,
+                       Qt.NoModifier, Qt.NoScrollPhase if phase is None else phase, False)
+
+
+def test_one_notch_of_the_wheel_is_one_step():
+    """A high-resolution wheel sends one notch in parts (8 × 15): it moved the quick menu 3-5 rows per notch (the
+    user, 2026-11-05). A whole notch is one step — and a desktop that scrolls faster (one bigger event) still one."""
+    from PySide6.QtCore import Qt
+    from ezgd.ui.wheel_steps import WheelSteps
+    now = [100.0]
+    w = WheelSteps(clock=lambda: now[0])
+    parts = [w.steps(_wheel_event(-15)) for _ in range(8)]              # one notch towards the player, in parts
+    assert parts == [0] * 7 + [-1]
+    assert [w.steps(_wheel_event(-15)) for _ in range(16)].count(-1) == 2   # two more notches: two steps
+    assert w.steps(_wheel_event(120)) == 1                              # an ordinary wheel: one per notch
+    assert w.steps(_wheel_event(360)) == 1                              # KDE's scroll speed 3: still one
+    assert w.steps(_wheel_event(-60)) == 0                              # half a notch back …
+    now[0] += 1.0
+    assert w.steps(_wheel_event(-60)) == 0                              # … and the other half much later: a new turn
+    assert w.steps(_wheel_event(-60)) == -1
+    assert w.steps(_wheel_event(-90)) == 0 and w.steps(_wheel_event(60)) == 0   # turned back: nothing left over
+    assert w.steps(_wheel_event(60)) == 1
+    # a touchpad: its fingers' travel in pixels; its coasting after they left is not the player's
+    assert [w.steps(_wheel_event(-10, -10, Qt.ScrollUpdate)) for _ in range(5)] == [0, 0, 0, 0, -1]
+    assert w.steps(_wheel_event(-400, -400, Qt.ScrollMomentum)) == 0
+
+
+def test_the_wheel_moves_the_quick_menu_and_couch_mode_once_per_notch(ui, qtbot, tmp_path):
+    win, core, _ = ui
+    a = _running(win, core, tmp_path, qtbot, "Notch Menu")
+    couch = _open_couch(win, qtbot)
+    qtbot.waitUntil(lambda: a.id in couch.running, timeout=5000)
+    couch._home_held()
+    qtbot.waitUntil(lambda: couch.quick is not None and couch.quick._shown >= 1.0, timeout=5000)
+    q = couch.quick
+    start = q.focus
+    for _ in range(8):
+        q.wheelEvent(_wheel_event(-15))                                 # one notch of a high-resolution wheel
+    assert q.focus == start + 1
+    q.command("b")
+    qtbot.waitUntil(lambda: not q.isVisible(), timeout=3000)
+    moves = []
+    real = couch.command
+    couch.command = lambda name: (moves.append(name), real(name))
+    couch.showNormal()
+    for _ in range(8):
+        couch.wheelEvent(_wheel_event(-15))                             # couch mode itself: once as well
+    assert len(moves) == 1
+    couch.command = real
+    win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
+    couch.force_close()
+
+
+@linux_only
+def test_a_key_still_held_as_the_menu_closes_is_let_go_before_the_game_gets_it(ui, qtbot, tmp_path, monkeypatch):
+    """Esc closes the menu; KWin hands a newly focused window the keys being held, so the game saw a fresh Esc (its
+    own pause menu) when the menu hid before the key was let go. The menu waits for it (not forever)."""
+    from PySide6.QtCore import Qt
+    from ezgd.ui import couch_quick
+    win, core, _ = ui
+    a = _running(win, core, tmp_path, qtbot, "Held Key")
+    couch = _open_couch(win, qtbot)
+    qtbot.waitUntil(lambda: a.id in couch.running, timeout=5000)
+    couch._home_held()
+    qtbot.waitUntil(lambda: couch.quick is not None and couch.quick._shown >= 1.0, timeout=5000)
+    q = couch.quick
+    monkeypatch.setattr(q, "isActiveWindow", lambda: True)
+    went = []
+    monkeypatch.setattr(couch, "go_to_game", lambda e: went.append(e.id))
+    qtbot.keyPress(q, Qt.Key_Escape)                                    # pressed … and held
+    qtbot.waitUntil(lambda: q._release_wait, timeout=3000)              # slid out: waiting for the key
+    qtbot.wait(300)
+    assert q.isVisible() and went == []                                 # the game does not have the focus yet
+    qtbot.keyRelease(q, Qt.Key_Escape)
+    qtbot.waitUntil(lambda: not q.isVisible() and went == [a.id], timeout=2000)
+    couch._home_held()                                                  # held and never let go: not forever
+    qtbot.waitUntil(lambda: q.isVisible() and q._shown >= 1.0, timeout=5000)
+    monkeypatch.setattr(couch_quick, "RELEASE_WAIT", 300)
+    qtbot.keyPress(q, Qt.Key_Escape)
+    qtbot.waitUntil(lambda: not q.isVisible(), timeout=3000)
+    q._keys_down.clear()
+    monkeypatch.undo()
+    win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
+    couch.force_close()
+
+
+@linux_only
+def test_keyboard_and_mouse_in_the_quick_menu(ui, qtbot, tmp_path, monkeypatch):
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    win, core, _ = ui
+    a = _running(win, core, tmp_path, qtbot, "Keys Game")
+    couch = _open_couch(win, qtbot)
+    qtbot.waitUntil(lambda: a.id in couch.running, timeout=5000)
+    couch.pad_family = "xbox"                                           # (a controller was used last)
+    couch._home_held()
+    qtbot.waitUntil(lambda: couch.quick is not None and couch.quick._shown >= 1.0, timeout=5000)
+    q = couch.quick
+    keys = [r.key for r in q.rows]
+    qtbot.keyClick(q, Qt.Key_End)
+    assert q.rows[q.focus].key == "quit" and couch.pad_family == ""     # the keyboard's keys as the prompts now
+    assert couch._pad_labels()["a"] == "Enter"
+    qtbot.keyClick(q, Qt.Key_Home)
+    assert q.rows[q.focus].key == "resume"
+    qtbot.keyClick(q, Qt.Key_PageDown)
+    assert q.focus == min(len(keys) - 1, 5)
+    qtbot.keyClick(q, Qt.Key_Home)
+    qtbot.keyClick(q, Qt.Key_Tab)
+    assert q.rows[q.focus].key == "switch"
+
+    def click(pos, double=False, button=Qt.LeftButton):
+        kind = QEvent.MouseButtonDblClick if double else QEvent.MouseButtonPress
+        ev = QMouseEvent(kind, QPointF(pos), QPointF(pos), button, button, Qt.NoModifier)
+        (q.mouseDoubleClickEvent if double else q.mousePressEvent)(ev)
+        q.mouseReleaseEvent(QMouseEvent(QEvent.MouseButtonRelease, QPointF(pos), QPointF(pos), button,
+                                        Qt.NoButton, Qt.NoModifier))
+    # the game's volume: its ◂ ▸ are buttons for the mouse
+    q._got("volume", 70)
+    row = next(k for k, r in enumerate(q.rows) if r.key == "volume")
+    q.focus = row                                                       # (in view on a small screen)
+    q.grab()
+    dec = next(r for r, kind, k in q._hits if kind == "dec" and k == row)
+    inc = next(r for r, kind, k in q._hits if kind == "inc" and k == row)
+    click(dec.center())
+    assert q.volume == 60 and q.focus == row
+    click(inc.center())
+    click(inc.center())
+    assert q.volume == 80
+    # a double click is one click: Quit only arms (it asks again)
+    q.focus = next(k for k, r in enumerate(q.rows) if r.key == "quit")
+    q.grab()
+    quit_row = next(r for r, kind, k in q._hits if kind == "row" and q.rows[k].key == "quit")
+    click(quit_row.center())
+    click(quit_row.center(), double=True)
+    assert q.isVisible() and q.rows[q.focus].label == "Press again to quit"
+    assert core.library.is_running(a.id)
+    # a click on the game beside the panel (not only on its left half): back to the game
+    x = q._panel_rect(1.0).left() - 20
+    assert x > q.width() * 0.5
+    click(QPointF(x, q.height() / 2))
+    qtbot.waitUntil(lambda: not q.isVisible(), timeout=3000)
+    win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
+    couch.force_close()
+
+
+@linux_only
+def test_shift_tab_shows_the_keyboards_keys_and_steam_is_not_guarded(ui, qtbot, tmp_path, monkeypatch):
+    """Opened with Shift+Tab from the desktop: the prompts are the keyboard's (Enter / Esc), even with a controller
+    connected; and Steam never sees that key, so its windows are not watched for an answer to it."""
+    win, core, _ = ui
+    win.show()
+    a = _running(win, core, tmp_path, qtbot, "Shift Tab Game")
+    guarded = []
+    from ezgd.ui import couch as couch_mod
+    monkeypatch.setattr(couch_mod._Couch, "guide_pressed", lambda self: guarded.append(1))
+    win._quick_menu_by_key()
+    couch = win.couch
+    qtbot.waitUntil(lambda: couch is not None and couch.quick is not None and couch.quick._shown >= 1.0,
+                    timeout=5000)
+    from PySide6.QtCore import Qt
+    assert couch.pad_family == "" and guarded == []
+    assert couch.quick.cursor().shape() == Qt.ArrowCursor                # Shift+Tab: mouse pointer shown right away
+    couch.quick.command("b")
+    qtbot.waitUntil(lambda: win.couch is None, timeout=5000)
+    win._quick_menu_from_desktop()                                       # the guide button: Steam's windows watched
+    qtbot.waitUntil(lambda: win.couch is not None and win.couch.quick is not None and win.couch.quick.isVisible(),
+                    timeout=5000)
+    assert guarded == [1] and win.couch.quick.cursor().shape() == Qt.BlankCursor
+    win.couch.quick.command("b")
+    qtbot.waitUntil(lambda: win.couch is None, timeout=5000)
+    monkeypatch.undo()
+    win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
+
+
+@linux_only
+def test_the_game_grid_is_laid_out_once_as_the_panel_widens(ui, qtbot, tmp_path):
+    """Switch game widens the panel: its tiles were laid out (and their pictures scaled) for every width the panel
+    went through. Now they are where they end up from the first frame, uncovered as the panel widens."""
+    win, core, _ = ui
+    a = _running(win, core, tmp_path, qtbot, "Wide One")
+    for n in range(3):
+        _install(core.library, tmp_path, f"Other {n}")
+    win._reload_library()
+    couch = _open_couch(win, qtbot)
+    qtbot.waitUntil(lambda: a.id in couch.running and len(couch.entries) == 4, timeout=5000)
+    couch._home_held()
+    qtbot.waitUntil(lambda: couch.quick is not None and couch.quick._shown >= 1.0, timeout=5000)
+    q = couch.quick
+    q.open_switch()
+    q._wide_anim.stop()
+
+    def tiles(wide):
+        q._wide = wide
+        q.grab()
+        return [(r.x(), r.y(), r.width(), r.height()) for r, kind, _k in q._hits if kind == "tile"]
+    final = tiles(1.0)
+    assert len(final) == 3
+    assert tiles(0.3) == final
+    q.close_switch()
+    q.command("b")
+    qtbot.waitUntil(lambda: not q.isVisible(), timeout=3000)
+    win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
+    couch.force_close()
+
+
+def test_kwin_reports_when_the_game_window_goes():
+    """The script that watches the game's window while the quick menu is over it, run against a stand-in for KWin:
+    the game's biggest (full-screen) window among its processes, reported at once and on every change."""
+    import json
+    from PySide6.QtQml import QJSEngine
+    from ezgd.ui import window_control as wc
+    eng = QJSEngine()
+    eng.evaluate("""
+        var sent = [];
+        function callDBus() { sent.push(Array.prototype.slice.call(arguments)); }
+        function signal() { return {fns: [], connect: function (f) { this.fns.push(f); },
+                                    emit: function (a) { for (var i = 0; i < this.fns.length; i++) this.fns[i](a); }}; }
+        function win(pid, normal, full, w, h) { return {pid: pid, normalWindow: normal, fullScreen: full, width: w,
+                                                        height: h, minimized: false, minimizedChanged: signal()}; }
+        var other = win(7, true, false, 800, 600), helper = win(43, false, false, 10, 10);
+        var launcher = win(41, true, false, 640, 480), game = win(42, true, true, 3840, 2160);
+        var workspace = {windowList: function () { return [other, launcher, helper, game]; }, windowRemoved: signal()};
+    """)
+
+    def run(pids):
+        r = eng.evaluate(wc.GAME_WATCH_SCRIPT % {"pids": json.dumps(pids), "token": 5, "svc": '":1.9"',
+                                                 "path": json.dumps(wc.WATCH_PATH), "iface": json.dumps(wc.WATCH_IFACE)})
+        assert not r.isError(), r.toString()
+
+    def sent():
+        return json.loads(eng.evaluate("JSON.stringify(sent)").toString())
+    run([41, 42, 43])
+    assert sent() == [[":1.9", wc.WATCH_PATH, wc.WATCH_IFACE, "GameWindow", 5, 1]]
+    eng.evaluate("launcher.minimized = true; launcher.minimizedChanged.emit();")      # not the game's window
+    eng.evaluate("game.minimized = true; game.minimizedChanged.emit();")
+    eng.evaluate("game.minimized = false; game.minimizedChanged.emit();")
+    eng.evaluate("workspace.windowRemoved.emit(other); workspace.windowRemoved.emit(game);")
+    assert [m[-1] for m in sent()] == [1, 0, 1, 0]
+    eng.evaluate("sent = []")
+    run([99])                                                            # none of its windows
+    assert [m[-1] for m in sent()] == [-1]
+    assert wc.watch_game_window([42], 1, lambda *_a: None) is None       # (never from the tests: no KWin here)
+
+
+def test_couch_sounds_can_open_their_stream_later(qtbot, monkeypatch):
+    """The hidden couch mode of a desktop start opens its sound stream after the quick menu slid in (opening it
+    held up the slide's frames)."""
+    import time
+    from ezgd.ui import couch_sounds
+    opened = []
+    monkeypatch.setattr(couch_sounds, "_multimedia", lambda: object())
+    monkeypatch.setattr(couch_sounds.CouchSounds, "_open_stream", lambda self, mm: opened.append(time.monotonic())
+                        or True)
+    t = time.monotonic()
+    s = couch_sounds.CouchSounds(None, lambda: True)
+    s.defer(500)
+    qtbot.wait(300)
+    assert opened == []
+    qtbot.waitUntil(lambda: bool(opened), timeout=2000)
+    assert opened[0] - t >= 0.45
+    s.stop()
+
+
+def test_waiting_for_pictures_redraws_only_the_panel_and_not_forever(ui, qtbot, tmp_path):
+    """A game with no picture at all kept the menu "waiting for its art": the whole 4K screen redrawn 8 times a second
+    for as long as the menu was open. Now only the panel is looked at again, and for the first 15 s."""
+    win, core, _ = ui
+    a = _running(win, core, tmp_path, qtbot, "No Art Game")
+    couch = _open_couch(win, qtbot)
+    qtbot.waitUntil(lambda: a.id in couch.running, timeout=5000)
+    couch._home_held()
+    qtbot.waitUntil(lambda: couch.quick is not None and couch.quick._shown >= 1.0, timeout=5000)
+    q = couch.quick
+    q.grab()
+    assert q._pending_art                                               # (no picture for this game)
+    asked = []
+    real = q.update
+    q.update = lambda *args: (asked.append(args), real(*args))
+    q._art_tick()
+    assert asked and asked[-1] and asked[-1][0].left() > 0              # the panel's area, not the whole screen
+    asked.clear()
+    q.opened_at -= 16
+    q._art_tick()
+    assert asked == []                                                  # given up after 15 s
+    q.update = real
+    q.command("b")
+    qtbot.waitUntil(lambda: not q.isVisible(), timeout=3000)
+    win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
+    couch.force_close()
+
+
+@linux_only
+def test_volume_slider_drag_wheel_and_mute_in_the_quick_menu(ui, qtbot, tmp_path):
+    """Mouse & keyboard volume controls: draggable slider (snapping near 100 %), wheel ±5 % over the slider, and
+    mute / unmute on the speaker icon or M."""
+    from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent, QWheelEvent
+    win, core, _ = ui
+    a = _running(win, core, tmp_path, qtbot, "Slider Vol Game")
+    couch = _open_couch(win, qtbot)
+    qtbot.waitUntil(lambda: a.id in couch.running, timeout=5000)
+    couch._home_held(by_key=True)
+    qtbot.waitUntil(lambda: couch.quick is not None and couch.quick._shown >= 1.0, timeout=5000)
+    q = couch.quick
+    q.resize(1920, 1080)
+    q._got("volume", 75)
+    row = next(k for k, r in enumerate(q.rows) if r.key == "volume")
+    q.focus = row
+    q.grab()
+    assert q._vol_track is not None
+    tr = q._vol_track
+
+    def mouse(kind, pt, btn=Qt.LeftButton, buttons=Qt.NoButton):
+        ev = QMouseEvent(kind, QPointF(pt), QPointF(pt), btn, buttons, Qt.NoModifier)
+        if kind == QEvent.MouseButtonPress:
+            q.mousePressEvent(ev)
+        elif kind == QEvent.MouseMove:
+            q.mouseMoveEvent(ev)
+        else:
+            q.mouseReleaseEvent(ev)
+
+    # click & drag along the slider; near 100 % snaps cleanly to 100 %
+    p30 = QPointF(tr.left() + tr.width() * (30 / 150), tr.center().y())
+    mouse(QEvent.MouseButtonPress, p30, Qt.LeftButton, Qt.LeftButton)
+    assert q.volume == 30
+    p99 = QPointF(tr.left() + tr.width() * (99 / 150), tr.center().y() + 25)    # (drifting vertically keeps dragging)
+    mouse(QEvent.MouseMove, p99, Qt.NoButton, Qt.LeftButton)
+    assert q.volume == 100
+    mouse(QEvent.MouseButtonRelease, p99, Qt.LeftButton, Qt.NoButton)
+
+    # mouse wheel directly over the slider steps volume by 5 % without moving the row focus
+    q.grab()
+    bar_hit = next(r for r, kind, k in q._hits if kind == "vol_bar" and k == row)
+    mouse(QEvent.MouseMove, bar_hit.center())
+    q.wheelEvent(QWheelEvent(bar_hit.center(), bar_hit.center(), QPoint(), QPoint(0, 120), Qt.NoButton,
+                             Qt.NoModifier, Qt.NoScrollPhase, False))
+    assert q.volume == 105 and q.focus == row
+
+    # M key and speaker icon mute & restore the previous level
+    qtbot.keyClick(q, Qt.Key_M)
+    assert q.volume == 0 and next(r for r in q.rows if r.key == "volume").value == "Muted"
+    q.grab()
+    mute_hit = next(r for r, kind, k in q._hits if kind == "mute" and k == row)
+    mouse(QEvent.MouseButtonPress, mute_hit.center(), Qt.LeftButton, Qt.LeftButton)
+    mouse(QEvent.MouseButtonRelease, mute_hit.center(), Qt.LeftButton, Qt.NoButton)
+    assert q.volume == 105
+
+    q.command("b")
+    qtbot.waitUntil(lambda: not q.isVisible(), timeout=3000)
+    win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
+    couch.force_close()
+
+
+@linux_only
+def test_header_buttons_grid_navigation_chat_scroll_and_direct_typing(ui, qtbot, tmp_path, monkeypatch):
+    """Mouse & keyboard across subviews: ← Back and ✕ Close in the header, clickable footer prompts, Tab wrapping &
+    row-wise wheel in a multi-row game grid (without misclick-closing on tile gaps), scrollable long chats, direct
+    typing / Ctrl+V paste in chat, '/' search & one-click ✕ clear in Friends, and clicking outside Keyboard."""
+    from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+    from PySide6.QtGui import QKeyEvent, QMouseEvent, QWheelEvent
+    from PySide6.QtWidgets import QApplication
+    from ezgd.platform import steamfriends as sf
+    win, core, _ = ui
+    a = _running(win, core, tmp_path, qtbot, "Mouse Hub")
+    for n in range(5):                                                   # 5 other games → 2 rows in Switch game (4 + 1)
+        _install(core.library, tmp_path, f"Grid {n}")
+    win._reload_library()
+
+    bob_sid = sf.to_steamid64(202)
+    bob_acct = 202
+    many_friends = [sf.Friend(sf.to_steamid64(200 + i), f"Friend {i:02d}", "online").as_dict() for i in range(18)]
+    many_friends[2]["name"] = "Bob"
+    many_friends[2]["steamid"] = bob_sid
+
+    async def friends(force=False):
+        return {"me": "1", "live": True, "private": False, "error": "", "at": 0, "friends": many_friends}
+
+    async def chats():
+        return {"self": {"accountid": 1, "appid": 480, "lobby": "77", "connect": "", "game": ""},
+                "chats": [{"accountid": bob_acct, "name": "Bob", "unread": 0, "time": 1, "last": "hi",
+                           "last_from": bob_acct, "invite": None}]}
+
+    history_msgs = [{"mine": i % 2 == 0, "time": i + 1, "text": f"line {i}", "invite": None} for i in range(25)]
+    sent = []
+
+    async def history(acct, limit=40):
+        return list(history_msgs)
+
+    async def send(acct, text):
+        sent.append((acct, text))
+    monkeypatch.setattr(core, "steam_friends", friends)
+    monkeypatch.setattr(core, "steam_chats", chats)
+    monkeypatch.setattr(core, "steam_chat_history", history)
+    monkeypatch.setattr(core, "steam_chat_send", send)
+
+    couch = _open_couch(win, qtbot)
+    monkeypatch.setitem(couch.actions.settings, "own_overlay", True)
+    qtbot.waitUntil(lambda: a.id in couch.running and len(couch.entries) == 6, timeout=5000)
+    couch.pad_family = ""
+    couch._home_held(by_key=True)
+    qtbot.waitUntil(lambda: couch.quick is not None and couch.quick._shown >= 1.0, timeout=5000)
+    q = couch.quick
+    q.resize(1600, 900)
+    qtbot.waitUntil(lambda: q.friends is not None and q.chats is not None, timeout=3000)
+
+    def click(pt, button=Qt.LeftButton):
+        q.mouseMoveEvent(QMouseEvent(QEvent.MouseMove, QPointF(pt), QPointF(pt), Qt.NoButton, Qt.NoButton,
+                                     Qt.NoModifier))
+        q.mousePressEvent(QMouseEvent(QEvent.MouseButtonPress, QPointF(pt), QPointF(pt), button, button,
+                                      Qt.NoModifier))
+        q.mouseReleaseEvent(QMouseEvent(QEvent.MouseButtonRelease, QPointF(pt), QPointF(pt), button, Qt.NoButton,
+                                        Qt.NoModifier))
+
+    # stray middle / forward mouse buttons never trigger actions
+    q.grab()
+    r0 = next(r for r, kind, k in q._hits if kind == "row" and k == 0)
+    click(r0.center(), button=Qt.MiddleButton)
+    assert q.isVisible()
+
+    # Switch game: Tab wraps across rows, mouse wheel steps a full row, gap click stays in Switch, header ← goes back
+    q.open_switch()
+    q._wide = 1.0
+    q._wide_anim.stop()
+    q.grab()
+    for _ in range(4):
+        qtbot.keyClick(q, Qt.Key_Tab)
+    assert q.grid_focus == 4                                             # reached row 1 instead of stopping at col 3
+    qtbot.keyClick(q, Qt.Key_Tab)
+    assert q.grid_focus == 0                                             # wrapped back to tile 0
+    q.pointer(True)
+    q.wheelEvent(QWheelEvent(QPointF(1200, 500), QPointF(1200, 500), QPoint(), QPoint(0, -120), Qt.NoButton,
+                             Qt.NoModifier, Qt.NoScrollPhase, False))
+    assert q.grid_focus == 4                                             # one wheel notch moved down a full row
+    t0 = next(r for r, kind, k in q._hits if kind == "tile" and k == 0)
+    t1 = next(r for r, kind, k in q._hits if kind == "tile" and k == 1)
+    click(QPointF((t0.right() + t1.left()) / 2, t0.center().y()))        # gap between tiles: stays in Switch game
+    assert q.view == "switch"
+    back_btn = next(r for r, kind, _k in q._hits if kind == "back")
+    click(back_btn.center())
+    assert q.view == "main"
+
+    # Friends: scrollbar on long list, '/' opens empty search (not '/'), outside click closes Keyboard, ✕ clears search
+    q.open_friends()
+    q.grab()
+    assert any(kind == "scrollbar" for _r, kind, _k in q._hits)
+    assert "/" in q._hint_actions                                        # '/' prompt instead of 'I'
+    q.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Slash, Qt.NoModifier, "/"))
+    assert q.keyboard is not None and q.keyboard.text == ""
+    q.grab()
+    click(QPointF(20, 20))                                               # outside Keyboard: cancels it, menu stays
+    assert q.keyboard is None and q.view == "friends"
+    q._found("Bob")
+    q.focus = 0
+    q.grab()
+    clr = next(r for r, kind, _k in q._hits if kind == "clear")
+    click(clr.center())
+    assert q.friend_query == "" and len([r for r in q.rows if r.kind == "friend"]) == 18
+
+    # Chat: scrollable 25-message history with Write pinned, direct typing + Enter sends, Ctrl+V pastes, header ✕ closes
+    q.open_chat(many_friends[2])
+    qtbot.waitUntil(lambda: len(q.chat_msgs) == 25, timeout=3000)
+    q.grab()
+    assert any(kind == "scrollbar" for _r, kind, _k in q._hits)
+    assert any(kind == "row" and q.rows[k].key == "write" for _r, kind, k in q._hits)
+    q.wheelEvent(QWheelEvent(QPointF(1300, 400), QPointF(1300, 400), QPoint(), QPoint(0, 120), Qt.NoButton,
+                             Qt.NoModifier, Qt.NoScrollPhase, False))
+    assert q._chat_top is not None                                       # scrolled up into earlier messages
+    qtbot.keyClick(q, Qt.Key_Home)
+    assert q._chat_top == 0
+    qtbot.keyClick(q, Qt.Key_End)
+    assert q._chat_top is None
+    q.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_H, Qt.NoModifier, "h"))
+    q.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_I, Qt.NoModifier, "i"))
+    assert q.keyboard is not None and q.keyboard.text == "hi"
+    qtbot.keyClick(q, Qt.Key_Return)                                     # real keyboard Enter sends immediately
+    qtbot.waitUntil(lambda: (bob_acct, "hi") in sent, timeout=3000)
+    assert q.keyboard is None
+    QApplication.clipboard().setText("lobby 99")
+    q.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_V, Qt.ControlModifier, ""))
+    assert q.keyboard is not None and q.keyboard.text == "lobby 99"
+    q.grab()
+    kb_x = next(r for r, kind, _k in q._hits if kind == "kb_close")
+    click(kb_x.center())
+    assert q.keyboard is None and q.view == "chat"
+
+    # Top-right ✕ closes the quick menu straight back to the game from any subview
+    q.grab()
+    close_x = next(r for r, kind, _k in q._hits if kind == "close")
+    click(close_x.center())
+    qtbot.waitUntil(lambda: not q.isVisible(), timeout=3000)
+
+    monkeypatch.undo()
+    win.bridge.run_sync(core.library_call("stop_completely", a.id, 3))
+    couch.force_close()

@@ -22,6 +22,8 @@ import logging
 import os
 import platform
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -218,14 +220,102 @@ def parse_fault_log(text: str) -> tuple[str, list[tuple[str, str]], str]:
     return kind, frames, thread
 
 
-def _describe_fatal(kind: str, frames: list[tuple[str, str]]) -> str:
+def _describe_fatal(kind: str, frames: list[tuple[str, str]], lib: str = "") -> str:
     what = {"SEGV": "crashed (segmentation fault — memory access error)", "ABRT": "aborted (a fatal error in Qt "
             "or a library)", "FPE": "crashed (arithmetic error)", "BUS": "crashed (bus error)",
             "ILL": "crashed (illegal instruction)", "EXIT": "closed unexpectedly"}.get(kind, "crashed")
     ours = _ours(frames)
     top = ours[0] if ours else None
     where = f" while running {Path(top[0]).stem}.{top[1]}" if top else ""
-    return f"The app {what}{where}."
+    return f"The app {what}{where}" + (f", in {lib}" if lib else "") + "."
+
+
+# ------------------------------------------------- the native side of a hard crash
+_STACK_HEAD = re.compile(r"^Stack trace of thread \d+:$")
+_FRAME_LIB = re.compile(r"\((\S+?) \+ 0x[0-9a-f]+\)\s*$")
+_FAULT_LINE = re.compile(r"segfault at|general protection|trap |stack segment|invalid opcode")
+
+
+def _journal(args: list[str]) -> list[dict]:
+    """``journalctl -o json`` entries (tests replace this: they never read the real journal)."""
+    exe = shutil.which("journalctl")
+    if not exe:
+        return []
+    try:
+        r = subprocess.run([exe, "--no-pager", "-o", "json", *args], capture_output=True, text=True, timeout=6,
+                           env={**os.environ, "SYSTEMD_COLORS": "0"})
+    except (OSError, subprocess.SubprocessError):
+        return []
+    out = []
+    for ln in r.stdout.splitlines():
+        try:
+            out.append(json.loads(ln))
+        except ValueError:
+            continue
+    return out
+
+
+def _field(entry: dict, key: str) -> str:
+    v = entry.get(key)
+    if isinstance(v, list):               # (journalctl gives a field that is not plain text as a list of bytes)
+        try:
+            return bytes(v).decode("utf-8", "replace")
+        except (TypeError, ValueError):
+            return ""
+    return "" if v is None else str(v)
+
+
+def native_trace(pid: int, since: float, crashed_at: float) -> tuple[str, str]:
+    """The crashed process's native stack as systemd-coredump logged it, and the library it crashed in:
+    (text for the report, library) — ("", "") when the system kept none.
+
+    The Python trace stops where Qt's C++ starts: a crash inside the event loop names nothing but the window whose
+    ``exec()`` was running — EZGD-SEGV-F117EA (2026-11-15) showed only the game page, 8 s after the in-app browser
+    opened over it. The core dump's stack names the library and the function. Matched by pid *and* time, so a pid
+    reused after a restart is never someone else's crash."""
+    if not pid or not sys.platform.startswith("linux") or os.environ.get("EZGD_SYSLOG", "1") == "0":
+        return "", ""
+    window = [f"--since=@{since - 5:.0f}", f"--until=@{crashed_at + 600:.0f}"]
+
+    def ours(e: dict) -> bool:
+        at = _field(e, "COREDUMP_TIMESTAMP")
+        return _field(e, "COREDUMP_PID") == str(pid) and (not at.isdigit() or abs(int(at) / 1e6 - crashed_at) < 180)
+    dump = None
+    for scope in ([], ["--user"]):        # the system journal; else the user's own, which holds their core dumps
+        dump = next((e for e in _journal([*scope, *window, f"COREDUMP_PID={pid}"]) if ours(e)), None)
+        if dump is not None:
+            break
+    lines: list[str] = []
+    lib = ""
+    if dump is not None:
+        thread = _field(dump, "COREDUMP_THREAD_NAME")
+        lines.append(f"{_field(dump, 'COREDUMP_SIGNAL_NAME') or 'signal'} in thread “{thread or '?'}”")
+        stack = False
+        for ln in _field(dump, "MESSAGE").splitlines():
+            ln = ln.strip()
+            if not stack:                 # (the crashing thread's stack comes first)
+                stack = bool(_STACK_HEAD.match(ln))
+                if stack:
+                    lines.append(ln)
+                continue
+            if not ln:
+                break
+            if ln.startswith("#"):
+                lines.append(ln)
+                m = _FRAME_LIB.search(ln)
+                if not lib and m and m.group(1) != "n/a":
+                    lib = m.group(1)
+            if len(lines) >= 45:
+                lines.append("…")
+                break
+    # the kernel's own line names the library too, also where core dumps are switched off (needs journal access)
+    kernel = [m for e in _journal(["-k", *window]) if f"[{pid}]" in (m := _field(e, "MESSAGE")) and _FAULT_LINE.search(m)]
+    if kernel:
+        lines += ["", "kernel: " + kernel[0].strip()]
+        if not lib:
+            m = re.search(r" in ([^\s\[]+)\[", kernel[0])
+            lib = m.group(1) if m else ""
+    return "\n".join(lines), lib
 
 
 def _previous_session(state_dir: Path, fault_file: Path, log_file: Path, folder: Path) -> CrashReport | None:
@@ -247,9 +337,18 @@ def _previous_session(state_dir: Path, fault_file: Path, log_file: Path, folder:
     # the previous session's log is the rotated one if this start already rotated it; the tail is enough
     if fault.strip():
         kind, frames, _thread = parse_fault_log(fault)
-        code = _code(kind, f"{kind}|{_frames_signature(frames)}")
-        summary = _describe_fatal(kind, frames)
-        text = _compose(code, summary, fault, log_file, ran)
+        code = _code(kind, f"{kind}|{_frames_signature(frames)}")      # (the Python frames only: codes stay comparable)
+        native, lib = "", ""
+        try:
+            crashed_at = fault_file.stat().st_mtime                       # (written as the process died)
+            native, lib = native_trace(int(info.get("pid") or 0), float(info.get("started") or crashed_at),
+                                       crashed_at)
+        except Exception:
+            log.exception("could not read the crash's native trace")
+        summary = _describe_fatal(kind, frames, lib)
+        trace = fault.rstrip() + "\n\n--- Native trace (systemd-coredump) ---\n" + (
+            native or "(none: the system kept no core dump record of it)")
+        text = _compose(code, summary, trace, log_file, ran)
     else:
         code = _code("EXIT", "no-trace")
         summary = ("The app closed unexpectedly without leaving a crash trace — it was force-closed, the system ran "
